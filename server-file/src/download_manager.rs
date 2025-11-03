@@ -1,0 +1,149 @@
+use crate::app::App;
+use crate::models::DownloadSession; // 🔥 FIX: Loại bỏ DownloadSessionCache
+use alloy::primitives::B256;
+use dashmap::mapref::one::Ref;
+use std::path::Path;
+use std::sync::Arc;
+use tokio::fs;
+
+pub async fn initialize_download_session<'a>(
+    download_key: &str,
+    app: &'a Arc<App>,
+) -> Result<Ref<'a, String, DownloadSession>, String> {
+    // ✅ FAST PATH: Check cache trước
+    if let Some(session_ref) = app.download_cache.get(download_key) {
+        return Ok(session_ref);
+    }
+    
+    // Khóa Mutex (luồng khác sẽ đợi ở đây)
+    let lock_guard = app.init_locks.entry(download_key.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
+    let lock_arc = lock_guard.value().clone();
+
+    // Khóa Mutex (luồng khác sẽ đợi ở đây)
+    let _lock = lock_arc.lock().await;
+
+    // DOUBLE CHECK: Sau khi có lock, kiểm tra lại cache lần nữa
+    if let Some(session_ref) = app.download_cache.get(download_key) {
+        return Ok(session_ref);
+    }
+    
+    // ----------- SLOW PATH (CHỈ MỘT LUỒNG CHẠY Ở ĐÂY) -----------
+    
+    // Parse download key (phải là hex string 64 chars = 32 bytes)
+    let download_key_clean = download_key.trim_start_matches("0x");
+    let download_key_bytes = hex::decode(download_key_clean)
+        .map_err(|e| format!("Invalid download key hex: {}", e))?;
+
+    if download_key_bytes.len() != 32 {
+        return Err(format!(
+            "Invalid download key length: expected 32 bytes, got {} bytes",
+            download_key_bytes.len()
+        ));
+    }
+
+    let download_key_b256 = B256::from_slice(&download_key_bytes);
+
+    // Gọi contract để lấy thông tin (RPC CALL - LÀM CHẬM)
+    let contract = app
+        .contract()
+        .await
+        .map_err(|e| format!("Failed to create contract instance: {}", e))?;
+        
+    let session_info = contract
+        .getDownloadSessionInfo(download_key_b256)
+        .call()
+        .await
+        .map_err(|e| format!("Failed to get download session info: {}", e))?;
+
+    if session_info.fileKey == B256::ZERO {
+        return Err(format!("Download key '{}' not found on-chain", download_key));
+    }
+
+    let file_info_onchain = contract
+        .getFileInfo(session_info.fileKey)
+        .call()
+        .await
+        .map_err(|e| format!("Failed to fetch file info: {}", e))?;
+
+    // Đường dẫn file
+    let file_key = hex::encode(session_info.fileKey);
+    let level1 = &file_key[0..2];
+    let level2 = &file_key[2..4];
+    let file_path = Path::new(&app.config.storage_root)
+        .join(level1)
+        .join(level2)
+    .join(&file_key);
+
+    // Đếm số chunks
+    let chunk_count = count_chunks(&file_path)
+        .await
+        .map_err(|e| format!("Failed to count chunks: {}", e))?;
+
+    let session = DownloadSession {
+        download_key: download_key.to_string(),
+        file_key: file_key.clone(),
+        remaining_chunks: chunk_count,
+        file_owner: file_info_onchain.owner,
+        total_chunks: chunk_count,
+    };
+
+    // ✅ Insert vào cache
+    app.download_cache.insert(download_key.to_string(), session);
+    
+    // Trả về session từ cache
+    app.download_cache
+        .get(download_key)
+        .ok_or_else(|| "Failed to retrieve inserted session".to_string())
+
+    // Lock sẽ tự động được giải phóng (_lock bị drop) khi hàm kết thúc
+}
+
+pub async fn count_chunks(file_path: &Path) -> Result<u32, String> {
+    if !file_path.exists() {
+        return Err("File path does not exist".to_string());
+    }
+
+    let mut count = 0u32;
+    let mut entries = fs::read_dir(file_path)
+        .await
+        .map_err(|e| format!("Failed to read directory: {}", e))?;
+
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| format!("Failed to read entry: {}", e))?
+    {
+        if entry
+            .file_type()
+            .await
+            .map_err(|e| format!("Failed to get file type: {}", e))?
+            .is_file()
+        {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+pub fn descrease_chunk_count(download_key: &str, app: &Arc<App>) -> Result<u32, String> {
+    // if let Some(mut session) = app.download_cache.get_mut(download_key) {
+    let mut entry = match app.download_cache.entry(download_key.to_string()) {
+        dashmap::mapref::entry::Entry::Occupied(o) => o,
+        dashmap::mapref::entry::Entry::Vacant(_) => {
+            return Err("Download session not found".to_string())
+        }
+    };
+    let session = entry.get_mut();
+    if session.remaining_chunks > 0 {
+        session.remaining_chunks -= 1;
+        let remaining = session.remaining_chunks;
+        if remaining == 0 {
+            // ✅ FIX: `send()` trên UnboundedSender trả về Result (đã fix trong app.rs)
+            if let Err(e) = app.confirmation_sender.send(download_key.to_string()) {
+                println!("❌ Failed to send to confirmation queue: {:?}", e);
+            }
+        }
+        return Ok(remaining);
+    } else {
+        return Err("No remaining chunks".to_string());
+    }
+}
