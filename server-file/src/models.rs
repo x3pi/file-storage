@@ -12,7 +12,8 @@ pub enum Command {
     UploadChunk { payload: UploadChunkPayload },
     DownloadChunkRequest { payload: DownloadChunkPayload },
     ListChunksRequest { payload: ListChunksPayload },
-  GetLogsRequest { payload: Option<GetLogsPayload> },
+    GetLogList { payload: Option<()> }, // Lấy danh sách file, không cần payload
+    GetLogContent { payload: GetLogContentPayload }, // Lấy nội dung
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -79,10 +80,17 @@ pub struct ListChunksResponse {
 // logs
 // (Thêm struct GetLogsPayload)
 #[derive(Serialize, Deserialize, Debug)]
-pub struct GetLogsPayload {
-    pub is_new: bool,
+pub struct LogsListResponse {
+    pub status: String,
+    pub message: String,
+    pub available_files: Vec<String>,
 }
-// ---------------------------------
+
+// --- API 2: Lấy nội dung file ---
+#[derive(Serialize, Deserialize, Debug)]
+pub struct GetLogContentPayload {
+    pub file_name: String,
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct LogFileContent {
@@ -91,8 +99,8 @@ pub struct LogFileContent {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct LogsResponse {
+pub struct LogsContentResponse {
     pub status: String,
     pub message: String,
-    pub logs: Vec<LogFileContent>,
+    pub log_content: Option<LogFileContent>,
 }

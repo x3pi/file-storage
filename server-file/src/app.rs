@@ -37,13 +37,8 @@ impl App {
     pub async fn setup() -> Result<Self> {
         let config = AppConfig::from_env()?;
         let storage_root = PathBuf::from(&config.storage_root);
-        println!("📁 Storage root: {}", storage_root.display());
-        println!("📡 RPC URL: {}", config.rpc_url);
-
         // Khởi tạo wallet từ private key
         let wallet = PrivateKeySigner::from_str(&config.private_key)?;
-        println!("👤 Wallet address: {:?}", wallet.address());
-
         let contract_address = config.contract_address; // Vẫn cần đọc từ config
         let download_cache: DownloadSessionCache = Arc::new(DashMap::new());
         let verified_signature_cache: VerifiedSignatureCache = Arc::new(DashMap::new());
@@ -52,8 +47,7 @@ impl App {
         let (confirmation_sender, confirmation_receiver) = mpsc::unbounded_channel(); 
         let init_locks = Arc::new(DashMap::new());
         let num_cores = num_cpus::get();
-// Giới hạn 2/3 số lõi, nhưng ít nhất là 1
-        let semaphore_limit = std::cmp::max(1, (num_cores * 2) / 3);
+        let semaphore_limit = std::cmp::max(1, num_cores);
         let task_semaphore = Arc::new(Semaphore::new(semaphore_limit));
         Ok(Self {
             config,

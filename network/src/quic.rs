@@ -87,11 +87,9 @@ impl QuicConnection {
             Ok(streams) => streams,
             Err(quinn::ConnectionError::ApplicationClosed(_)) | 
             Err(quinn::ConnectionError::LocallyClosed) => {
-                println!("[QuicConnection] Kết nối đã đóng.");
                 return Err(Box::new(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "Connection closed")));
             }
             Err(e) => {
-                eprintln!("[QuicConnection] Lỗi chấp nhận stream: {}", e);
                 return Err(Box::new(e));
             }
         };
@@ -128,14 +126,11 @@ pub struct QuicListener {
 impl Listener for QuicListener {
     // 🔥 THAY ĐỔI: `accept` giờ chỉ chấp nhận KẾT NỐI (Connection)
     async fn accept(&mut self) -> TransportResult<(Box<dyn Connection>, SocketAddr)> {
-        println!("🔍 [QuicListener] Đang chờ kết nối QUIC đến...");
         let connecting = self.listener.accept().await.unwrap();
         let remote_addr = connecting.remote_address();
-        println!("🔌 [QuicListener] Đang chấp nhận kết nối từ {}...", remote_addr);
         
         let connection = connecting.await?;
         let addr = connection.remote_address();
-        println!("✅ [QuicListener] Kết nối QUIC đã thiết lập từ {}", addr);
         
         // Trả về đối tượng QuicConnection
         let conn = Box::new(QuicConnection { connection });

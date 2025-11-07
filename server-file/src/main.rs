@@ -31,9 +31,9 @@ async fn main() {
         .format_for_files(detailed_format) // Format chi tiết cho file
         .format_for_stdout(detailed_format) // Format chi tiết cho console
         .rotate(
-            Criterion::Size(250_000), 
+            Criterion::Size(500_000), 
             Naming::Numbers,        // Đặt tên file xoay vòng là .1, .2
-            Cleanup::KeepLogFiles(2), // Chỉ giữ 2 file log
+            Cleanup::KeepLogFiles(10), // Chỉ giữ 2 file log
         )
         .duplicate_to_stdout(flexi_logger::Duplicate::All) // Hiển thị log ra cả console
         .start()
@@ -70,7 +70,6 @@ async fn main() {
             log::error!("❌ Event listener failed: {:?}", e)
         }
     });
-    // ✅ QUIC Transport and Listener
     let transport = QuicTransport::new();
     let addr: std::net::SocketAddr = listen_addr.parse().expect("Invalid listen address");
     let mut listener = transport
@@ -78,7 +77,6 @@ async fn main() {
         .await
         .expect("Could not create QUIC listener");
 
-    // ✅ Async accept loop
     loop {
         match listener.accept().await {
             Ok((connection, peer_addr)) => {
@@ -89,13 +87,11 @@ async fn main() {
                     if let Err(e) =
                         server::handle_connection(connection, peer_addr, app_clone).await
                     {
-                        eprintln!("❌ Error handling connection from {}: {:?}", peer_addr, e);
                         log::error!("❌ Error handling connection from {}: {:?}", peer_addr, e);
                     }
                 });
             }
             Err(e) => {
-                eprintln!("❌ Connection failed: {}", e);
                 log::error!("❌ Connection failed: {}", e);
             }
         }
@@ -108,7 +104,6 @@ async fn process_confirmation_queue(
     while let Some(download_key) = receiver.recv().await {
         let app_clone = app.clone();
         if let Err(e) = handle_single_confirmation(download_key, app_clone).await {
-            eprintln!("❌ Error processing single confirmation: {:?}", e);
             log::error!("❌ Error processing single confirmation: {:?}", e);
         }
     }
@@ -131,17 +126,6 @@ async fn handle_single_confirmation(
         .await?;
 
     // Đợi transaction được mine
-    let receipt = pending_tx.get_receipt().await?;
-
-    // println!(
-    //     "✅ Successfully confirmed downloadKey: {}, tx: {:?}",
-    //     download_key, receipt.transaction_hash
-    // );
-    log::info!(
-        "✅ Successfully confirmed downloadKey: {}, tx: {:?}",
-        download_key,
-        receipt.transaction_hash
-    );
-
+    pending_tx.get_receipt().await?;
     Ok(())
 }

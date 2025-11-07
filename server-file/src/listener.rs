@@ -19,11 +19,7 @@ pub async fn listen_download_confirmed_events(app: Arc<App>) -> Result<(), Strin
                 return Ok(());
             }
             Err(e) => {
-                println!(
-                    "❌ DownloadKeyConfirmed listener error: {:?}, reconnecting in 200ms...",
-                    e
-                );
-                sleep(Duration::from_millis(200)).await;
+                sleep(Duration::from_secs(1)).await;
             }
         }
     }
@@ -37,10 +33,10 @@ async fn listen_download_confirmed_internal(app: Arc<App>) -> Result<(), String>
         .await
         .map_err(|e| format!("Failed to connect WebSocket: {}", e))?;
 
-    println!(
-        "👂 Listening for DownloadKeyConfirmed events at {:?}",
-        app.config.contract_address
-    );
+    // println!(
+    //     "👂 Listening for DownloadKeyConfirmed events at {:?}",
+    //     app.config.contract_address
+    // );
     // Tạo filter để lắng nghe events từ contract
     // 🔥 FIX E0609: Truy cập contract_address qua config
     let filter = Filter::new().address(app.config.contract_address);
@@ -55,7 +51,6 @@ async fn listen_download_confirmed_internal(app: Arc<App>) -> Result<(), String>
     while let Some(log) = stream.next().await {
         // Decode event DownloadKeyConfirmed
         if let Ok(event) = DownloadKeyConfirmed::decode_log(&log.inner.clone().into()) {
-        
             // Xử lý event
             process_download_confirmed_event(event.downloadKey, &app).await;
         } else if let Ok(event) = FileActivated::decode_log(&log.inner.clone().into()) {   
