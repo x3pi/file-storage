@@ -12,10 +12,8 @@ use std::sync::Arc;
 use tokio::fs; // <--- THÊM: Import tokio::fs cho I/O bất đồng bộ
                // QUIC imports
 use bytes::Bytes;
-use network::quic::{QuicConnection, QuicStreamHandler}; // ✅ THÊM Imports
+use network::quic::{QuicConnection, QuicStreamHandler}; 
 use network::transport::Connection;
-
-// 🔥 THAY ĐỔI: Các hàm này giờ nhận QuicStreamHandler
 async fn send_error_response(
     stream: &mut QuicStreamHandler, // Nhận stream
     message: &str,
@@ -101,6 +99,7 @@ pub async fn handle_connection(
                 break; // Thoát vòng lặp
             }
         };
+        
         match stream_handler.recv().await {
             Ok(Some(data)) => {
                 let line = String::from_utf8_lossy(&data).trim().to_string();
@@ -126,7 +125,6 @@ pub async fn handle_connection(
                 let peer_clone = peer; // SocketAddr là Copy
 
                 tokio::spawn(async move {
-                    // `stream_handler` và `command` được MOVED vào task này
                     let mut stream_handler = stream_handler;
                     let semaphore = app_clone.task_semaphore.clone();
                     match command {
@@ -233,7 +231,6 @@ pub async fn handle_connection(
                                 .and_then(|inner_result| inner_result);
                             match store_result {
                                 Ok((_chunk_path)) => {
-                                    // _chunk_path không được dùng nên thêm _
                                     let response = GenericResponse {
                                         status: "SUCCESS".to_string(),
                                         message: "Chunk stored successfully".to_string(),
@@ -267,12 +264,9 @@ pub async fn handle_connection(
                                     }
                                 }
                             }
-                            // --- KẾT THÚC LOGIC UploadChunk ---
-                            // _permit sẽ tự động được giải phóng khi ra khỏi scope này
                         }
-
                         Command::DownloadChunkRequest { payload } => {
-                            // 6. ✅ CHỜ (await) để lấy "suất" xử lý
+                         
                             let _permit = match semaphore.acquire().await {
                                 Ok(permit) => permit,
                                 Err(e) => {
@@ -289,22 +283,19 @@ pub async fn handle_connection(
                                     return; // Thoát task này
                                 }
                             };
-                            log::debug!(
-                                "[{}] Acquired semaphore for DownloadChunkRequest",
-                                peer_clone
-                            );
-
-                            // --- TOÀN BỘ LOGIC DownloadChunkRequest CŨ CỦA BẠN VÀO ĐÂY ---
-                            // (Sử dụng app_clone và peer_clone)
-                            match verify_download_chunk(&payload, &app_clone).await {
+                            let verify_result = verify_download_chunk(&payload, &app_clone).await;
+                           
+                            match verify_result {
                                 Ok(true) => {
+                                  
                                     let response =
                                         handle_download_request(&payload, &app_clone).await;
                                     let send_result =
                                         send_download_response(&mut stream_handler, &response)
                                             .await;
-
+                                
                                     if send_result.is_ok() && response.status == "SUCCESS" {
+                                  
                                         match download_manager::descrease_chunk_count(
                                             &payload.download_key,
                                             &app_clone,
@@ -323,6 +314,8 @@ pub async fn handle_connection(
                                                 );
                                             }
                                         }
+                                        // ✅ LOG TỔNG THỜI GIAN (SUCCESS)
+                                
                                     } else if let Err(e) = send_result {
                                         log::error!("[{}] ❌ Failed to send download response: {}. Chunk count not decreased.", peer_clone, e);
                                     } else {
@@ -374,16 +367,8 @@ pub async fn handle_connection(
                                     }
                                 }
                             }
-                            // --- KẾT THÚC LOGIC DownloadChunkRequest ---
-                            // _permit sẽ tự động được giải phóng
                         }
-
-                        // 7. ✅ Các command NHẸ không cần semaphore
                         Command::ListChunksRequest { payload } => {
-                            log::debug!(
-                                "[{}] Handling ListChunksRequest (no semaphore)",
-                                peer_clone
-                            );
                             // --- TOÀN BỘ LOGIC ListChunksRequest CŨ CỦA BẠN VÀO ĐÂY ---
                             // (Sử dụng app_clone và peer_clone)
                             let file_path =

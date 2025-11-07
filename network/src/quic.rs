@@ -69,7 +69,9 @@ impl QuicStreamHandler {
     // Hàm để gửi 1 response VÀ ĐÓNG stream
     pub async fn send(&mut self, data: Bytes) -> TransportResult<()> {
         self.framed.send(data).await?;
-        self.framed.close().await?; // Đóng stream SAU KHI gửi
+        // ✅ CHỈ flush, KHÔNG chờ close → task kết thúc nhanh
+        // Stream sẽ tự động close khi drop QuicStreamHandler
+        self.framed.flush().await?;
         Ok(())
     }
 }
@@ -127,7 +129,6 @@ impl Listener for QuicListener {
     // 🔥 THAY ĐỔI: `accept` giờ chỉ chấp nhận KẾT NỐI (Connection)
     async fn accept(&mut self) -> TransportResult<(Box<dyn Connection>, SocketAddr)> {
         let connecting = self.listener.accept().await.unwrap();
-        let remote_addr = connecting.remote_address();
         
         let connection = connecting.await?;
         let addr = connection.remote_address();

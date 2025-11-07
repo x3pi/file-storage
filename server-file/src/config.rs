@@ -19,7 +19,6 @@ impl AppConfig {
         } else {
             dotenv::dotenv().ok();
         }
-        
         Ok(Self {
             rpc_url: std::env::var("RPC_URL")?,
             contract_address: std::env::var("CONTRACT_ADDRESS")?.parse()?,

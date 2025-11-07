@@ -160,9 +160,7 @@ pub async fn handle_download_request(
     let chunk_path_clone: PathBuf = chunk_path.clone();
     let read_result = tokio::task::spawn_blocking(move || fs::read(&chunk_path_clone)).await;
     let chunk_data = match read_result {
-        // I/O thành công, trả về dữ liệu
         Ok(Ok(data)) => data,
-        // I/O thất bại, trả về lỗi ngay lập tức
         Ok(Err(e)) => {
             println!("❌ Failed to read chunk: {}", e);
             return DownloadResponse {
