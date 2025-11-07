@@ -11,6 +11,8 @@ use std::sync::Arc;
 pub enum Command {
     UploadChunk { payload: UploadChunkPayload },
     DownloadChunkRequest { payload: DownloadChunkPayload },
+    ListChunksRequest { payload: ListChunksPayload },
+  GetLogsRequest { payload: Option<GetLogsPayload> },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -58,3 +60,39 @@ pub type VerifiedUploadSignatureCache = Arc<DashMap<String, Address>>;
 
 pub type ConfirmationSender = mpsc::UnboundedSender<String>;
 pub type ConfirmationReceiver = mpsc::UnboundedReceiver<String>;
+
+
+
+// --- API  ---
+// chunk response
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ListChunksPayload {
+    pub file_key: String,
+}
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ListChunksResponse {
+    pub status: String,
+    pub message: String,
+    pub chunk_indices: Vec<u64>,
+}
+
+// logs
+// (Thêm struct GetLogsPayload)
+#[derive(Serialize, Deserialize, Debug)]
+pub struct GetLogsPayload {
+    pub is_new: bool,
+}
+// ---------------------------------
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct LogFileContent {
+    pub file_name: String,
+    pub content: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct LogsResponse {
+    pub status: String,
+    pub message: String,
+    pub logs: Vec<LogFileContent>,
+}

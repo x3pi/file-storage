@@ -8,7 +8,6 @@ pub struct AppConfig {
     pub private_key: String,
     pub chain_id: u64,
     pub storage_root: String,
-    pub enable_event_listener: bool,
     pub address_sign_admin: String
 }
 impl AppConfig {
@@ -27,10 +26,6 @@ impl AppConfig {
             private_key: std::env::var("PRIVATE_KEY")?,
             chain_id: std::env::var("CHAIN_ID")?.parse()?,
             storage_root: std::env::var("STORAGE_ROOT").unwrap_or_else(|_| "./storage".to_string()),
-            enable_event_listener: std::env::var("ENABLE_EVENT_LISTENER")
-                .unwrap_or_else(|_| "false".to_string())
-                .parse()
-                .unwrap_or(false),
             address_sign_admin: std::env::var("ADDRESS_SIGN_ADMIN")?,
         })
     }

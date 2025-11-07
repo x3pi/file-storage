@@ -3,10 +3,11 @@
 use crate::app::App;
 use crate::download_manager;
 use crate::ethereum::{handle_download_request, verify_download_chunk, verify_upload_chunk};
-use crate::models::{Command, DownloadResponse, GenericResponse};
+use crate::models::{Command, DownloadResponse, GenericResponse, ListChunksResponse, LogFileContent, LogsResponse};
 use base64::{engine::general_purpose, Engine as _};
-use chrono::Local;
-use std::path::PathBuf;
+use std::fs as std_fs; // <--- THAY ĐỔI: Đổi tên std::fs thành std_fs
+use tokio::fs;         // <--- THÊM: Import tokio::fs cho I/O bất đồng bộ
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 // QUIC imports
 use bytes::Bytes;
@@ -39,17 +40,37 @@ async fn send_download_response(
     stream.send(Bytes::from(response_json)).await?;
     Ok(())
 }
-
+async fn send_list_chunks_response(
+    stream: &mut QuicStreamHandler,
+    response: &ListChunksResponse,
+)-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut response_json = serde_json::to_vec(response)?;
+    response_json.push(b'\n');
+    stream.send(Bytes::from(response_json)).await?;
+    Ok(())
+}
+async fn send_logs_response(
+    stream: &mut QuicStreamHandler,
+    response: &LogsResponse,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut response_json = serde_json::to_vec(response)?;
+    response_json.push(b'\n');
+    stream.send(Bytes::from(response_json)).await?;
+    Ok(())
+}
+fn get_file_key_path(storage_root: &Path, file_key: &str) -> PathBuf {
+    let level1 = &file_key[0..2];
+    let level2 = &file_key[2..4];
+    storage_root
+        .join(level1) // Cấp 1
+        .join(level2) // Cấp 2
+        .join(file_key)
+}
 pub async fn handle_connection(
     mut connection: Box<dyn Connection>,
     peer: std::net::SocketAddr,
     app: Arc<App>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // println!(
-    //     "\n[{}] 🔵 New connection accepted (Sẵn sàng nhận nhiều stream)",
-    //     peer
-    // );
-    // 🔥 THAY ĐỔI: Downcast `Box<dyn Connection>` về `QuicConnection`
     let quic_conn = match connection.as_any_mut().downcast_mut::<QuicConnection>() {
         Some(conn) => conn,
         None => return Err("Failed to downcast to QuicConnection".into()),
@@ -62,12 +83,12 @@ pub async fn handle_connection(
                 // Kiểm tra xem có phải lỗi đóng kết nối bình thường không
                 if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
                     if io_err.kind() == std::io::ErrorKind::ConnectionAborted {
-                        println!("[{}] 📭 Connection closed by client.", peer);
                         break; // Thoát vòng lặp, kết thúc handle_connection
                     }
                 }
                 // Lỗi khác
                 eprintln!("[{}] ❌ Error accepting stream: {}", peer, e);
+                log::error!("[{}] ❌ Error accepting stream: {}", peer, e);
                 break; // Thoát vòng lặp
             }
         };
@@ -78,13 +99,14 @@ pub async fn handle_connection(
                 let line = String::from_utf8_lossy(&data).trim().to_string();
                 if line.is_empty() {
                     println!("[{}] ⚠️  Nhận được stream rỗng, bỏ qua.", peer);
+                    log::warn!("[{}] ⚠️  Nhận được stream rỗng, bỏ qua.", peer);
                     continue; // Chờ stream tiếp theo
                 }
                 let command: Command = match serde_json::from_str(&line) {
                     Ok(cmd) => cmd,
                     Err(e) => {
-                        eprintln!("[{}] ❌ Failed to parse command: {}", peer, e);
-                        eprintln!("Raw data: {}", line);
+                        log::error!("[{}] ❌ Failed to parse command: {}", peer, e);
+                        log::error!("Raw data: {}", line);
                         // Gửi lỗi TRÊN STREAM NÀY
                         if let Err(e) =
                             send_error_response(&mut stream_handler, "Invalid command format").await
@@ -94,13 +116,9 @@ pub async fn handle_connection(
                         continue; // Chờ stream tiếp theo
                     }
                 };
-                // (Logic match command bên trong giữ nguyên từ code gốc của bạn)
+         
                 match command {
                     Command::UploadChunk { payload } => {
-                        println!(
-                            "[{}] UploadChunk - file: {}, chunk: {}",
-                            peer, payload.file_key, payload.chunk_index
-                        );
                         match verify_upload_chunk(&payload, &app).await {
                             Ok(true) => {
                                 println!("[{}] ✅ Upload signature verified for chunk {}", peer, payload.chunk_index);
@@ -191,12 +209,7 @@ pub async fn handle_connection(
                             }
                         }
                     }
-
                     Command::DownloadChunkRequest { payload } => {
-                        println!(
-                            "[{}] 📥 DownloadChunkRequest - downloadKey: {}, chunk: {}",
-                            peer, payload.download_key, payload.chunk_index
-                        );
                         match verify_download_chunk(&payload, &app).await {
                             Ok(true) => {
                                 let response = handle_download_request(&payload, &app).await;
@@ -247,7 +260,7 @@ pub async fn handle_connection(
                                 }
                             }
                             Err(er) => {
-                                eprintln!("_____--[{}] ❌ Verification error: {}", peer, er);
+                                eprintln!("-[{}] ❌ Verification error: {}", peer, er);
                                 let response = DownloadResponse {
                                     status: "ERROR".to_string(),
                                     message: format!("Verification error: {}", er),
@@ -260,6 +273,86 @@ pub async fn handle_connection(
                                     eprintln!("[{}] Error sending error response: {}", peer, e);
                                 }
                             }
+                        }
+                    }
+                    Command::ListChunksRequest {payload} =>{
+                        let file_path = get_file_key_path(&app.storage_root, &payload.file_key);
+                        match download_manager::list_chunks(&file_path).await {
+                            Ok(indices) =>{
+                                let response = ListChunksResponse {
+                                         status: "SUCCESS".to_string(),
+                                         message: format!("Found {} chunks", indices.len()),
+                                         chunk_indices: indices,
+                                     };
+                                     if let Err(e) =
+                                         send_list_chunks_response(&mut stream_handler, &response).await
+                                     {
+                                         log::error!("[{}] Error sending list chunks response: {}", peer, e);
+                                     }
+                            }
+                            Err(e) => {
+                                log::error!("[{}] Failed to list chunks: {}", peer, e);
+                                if let Err(e) = send_error_response(&mut stream_handler, &format!("{}", e)).await {
+                                    log::error!("[{}] Error sending error response: {}", peer, e);
+                                }
+                            }
+                        }
+                    }
+                    Command::GetLogsRequest {payload}=> {
+                        let get_newest_only = payload.map_or(true, |p| p.is_new);
+                        let logs_dir = PathBuf::from("./log");
+                        let mut log_contents = Vec::new();
+                        match fs::read_dir(&logs_dir).await {
+                            Ok(mut entries) => {
+                                while let Ok(Some(entry)) = entries.next_entry().await {
+                                    let path = entry.path();
+                                    if path.is_file() {
+                                        let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                        match fs::read_to_string(&path).await { 
+                                            Ok(content) => {
+                                                log_contents.push(LogFileContent { file_name, content });
+                                            }
+                                            Err(e) => {
+                                                log::warn!("[{}] Failed to read log file {:?}: {}", peer, path, e);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("[{}] Failed to read log directory: {}", peer, e);
+                                let response = LogsResponse {
+                                    status: "ERROR".to_string(),
+                                    message: format!("Failed to read log directory: {}", e),
+                                    logs: vec![],
+                                };
+                                if let Err(e) = send_logs_response(&mut stream_handler, &response).await {
+                                    log::error!("[{}] Error sending logs response: {}", peer, e);
+                                }
+                                continue; // Bỏ qua và chờ stream tiếp theo
+                            }
+                        }
+                       let final_logs = if get_newest_only {
+                            if let Some(newest_log) = log_contents.into_iter().next() {
+                                vec![newest_log]
+                            } else {
+                                vec![] 
+                            }
+                        } else {
+                            log_contents 
+                        };
+                        let message = if get_newest_only {
+                            "Retrieved newest log file".to_string()
+                        } else {
+                             format!("Retrieved all {} log files", final_logs.len())
+                        };
+                        let response = LogsResponse {
+                            status: "SUCCESS".to_string(),
+                            message,
+                            logs: final_logs,
+                        };
+                        if let Err(e) = send_logs_response(&mut stream_handler, &response).await {
+                            log::error!("[{}] Error sending logs response: {}", peer, e);
                         }
                     }
                 }
@@ -277,6 +370,5 @@ pub async fn handle_connection(
         }
     } // Kết thúc vòng lặp loop (chờ stream mới)
 
-    println!("[{}] 🔵 Connection handler finished.", peer);
     Ok(())
 }

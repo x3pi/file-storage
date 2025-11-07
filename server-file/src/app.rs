@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
-
+use tokio::sync::Semaphore;
 use crate::config::AppConfig;
 use crate::models::{ConfirmationReceiver, ConfirmationSender, DownloadSessionCache, VerifiedSignatureCache, VerifiedUploadSignatureCache};
 // 🔥 THÊM IMPORTS CHO CHANNEL VÀ MUTEX
@@ -21,7 +21,6 @@ use crate::file_contract::Files::FilesInstance;
 /// App chứa tất cả các thành phần cốt lõi của ứng dụng.
 pub struct App {
     pub config: AppConfig,
-    // Note: Không còn trường `contract_address` trực tiếp
     pub download_cache: DownloadSessionCache,
     pub verified_signature_cache: VerifiedSignatureCache,
     pub verified_upload_cache:VerifiedUploadSignatureCache,
@@ -30,6 +29,7 @@ pub struct App {
     pub storage_root: PathBuf,
     pub wallet: PrivateKeySigner,
     pub init_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
+    pub task_semaphore: Arc<Semaphore>,
 }
 
 impl App {
@@ -51,10 +51,10 @@ impl App {
         // 🔥 FIX: Sử dụng unbounded_channel để match với models.rs
         let (confirmation_sender, confirmation_receiver) = mpsc::unbounded_channel(); 
         let init_locks = Arc::new(DashMap::new());
-
-        println!("📝 File Contract address: {:?}", contract_address);
-        println!("🎉 Application setup completed!\n");
-
+        let num_cores = num_cpus::get();
+// Giới hạn 2/3 số lõi, nhưng ít nhất là 1
+        let semaphore_limit = std::cmp::max(1, (num_cores * 2) / 3);
+        let task_semaphore = Arc::new(Semaphore::new(semaphore_limit));
         Ok(Self {
             config,
             download_cache,
@@ -66,6 +66,7 @@ impl App {
             storage_root,
             wallet,
             init_locks,
+            task_semaphore,
         })
     }
    

@@ -124,6 +124,33 @@ pub async fn count_chunks(file_path: &Path) -> Result<u32, String> {
     }
     Ok(count)
 }
+pub async fn list_chunks(file_path: &Path) -> Result<Vec<u64>, String> {
+    if !file_path.exists() {
+        return Err("File path does not exist".to_string());
+    }
+    let mut chunks = Vec::new();
+    let mut entries = fs::read_dir(file_path)
+        .await
+        .map_err(|e| format!("Failed to read directory: {}", e))?;
+    while let Some(entry) = entries.next_entry().await.map_err(|e| format!("Failed to read entry: {}", e))? {
+        if entry.file_type().await.map_err(|e| format!("Failed to get file type: {}", e))?.is_file() {
+            // Lấy tên file
+            if let Some(file_name_str) = entry.file_name().to_str() {
+                // Parse tên file (là chunk index) sang u64
+                match file_name_str.parse::<u64>() {
+                    Ok(index) => chunks.push(index),
+                    Err(_) => {
+                        // Bỏ qua các file không phải là số
+                        log::warn!("Found non-numeric file in chunk directory: {}", file_name_str);
+                    }
+                }
+            }
+        }
+    }
+    // Sắp xếp lại cho dễ nhìn
+    chunks.sort();
+    Ok(chunks)
+}
 pub fn descrease_chunk_count(download_key: &str, app: &Arc<App>) -> Result<u32, String> {
     // if let Some(mut session) = app.download_cache.get_mut(download_key) {
     let mut entry = match app.download_cache.entry(download_key.to_string()) {
