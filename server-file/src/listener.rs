@@ -6,6 +6,7 @@ use alloy::transports::ws::WsConnect;
 use futures_util::StreamExt;
 
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::time::{sleep, Duration};
 
 // Import event từ file_contract
@@ -33,12 +34,6 @@ async fn listen_download_confirmed_internal(app: Arc<App>) -> Result<(), String>
         .await
         .map_err(|e| format!("Failed to connect WebSocket: {}", e))?;
 
-    // println!(
-    //     "👂 Listening for DownloadKeyConfirmed events at {:?}",
-    //     app.config.contract_address
-    // );
-    // Tạo filter để lắng nghe events từ contract
-    // 🔥 FIX E0609: Truy cập contract_address qua config
     let filter = Filter::new().address(app.config.contract_address);
     let sub = provider
         .subscribe_logs(&filter)
@@ -65,9 +60,18 @@ async fn listen_download_confirmed_internal(app: Arc<App>) -> Result<(), String>
 async fn process_download_confirmed_event(download_key: B256, app: &Arc<App>) {
     let download_key_hex = hex::encode(download_key);
     // Xóa download key khỏi cache
-    if let Some(_removed) = app.download_cache.remove(&download_key_hex) {
-        println!("✅ Removed downloadKey from cache: {}", download_key_hex);
+    if let Some(mut session) = app.download_cache.get_mut(&download_key_hex) {
+         session.confirmed_at = Some(Instant::now());
+         let app_clone = app.clone();
+         let key_to_delete = download_key_hex.clone();
+         tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(15 * 60)).await;
+            if let Some((_key, _session)) = app_clone.download_cache.remove(&key_to_delete) {
+                println!("✅ Removed expired downloadKey from cache: {}", key_to_delete);
+            }
+         });
     }
+
 }
 async fn process_file_activated_event(file_key: B256, app: &Arc<App>) {
     let file_key_hex = hex::encode(file_key);

@@ -7,6 +7,7 @@ use crate::models::{
     Command, DownloadResponse, GenericResponse, ListChunksResponse, LogFileContent, LogsContentResponse, LogsListResponse
 };
 use base64::{engine::general_purpose, Engine as _};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs; // <--- THÊM: Import tokio::fs cho I/O bất đồng bộ
@@ -24,7 +25,6 @@ async fn send_error_response(
     };
     let mut response_json = serde_json::to_vec(&response)?;
     response_json.push(b'\n');
-    // ✅ GỌI stream.send
     stream.send(Bytes::from(response_json)).await?;
     Ok(())
 }
@@ -80,12 +80,12 @@ pub async fn handle_connection(
     mut connection: Box<dyn Connection>,
     peer: std::net::SocketAddr,
     app: Arc<App>,
+    request_ip: IpAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let quic_conn = match connection.as_any_mut().downcast_mut::<QuicConnection>() {
         Some(conn) => conn,
         None => return Err("Failed to downcast to QuicConnection".into()),
     };
-    // Vòng lặp này chấp nhận MỘT STREAM MỚI mỗi lần
     loop {
         let mut stream_handler = match quic_conn.accept_stream().await {
             Ok(handler) => handler,
@@ -283,7 +283,7 @@ pub async fn handle_connection(
                                     return; // Thoát task này
                                 }
                             };
-                            let verify_result = verify_download_chunk(&payload, &app_clone).await;
+                            let verify_result = verify_download_chunk(&payload, &app_clone,request_ip).await;
                            
                             match verify_result {
                                 Ok(true) => {

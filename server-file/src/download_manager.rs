@@ -2,6 +2,8 @@ use crate::app::App;
 use crate::models::DownloadSession; // 🔥 FIX: Loại bỏ DownloadSessionCache
 use alloy::primitives::B256;
 use dashmap::mapref::one::Ref;
+use futures_util::lock::Mutex;
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::fs;
@@ -9,12 +11,12 @@ use tokio::fs;
 pub async fn initialize_download_session<'a>(
     download_key: &str,
     app: &'a Arc<App>,
+    request_ip: IpAddr,
 ) -> Result<Ref<'a, String, DownloadSession>, String> {
     // ✅ FAST PATH: Check cache trước
     if let Some(session_ref) = app.download_cache.get(download_key) {
         return Ok(session_ref);
     }
-    
     // Khóa Mutex (luồng khác sẽ đợi ở đây)
     let lock_guard = app.init_locks.entry(download_key.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
     let lock_arc = lock_guard.value().clone();
@@ -28,8 +30,6 @@ pub async fn initialize_download_session<'a>(
     }
     
     // ----------- SLOW PATH (CHỈ MỘT LUỒNG CHẠY Ở ĐÂY) -----------
-    
-    // Parse download key (phải là hex string 64 chars = 32 bytes)
     let download_key_clean = download_key.trim_start_matches("0x");
     let download_key_bytes = hex::decode(download_key_clean)
         .map_err(|e| format!("Invalid download key hex: {}", e))?;
@@ -85,6 +85,10 @@ pub async fn initialize_download_session<'a>(
         remaining_chunks: chunk_count,
         file_owner: file_info_onchain.owner,
         total_chunks: chunk_count,
+        first_ip: request_ip,
+        confirmed_at: None,
+        retry_remaining: chunk_count *3,
+        verified_signature: Arc::new(Mutex::new(None)),
     };
 
     // ✅ Insert vào cache

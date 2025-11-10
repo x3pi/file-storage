@@ -6,6 +6,7 @@ use alloy::primitives::{keccak256, Address};
 use alloy::signers::Signature;
 use base64::{engine::general_purpose, Engine as _};
 use std::fs;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -53,7 +54,7 @@ fn recover_address_from_signature(
     let recovered_address = signature
         .recover_address_from_prehash(&message_hash)
         .map_err(|e| format!("Recover address failed: {}", e))?;
-    
+
     Ok(recovered_address)
 }
 pub async fn verify_upload_chunk(
@@ -85,25 +86,33 @@ pub async fn verify_upload_chunk(
 pub async fn verify_download_chunk(
     payload: &DownloadChunkPayload,
     app: &Arc<App>,
+    request_ip: IpAddr,
 ) -> Result<bool, String> {
-    let session = download_manager::initialize_download_session(&payload.download_key, app).await?;
-    let cache_key = format!("{}:{}", payload.download_key, payload.signature);
-    let cached_owner = app.verified_signature_cache.get(&cache_key);
-    if let Some(owner) = cached_owner {
+    let session =
+        download_manager::initialize_download_session(&payload.download_key, app, request_ip)
+            .await?;
+    if session.first_ip != request_ip {
+        return Err("IP address mismatch".to_string());
+    }
+    // 1. Lấy cache chữ ký của session
+    let cache_guard = session.verified_signature.lock().await;
+    if let Some(cached_sig) = cache_guard.as_ref() {
         // Cache hit - verify với owner đã cache
-        if *owner == session.file_owner {
+        if *cached_sig == payload.signature {
             return Ok(true);
         } else {
-            println!(
-                "❌ Cached signature owner mismatch: {:?}, expected: {}",
-                owner, session.file_owner
+            log::warn!(
+                "Signature mismatch for {}: expected (cached) {}, got {}",
+                payload.download_key,
+                cached_sig,
+                payload.signature
             );
-            return Err("Cached signature owner does not match file owner".to_string());
+            return Err("Invalid signature (mismatch with cached)".to_string());
         }
     }
-
-    // Cache miss - phải recover signature
-    // 🔥 FIX: Chuyển tác vụ phục hồi chữ ký sang Blocking Thread Pool
+    // 3. (CACHE MISS) - 'cache_guard' vẫn đang giữ lock, và cache đang là None
+    // Chúng ta phải thả lock để chạy hàm blocking
+    drop(cache_guard);
     let recovered_address =
         run_recover_address_blocking(payload.download_key.clone(), payload.signature.clone())
             .await?;
@@ -117,10 +126,10 @@ pub async fn verify_download_chunk(
         return Err("Signer address does not match file owner".to_string());
     }
 
-    // ✅ Cache kết quả để tránh recover lại lần sau
-    app.verified_signature_cache
-        .insert(cache_key, recovered_address);
-
+    let mut cache_guard = session.verified_signature.lock().await;
+    if cache_guard.is_none() {
+        *cache_guard = Some(payload.signature.clone());
+    }
     Ok(true)
 }
 

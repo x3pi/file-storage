@@ -21,7 +21,6 @@ use crate::file_contract::Files::FilesInstance;
 pub struct App {
     pub config: AppConfig,
     pub download_cache: DownloadSessionCache,
-    pub verified_signature_cache: VerifiedSignatureCache,
     pub verified_upload_cache:VerifiedUploadSignatureCache,
     pub confirmation_sender: ConfirmationSender,
     pub confirmation_receiver: Arc<Mutex<ConfirmationReceiver>>,
@@ -38,9 +37,7 @@ impl App {
         let storage_root = PathBuf::from(&config.storage_root);
         // Khởi tạo wallet từ private key
         let wallet = PrivateKeySigner::from_str(&config.private_key)?;
-        let contract_address = config.contract_address; // Vẫn cần đọc từ config
         let download_cache: DownloadSessionCache = Arc::new(DashMap::new());
-        let verified_signature_cache: VerifiedSignatureCache = Arc::new(DashMap::new());
         let verified_upload_cache: VerifiedUploadSignatureCache = Arc::new(DashMap::new());
         // 🔥 FIX: Sử dụng unbounded_channel để match với models.rs
         let (confirmation_sender, confirmation_receiver) = mpsc::unbounded_channel(); 
@@ -51,7 +48,6 @@ impl App {
         Ok(Self {
             config,
             download_cache,
-            verified_signature_cache,
             confirmation_sender,
             verified_upload_cache,
             // Đảm bảo kiểu dữ liệu khớp

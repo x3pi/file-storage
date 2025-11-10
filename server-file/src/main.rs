@@ -81,11 +81,11 @@ async fn main() {
         match listener.accept().await {
             Ok((connection, peer_addr)) => {
                 let app_clone = app.clone();
-
+                log::info!("✅ New conn IP from {}", peer_addr.ip());
                 // ✅ Spawn async task cho mỗi kết nối
                 tokio::spawn(async move {
                     if let Err(e) =
-                        server::handle_connection(connection, peer_addr, app_clone).await
+                        server::handle_connection(connection, peer_addr, app_clone, peer_addr.ip()).await
                     {
                         log::error!("❌ Error handling connection from {}: {:?}", peer_addr, e);
                     }
