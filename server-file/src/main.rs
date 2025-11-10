@@ -33,7 +33,7 @@ async fn main() {
         .rotate(
             Criterion::Size(500_000), 
             Naming::Numbers,        // Đặt tên file xoay vòng là .1, .2
-            Cleanup::KeepLogFiles(10), // Chỉ giữ 2 file log
+            Cleanup::KeepLogFiles(20), // Chỉ giữ 2 file log
         )
         .duplicate_to_stdout(flexi_logger::Duplicate::All) // Hiển thị log ra cả console
         .start()

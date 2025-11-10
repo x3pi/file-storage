@@ -12,7 +12,7 @@ async fn simple_send() {
 
     // Make the network sender and send the message.
     let mut sender = SimpleSender::new();
-    
+
     // SỬA ĐỔI: Serialize tin nhắn bằng bincode trước khi gửi.
     let bytes = Bytes::from(bincode::serialize(message).unwrap());
     sender.send(address, bytes).await;

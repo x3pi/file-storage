@@ -46,7 +46,11 @@ impl<Handler: MessageHandler> Receiver<Handler> {
         }
     }
 
-    async fn spawn_runner(mut connection: Box<dyn Connection + Send>, peer: SocketAddr, handler: Handler) {
+    async fn spawn_runner(
+        mut connection: Box<dyn Connection + Send>,
+        peer: SocketAddr,
+        handler: Handler,
+    ) {
         tokio::spawn(async move {
             loop {
                 match connection.recv().await {

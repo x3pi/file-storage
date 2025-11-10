@@ -41,7 +41,7 @@ async fn broadcast() {
 
     // Make the network sender and send the message.
     let mut sender = ReliableSender::new();
-    
+
     // SỬA ĐỔI: Serialize tin nhắn bằng bincode trước khi gửi.
     let bytes = Bytes::from(bincode::serialize(message).unwrap());
     let cancel_handlers = sender.broadcast(addresses, bytes).await;

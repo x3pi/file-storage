@@ -45,10 +45,10 @@ async fn receive() {
     // SỬA ĐỔI: Sử dụng QuicTransport để kết nối và gửi tin nhắn.
     let sent = "Hello, world!";
     let bytes = Bytes::from(bincode::serialize(sent).unwrap());
-    
+
     // Tạo một client kết nối đến receiver.
     let mut client_connection = transport.connect(address).await.unwrap();
-    
+
     // Gửi tin nhắn.
     client_connection.send(bytes.clone()).await.unwrap();
 

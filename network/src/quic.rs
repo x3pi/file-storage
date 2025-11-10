@@ -87,9 +87,12 @@ impl QuicConnection {
         // println!("🔌 [QuicConnection] Đang chờ client mở stream mới...");
         let (sender, receiver) = match self.connection.accept_bi().await {
             Ok(streams) => streams,
-            Err(quinn::ConnectionError::ApplicationClosed(_)) | 
-            Err(quinn::ConnectionError::LocallyClosed) => {
-                return Err(Box::new(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "Connection closed")));
+            Err(quinn::ConnectionError::ApplicationClosed(_))
+            | Err(quinn::ConnectionError::LocallyClosed) => {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "Connection closed",
+                )));
             }
             Err(e) => {
                 return Err(Box::new(e));
@@ -99,8 +102,12 @@ impl QuicConnection {
 
         let stream = QuicStream { sender, receiver };
         let framed = Framed::new(stream, LengthDelimitedCodec::new());
-        
+
         Ok(QuicStreamHandler { framed })
+    }
+
+    pub fn clone_connection(&self) -> quinn::Connection {
+        self.connection.clone()
     }
 }
 
@@ -129,10 +136,10 @@ impl Listener for QuicListener {
     // 🔥 THAY ĐỔI: `accept` giờ chỉ chấp nhận KẾT NỐI (Connection)
     async fn accept(&mut self) -> TransportResult<(Box<dyn Connection>, SocketAddr)> {
         let connecting = self.listener.accept().await.unwrap();
-        
+
         let connection = connecting.await?;
         let addr = connection.remote_address();
-        
+
         // Trả về đối tượng QuicConnection
         let conn = Box::new(QuicConnection { connection });
         Ok((conn, addr))
@@ -150,7 +157,7 @@ impl QuicTransport {
     pub fn new() -> Self {
         let (server_config, client_config) = configure_certificates();
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
-        endpoint.set_default_client_config(client_config.clone()); 
+        endpoint.set_default_client_config(client_config.clone());
         Self {
             client_endpoint: Arc::new(endpoint),
             server_config,
@@ -188,29 +195,29 @@ fn configure_certificates() -> (ServerConfig, ClientConfig) {
     let priv_key = cert.serialize_private_key_der();
     let priv_key = rustls::PrivateKey(priv_key);
     let cert_chain = vec![rustls::Certificate(cert_der.clone())];
-    
+
     let mut transport_config = TransportConfig::default();
     transport_config.max_concurrent_uni_streams(VarInt::from_u32(100_000));
-    transport_config.max_concurrent_bidi_streams(VarInt::from_u32(100_000)); 
+    transport_config.max_concurrent_bidi_streams(VarInt::from_u32(100_000));
     const MAX_STREAM_WINDOW: u32 = 20 * 1024 * 1024;
     const MAX_CONN_WINDOW: u32 = 40 * 1024 * 1024;
     transport_config.stream_receive_window(VarInt::from_u32(MAX_STREAM_WINDOW));
     transport_config.receive_window(VarInt::from_u32(MAX_CONN_WINDOW));
     transport_config.send_window((MAX_CONN_WINDOW as u64).into());
-    transport_config.max_idle_timeout(Some(Duration::from_secs(10).try_into().unwrap()));
+    transport_config.max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()));
     transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
     let transport = Arc::new(transport_config);
 
     let mut server_config = ServerConfig::with_single_cert(cert_chain, priv_key).unwrap();
-    server_config.transport = transport.clone(); 
+    server_config.transport = transport.clone();
 
     let client_crypto = rustls::ClientConfig::builder()
         .with_safe_defaults()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
     let mut client_config = ClientConfig::new(Arc::new(client_crypto));
-    client_config.transport_config(transport); 
-    
+    client_config.transport_config(transport);
+
     (server_config, client_config)
 }
 

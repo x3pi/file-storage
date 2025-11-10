@@ -7,7 +7,7 @@ use std::error::Error;
 use std::net::SocketAddr;
 
 /// Lỗi chung cho tầng giao vận.
-pub type TransportResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+pub type TransportResult<T> = Result<T, Box<dyn Error + Send + Sync + 'static>>;
 
 /// Đại diện cho một kết nối hai chiều.
 #[async_trait]

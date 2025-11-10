@@ -7,9 +7,9 @@ mod reliable_sender;
 mod simple_sender;
 
 // SỬA ĐỔI: Khai báo các module mới cho lớp trừu tượng giao vận.
-pub mod transport;
-pub mod tcp;
 pub mod quic;
+pub mod tcp;
+pub mod transport;
 
 #[cfg(test)]
 #[path = "tests/common.rs"]
