@@ -8,7 +8,8 @@ pub struct AppConfig {
     pub private_key: String,
     pub chain_id: u64,
     pub storage_root: String,
-    pub address_sign_admin: String
+    pub address_sign_admin: String,
+    pub session_timeout_seconds: u64,
 }
 impl AppConfig {
     pub fn from_env() -> Result<Self> {
@@ -26,6 +27,7 @@ impl AppConfig {
             chain_id: std::env::var("CHAIN_ID")?.parse()?,
             storage_root: std::env::var("STORAGE_ROOT").unwrap_or_else(|_| "./storage".to_string()),
             address_sign_admin: std::env::var("ADDRESS_SIGN_ADMIN")?,
+            session_timeout_seconds: std::env::var("SESSION_TIMEOUT_SECONDS").unwrap_or_else(|_| "900".to_string()).parse()?,
         })
     }
 }

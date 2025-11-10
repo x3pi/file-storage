@@ -3,9 +3,11 @@ use crate::models::DownloadSession; // 🔥 FIX: Loại bỏ DownloadSessionCach
 use alloy::primitives::B256;
 use dashmap::mapref::one::Ref;
 use futures_util::lock::Mutex;
+use std::ffi::c_long;
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::fs;
 
 pub async fn initialize_download_session<'a>(
@@ -13,7 +15,17 @@ pub async fn initialize_download_session<'a>(
     app: &'a Arc<App>,
     request_ip: IpAddr,
 ) -> Result<Ref<'a, String, DownloadSession>, String> {
-    // ✅ FAST PATH: Check cache trước
+   let timeout_duration = Duration::from_secs(app.config.session_timeout_seconds);
+
+    // --- Logic xử lý Timeout (On-Access Expiration) ---
+    if let Some(session_ref) = app.download_cache.get(download_key) {
+        if let Some(confirmed_at) = session_ref.confirmed_at {
+            if confirmed_at.elapsed() > timeout_duration {
+                log::info!("Removing expired download key ({}s timeout): {}", app.config.session_timeout_seconds, download_key);
+                app.download_cache.remove(download_key);
+            }
+        }
+    }
     if let Some(session_ref) = app.download_cache.get(download_key) {
         return Ok(session_ref);
     }
@@ -23,7 +35,6 @@ pub async fn initialize_download_session<'a>(
 
     // Khóa Mutex (luồng khác sẽ đợi ở đây)
     let _lock = lock_arc.lock().await;
-
     // DOUBLE CHECK: Sau khi có lock, kiểm tra lại cache lần nữa
     if let Some(session_ref) = app.download_cache.get(download_key) {
         return Ok(session_ref);
@@ -57,6 +68,8 @@ pub async fn initialize_download_session<'a>(
 
     if session_info.fileKey == B256::ZERO {
         return Err(format!("Download key '{}' not found on-chain", download_key));
+    } else if session_info.isConfirmed == true {
+        return Err(format!("Download key '{}' has expired", download_key));
     }
 
     let file_info_onchain = contract
@@ -78,7 +91,7 @@ pub async fn initialize_download_session<'a>(
     let chunk_count = count_chunks(&file_path)
         .await
         .map_err(|e| format!("Failed to count chunks: {}", e))?;
-
+    
     let session = DownloadSession {
         download_key: download_key.to_string(),
         file_key: file_key.clone(),
@@ -174,7 +187,11 @@ pub fn descrease_chunk_count(download_key: &str, app: &Arc<App>) -> Result<u32, 
             }
         }
         return Ok(remaining);
-    } else {
+    } else if session.retry_remaining > 0 {
+        session.retry_remaining -= 1;
+        let remaining = session.remaining_chunks;
+        return Ok(remaining);
+    }  else {
         return Err("No remaining chunks".to_string());
     }
 }

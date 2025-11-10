@@ -287,15 +287,12 @@ pub async fn handle_connection(
                            
                             match verify_result {
                                 Ok(true) => {
-                                  
                                     let response =
                                         handle_download_request(&payload, &app_clone).await;
                                     let send_result =
                                         send_download_response(&mut stream_handler, &response)
                                             .await;
-                                
                                     if send_result.is_ok() && response.status == "SUCCESS" {
-                                  
                                         match download_manager::descrease_chunk_count(
                                             &payload.download_key,
                                             &app_clone,
@@ -314,10 +311,8 @@ pub async fn handle_connection(
                                                 );
                                             }
                                         }
-                                        // ✅ LOG TỔNG THỜI GIAN (SUCCESS)
-                                
                                     } else if let Err(e) = send_result {
-                                        log::error!("[{}] ❌ Failed to send download response: {}. Chunk count not decreased.", peer_clone, e);
+                                        // log::error!("[{}] ❌ Failed to send download response: {}.", peer_clone, e);
                                     } else {
                                         log::warn!(
                                             "[{}] ⚠️  Sent error response to client: {}",
@@ -329,11 +324,11 @@ pub async fn handle_connection(
                                 Ok(false) => {
                                     let error_message =
                                         "Ownership or signature verification failed".to_string();
-                                    log::error!(
-                                        "[{}] ❌ Verification failed: {}",
-                                        peer_clone,
-                                        error_message
-                                    );
+                                    // log::error!(
+                                    //     "[{}] ❌ Verification failed: {}",
+                                    //     peer_clone,
+                                    //     error_message
+                                    // );
                                     let response = DownloadResponse {
                                         status: "ERROR".to_string(),
                                         message: error_message,
@@ -350,7 +345,7 @@ pub async fn handle_connection(
                                     }
                                 }
                                 Err(er) => {
-                                    log::error!("-[{}] ❌ Verification error: {}", peer_clone, er);
+                                    // log::error!("-[{}] ❌ Verification error: {}", peer_clone, er);
                                     let response = DownloadResponse {
                                         status: "ERROR".to_string(),
                                         message: format!("Verification error: {}", er),

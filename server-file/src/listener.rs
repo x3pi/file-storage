@@ -64,8 +64,9 @@ async fn process_download_confirmed_event(download_key: B256, app: &Arc<App>) {
          session.confirmed_at = Some(Instant::now());
          let app_clone = app.clone();
          let key_to_delete = download_key_hex.clone();
+         let timeout_seconds = app_clone.config.session_timeout_seconds;
          tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(15 * 60)).await;
+            tokio::time::sleep(Duration::from_secs(timeout_seconds)).await;
             if let Some((_key, _session)) = app_clone.download_cache.remove(&key_to_delete) {
                 println!("✅ Removed expired downloadKey from cache: {}", key_to_delete);
             }

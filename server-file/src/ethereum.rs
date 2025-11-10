@@ -83,6 +83,7 @@ pub async fn verify_upload_chunk(
         .insert(payload.file_key.clone(), recovered_address);
     Ok(true)
 }
+
 pub async fn verify_download_chunk(
     payload: &DownloadChunkPayload,
     app: &Arc<App>,
@@ -158,7 +159,7 @@ pub async fn handle_download_request(
     };
 
     // Check permission
-    if session.remaining_chunks == 0 {
+    if session.remaining_chunks == 0 && session.retry_remaining == 0 {
         return DownloadResponse {
             status: "ERROR".to_string(),
             message: "No remaining downloads for this key".to_string(),

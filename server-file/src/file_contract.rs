@@ -33,6 +33,7 @@ sol!(
 
         // Sửa lại struct này cho khớp với struct `DownloadSession` trong Solidity.
         // Tên struct đã được đổi thành `DownloadSession` cho nhất quán.
+        #[derive(Debug)]
         struct DownloadSession {
             bytes32 fileKey;
             address user;
