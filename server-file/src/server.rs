@@ -4,7 +4,8 @@ use crate::app::App;
 use crate::download_manager;
 use crate::ethereum::{handle_download_request, verify_download_chunk, verify_upload_chunk};
 use crate::models::{
-    Command, DownloadResponse, GenericResponse, ListChunksResponse, LogFileContent, LogsContentResponse, LogsListResponse
+    Command, DownloadResponse, GenericResponse, ListChunksResponse, LogFileContent,
+    LogsContentResponse, LogsListResponse,
 };
 use base64::{engine::general_purpose, Engine as _};
 use std::net::IpAddr;
@@ -13,7 +14,7 @@ use std::sync::Arc;
 use tokio::fs; // <--- THÊM: Import tokio::fs cho I/O bất đồng bộ
                // QUIC imports
 use bytes::Bytes;
-use network::quic::{QuicConnection, QuicStreamHandler}; 
+use network::quic::{QuicConnection, QuicStreamHandler};
 use network::transport::Connection;
 async fn send_error_response(
     stream: &mut QuicStreamHandler, // Nhận stream
@@ -99,7 +100,7 @@ pub async fn handle_connection(
                 break; // Thoát vòng lặp
             }
         };
-        
+
         match stream_handler.recv().await {
             Ok(Some(data)) => {
                 let line = String::from_utf8_lossy(&data).trim().to_string();
@@ -146,6 +147,11 @@ pub async fn handle_connection(
                                     return; // Thoát task này
                                 }
                             };
+                            log::info!(
+                                "[{}] ✅ Upload signature verified for chunk {}",
+                                peer_clone,
+                                payload.chunk_index
+                            );
                             match verify_upload_chunk(&payload, &app_clone).await {
                                 Ok(true) => {
                                     // log::info!(
@@ -266,7 +272,6 @@ pub async fn handle_connection(
                             }
                         }
                         Command::DownloadChunkRequest { payload } => {
-                         
                             let _permit = match semaphore.acquire().await {
                                 Ok(permit) => permit,
                                 Err(e) => {
@@ -283,8 +288,9 @@ pub async fn handle_connection(
                                     return; // Thoát task này
                                 }
                             };
-                            let verify_result = verify_download_chunk(&payload, &app_clone,request_ip).await;
-                           
+                            let verify_result =
+                                verify_download_chunk(&payload, &app_clone, request_ip).await;
+
                             match verify_result {
                                 Ok(true) => {
                                     let response =
@@ -298,11 +304,11 @@ pub async fn handle_connection(
                                             &app_clone,
                                         ) {
                                             Ok(remaining) => {
-                                                // log::info!(
-                                                //     "[{}] ✅ Chunk decreased. Remaining: {}",
-                                                //     peer_clone,
-                                                //     remaining
-                                                // );
+                                                log::info!(
+                                                    "[{}] ✅ Chunk decreased. Remaining: {}",
+                                                    peer_clone,
+                                                    remaining
+                                                );
                                             }
                                             Err(e) => {
                                                 log::error!(
@@ -401,23 +407,34 @@ pub async fn handle_connection(
                                 }
                             }
                         }
-                       Command::GetLogList { payload: _ } => {
+                        Command::GetLogList { payload: _ } => {
                             log::debug!("[{}] Handling GetLogList (no semaphore)", peer_clone);
-                            
+
                             let logs_dir = PathBuf::from("./log");
                             let mut files_with_meta = Vec::new();
 
                             let mut entries = match fs::read_dir(&logs_dir).await {
                                 Ok(entries) => entries,
                                 Err(e) => {
-                                    log::error!("[{}] Failed to read log directory: {}", peer_clone, e);
+                                    log::error!(
+                                        "[{}] Failed to read log directory: {}",
+                                        peer_clone,
+                                        e
+                                    );
                                     let response = LogsListResponse {
                                         status: "ERROR".to_string(),
                                         message: format!("Failed to read log directory: {}", e),
                                         available_files: vec![],
                                     };
-                                    if let Err(e) = send_logs_list_response(&mut stream_handler, &response).await {
-                                        log::error!("[{}] Error sending logs list response: {}", peer_clone, e);
+                                    if let Err(e) =
+                                        send_logs_list_response(&mut stream_handler, &response)
+                                            .await
+                                    {
+                                        log::error!(
+                                            "[{}] Error sending logs list response: {}",
+                                            peer_clone,
+                                            e
+                                        );
                                     }
                                     return; // Thoát task
                                 }
@@ -433,25 +450,37 @@ pub async fn handle_connection(
                                     }
                                 }
                             }
-                            
+
                             // Sắp xếp: file mới nhất lên đầu
                             files_with_meta.sort_by(|a, b| b.1.cmp(&a.1));
-                            
-                            let all_file_names: Vec<String> = files_with_meta.iter()
-                                .map(|(path, _)| path.file_name().unwrap_or_default().to_string_lossy().to_string())
+
+                            let all_file_names: Vec<String> = files_with_meta
+                                .iter()
+                                .map(|(path, _)| {
+                                    path.file_name()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .to_string()
+                                })
                                 .collect();
 
                             let message = format!("Found {} log files.", all_file_names.len());
-                            
+
                             let response = LogsListResponse {
                                 status: "SUCCESS".to_string(),
                                 message,
                                 available_files: all_file_names,
                             };
-                            
+
                             // Gửi response (payload nhỏ, sẽ chạy nhanh)
-                            if let Err(e) = send_logs_list_response(&mut stream_handler, &response).await {
-                                log::error!("[{}] Error sending logs list response: {}", peer_clone, e);
+                            if let Err(e) =
+                                send_logs_list_response(&mut stream_handler, &response).await
+                            {
+                                log::error!(
+                                    "[{}] Error sending logs list response: {}",
+                                    peer_clone,
+                                    e
+                                );
                             }
                         }
 
@@ -461,33 +490,49 @@ pub async fn handle_connection(
 
                             let logs_dir = PathBuf::from("./log");
                             let file_to_read_path = logs_dir.join(&payload.file_name);
-                            
+
                             let mut message: String;
                             let mut response_status = "SUCCESS".to_string();
                             let mut final_log_content: Option<LogFileContent> = None;
 
-                            if !file_to_read_path.starts_with(&logs_dir) || !file_to_read_path.is_file() {
+                            if !file_to_read_path.starts_with(&logs_dir)
+                                || !file_to_read_path.is_file()
+                            {
                                 // Ngăn chặn tấn công (directory traversal) và kiểm tra file tồn tại
-                                message = format!("Error: File '{}' not found or invalid.", payload.file_name);
+                                message = format!(
+                                    "Error: File '{}' not found or invalid.",
+                                    payload.file_name
+                                );
                                 response_status = "ERROR".to_string();
                             } else {
                                 // File hợp lệ -> Đọc nội dung
                                 match fs::read_to_string(&file_to_read_path).await {
                                     Ok(content) => {
-                                        final_log_content = Some(LogFileContent { 
-                                            file_name: payload.file_name.clone(), 
-                                            content 
+                                        final_log_content = Some(LogFileContent {
+                                            file_name: payload.file_name.clone(),
+                                            content,
                                         });
-                                        message = format!("Retrieved content for file: {}", payload.file_name);
+                                        message = format!(
+                                            "Retrieved content for file: {}",
+                                            payload.file_name
+                                        );
                                     }
                                     Err(e) => {
-                                        log::warn!("[{}] Failed to read log file {:?}: {}", peer_clone, file_to_read_path, e);
-                                        message = format!("Found file '{}', but failed to read its content: {}", payload.file_name, e);
+                                        log::warn!(
+                                            "[{}] Failed to read log file {:?}: {}",
+                                            peer_clone,
+                                            file_to_read_path,
+                                            e
+                                        );
+                                        message = format!(
+                                            "Found file '{}', but failed to read its content: {}",
+                                            payload.file_name, e
+                                        );
                                         response_status = "ERROR".to_string();
                                     }
                                 }
                             }
-                            
+
                             let response = LogsContentResponse {
                                 status: response_status,
                                 message,
@@ -495,8 +540,14 @@ pub async fn handle_connection(
                             };
 
                             // Gửi response (payload LỚN, 500KB+)
-                            if let Err(e) = send_logs_content_response(&mut stream_handler, &response).await {
-                                log::error!("[{}] Error sending logs content response: {}", peer_clone, e);
+                            if let Err(e) =
+                                send_logs_content_response(&mut stream_handler, &response).await
+                            {
+                                log::error!(
+                                    "[{}] Error sending logs content response: {}",
+                                    peer_clone,
+                                    e
+                                );
                             }
                         }
                     }

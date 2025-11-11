@@ -31,7 +31,7 @@ async fn main() {
         .format_for_files(detailed_format) // Format chi tiết cho file
         .format_for_stdout(detailed_format) // Format chi tiết cho console
         .rotate(
-            Criterion::Size(500_000), 
+            Criterion::Size(1_000_000), 
             Naming::Numbers,        // Đặt tên file xoay vòng là .1, .2
             Cleanup::KeepLogFiles(20), // Chỉ giữ 2 file log
         )
