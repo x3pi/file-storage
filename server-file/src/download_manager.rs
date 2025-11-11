@@ -3,7 +3,6 @@ use crate::models::DownloadSession; // 🔥 FIX: Loại bỏ DownloadSessionCach
 use alloy::primitives::B256;
 use dashmap::mapref::one::Ref;
 use futures_util::lock::Mutex;
-use std::ffi::c_long;
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -30,9 +29,13 @@ pub async fn initialize_download_session<'a>(
         return Ok(session_ref);
     }
     // Khóa Mutex (luồng khác sẽ đợi ở đây)
-    let lock_guard = app.init_locks.entry(download_key.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
-    let lock_arc = lock_guard.value().clone();
-
+    let lock_arc = {
+        let entry = app
+            .init_locks
+            .entry(download_key.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
+        Arc::clone(entry.value())
+    };
     // Khóa Mutex (luồng khác sẽ đợi ở đây)
     let _lock = lock_arc.lock().await;
     // DOUBLE CHECK: Sau khi có lock, kiểm tra lại cache lần nữa

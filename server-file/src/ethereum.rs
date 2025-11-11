@@ -89,14 +89,19 @@ pub async fn verify_download_chunk(
     app: &Arc<App>,
     request_ip: IpAddr,
 ) -> Result<bool, String> {
-    let session =
+    let session_ref =
         download_manager::initialize_download_session(&payload.download_key, app, request_ip)
             .await?;
-    if session.first_ip != request_ip {
+    let session_first_ip = session_ref.first_ip;
+    let session_owner = session_ref.file_owner;
+    let signature_cache = session_ref.verified_signature.clone();
+    drop(session_ref);
+
+    if session_first_ip != request_ip {
         return Err("IP address mismatch".to_string());
     }
     // 1. Lấy cache chữ ký của session
-    let cache_guard = session.verified_signature.lock().await;
+    let cache_guard = signature_cache.lock().await;
     if let Some(cached_sig) = cache_guard.as_ref() {
         // Cache hit - verify với owner đã cache
         if *cached_sig == payload.signature {
@@ -119,15 +124,15 @@ pub async fn verify_download_chunk(
             .await?;
 
     // Verify owner
-    if recovered_address != session.file_owner {
+    if recovered_address != session_owner {
         println!(
             "❌ Not match file owner: {}, recovered address: {}",
-            session.file_owner, recovered_address
+            session_owner, recovered_address
         );
         return Err("Signer address does not match file owner".to_string());
     }
 
-    let mut cache_guard = session.verified_signature.lock().await;
+    let mut cache_guard = signature_cache.lock().await;
     if cache_guard.is_none() {
         *cache_guard = Some(payload.signature.clone());
     }
