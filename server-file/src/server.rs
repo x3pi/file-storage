@@ -124,7 +124,7 @@ pub async fn handle_connection(
                 };
                 let app_clone = app.clone();
                 let peer_clone = peer; // SocketAddr là Copy
-
+                    
                 tokio::spawn(async move {
                     let mut stream_handler = stream_handler;
                     let semaphore = app_clone.task_semaphore.clone();
@@ -147,11 +147,11 @@ pub async fn handle_connection(
                                     return; // Thoát task này
                                 }
                             };
-                            log::info!(
-                                "[{}] ✅ Upload signature verified for chunk {}",
-                                peer_clone,
-                                payload.chunk_index
-                            );
+                            // log::info!(
+                            //     "[{}] ✅ Upload signature verified for chunk {}",
+                            //     peer_clone,
+                            //     payload.chunk_index
+                            // );
                             match verify_upload_chunk(&payload, &app_clone).await {
                                 Ok(true) => {
                                     // log::info!(
@@ -304,11 +304,11 @@ pub async fn handle_connection(
                                             &app_clone,
                                         ) {
                                             Ok(remaining) => {
-                                                log::info!(
-                                                    "[{}] ✅ Chunk decreased. Remaining: {}",
-                                                    peer_clone,
-                                                    remaining
-                                                );
+                                                // log::info!(
+                                                //     "[{}] ✅ Chunk decreased. Remaining: {}",
+                                                //     peer_clone,
+                                                //     remaining
+                                                // );
                                             }
                                             Err(e) => {
                                                 log::error!(
