@@ -47,10 +47,13 @@ pub struct DownloadResponse {
 
 #[derive(Debug, Clone)]
 pub struct DownloadSession {
+    #[allow(dead_code)]
     pub download_key: String,
+    #[allow(dead_code)]
     pub file_key: String,
     pub file_owner: Address,
     pub remaining_chunks: u32,
+    #[allow(dead_code)]
     pub total_chunks: u32,
     pub first_ip: IpAddr,
     pub retry_remaining:u32,
@@ -61,6 +64,7 @@ pub struct DownloadSession {
 pub type DownloadSessionCache = Arc<DashMap<String, DownloadSession>>;
 
 // Cache verified signatures: (download_key + signature) -> verified owner
+#[allow(dead_code)]
 pub type VerifiedSignatureCache = Arc<DashMap<String, Address>>;
 pub type VerifiedUploadSignatureCache = Arc<DashMap<String, Address>>;
 

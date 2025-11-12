@@ -236,7 +236,7 @@ pub async fn handle_connection(
                                 })
                                 .and_then(|inner_result| inner_result);
                             match store_result {
-                                Ok((_chunk_path)) => {
+                                Ok(_chunk_path) => {
                                     let response = GenericResponse {
                                         status: "SUCCESS".to_string(),
                                         message: "Chunk stored successfully".to_string(),
@@ -317,7 +317,7 @@ pub async fn handle_connection(
                                                 );
                                             }
                                         }
-                                    } else if let Err(e) = send_result {
+                                    } else if let Err(_e) = send_result {
                                         // log::error!("[{}] ❌ Failed to send download response: {}.", peer_clone, e);
                                     } else {
                                         log::warn!(
@@ -491,7 +491,7 @@ pub async fn handle_connection(
                             let logs_dir = PathBuf::from("./log");
                             let file_to_read_path = logs_dir.join(&payload.file_name);
 
-                            let mut message: String;
+                            let message: String;
                             let mut response_status = "SUCCESS".to_string();
                             let mut final_log_content: Option<LogFileContent> = None;
 

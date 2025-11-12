@@ -6,6 +6,7 @@ pub struct AppConfig {
     pub rpc_url: String,
     pub contract_address: Address,
     pub private_key: String,
+    #[allow(dead_code)]
     pub chain_id: u64,
     pub storage_root: String,
     pub address_sign_admin: String,
