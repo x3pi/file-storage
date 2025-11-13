@@ -86,9 +86,9 @@ pub async fn initialize_download_session<'a>(
         .map_err(|e| format!("System time error: {}", e))?
         .as_secs();
    if file_info_onchain.expireTime <= current_time_secs {
-        return Err(format!("Download key '{}' has expired", download_key));
+        return Err(format!("Download key has expired"));
     } else if file_info_onchain.status == FileStatus::Deleted {
-        return Err(format!("File associated with download key '{}' has been deleted", download_key));
+        return Err(format!("File  has been deleted"));
     }
     // Đường dẫn file
     let file_key = hex::encode(session_info.fileKey);
