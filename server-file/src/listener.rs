@@ -19,7 +19,7 @@ pub async fn listen_download_confirmed_events(app: Arc<App>) -> Result<(), Strin
             Ok(_) => {
                 return Ok(());
             }
-            Err(e) => {
+            Err(_) => {
                 sleep(Duration::from_secs(1)).await;
             }
         }
