@@ -6,7 +6,12 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio::sync::Semaphore;
 use crate::config::AppConfig;
-use crate::models::{ConfirmationReceiver, ConfirmationSender, DownloadSessionCache, VerifiedSignatureCache, VerifiedUploadSignatureCache};
+use crate::models::{
+    ConfirmationReceiver,
+    ConfirmationSender,
+    DownloadSessionCache,
+    VerifiedUploadSignatureCache,
+};
 
 // Imports cho Alloy
 use alloy::{
@@ -35,15 +40,13 @@ impl App {
     pub async fn setup() -> Result<Self> {
         let config = AppConfig::from_env()?;
         let storage_root = PathBuf::from(&config.storage_root);
-        // Khởi tạo wallet từ private key
         let wallet = PrivateKeySigner::from_str(&config.private_key)?;
         let download_cache: DownloadSessionCache = Arc::new(DashMap::new());
         let verified_upload_cache: VerifiedUploadSignatureCache = Arc::new(DashMap::new());
-        // 🔥 FIX: Sử dụng unbounded_channel để match với models.rs
         let (confirmation_sender, confirmation_receiver) = mpsc::unbounded_channel(); 
         let init_locks = Arc::new(DashMap::new());
         let num_cores = num_cpus::get();
-        let semaphore_limit = std::cmp::max(1, num_cores);
+        let semaphore_limit = std::cmp::max(1, num_cores*2);
         let task_semaphore = Arc::new(Semaphore::new(semaphore_limit));
         Ok(Self {
             config,

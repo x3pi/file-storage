@@ -25,15 +25,16 @@ async fn main() {
         .unwrap()
         .log_to_file(
             FileSpec::default()
-                .directory("log") // Thư mục "log"
-                .basename("app"), // Tên file cơ sở
-        )
+                .directory("log") 
+                .basename("app")
+            )
+        .append() // <--- THÊM DÒNG NÀY
         .format_for_files(detailed_format) // Format chi tiết cho file
         .format_for_stdout(detailed_format) // Format chi tiết cho console
         .rotate(
-            Criterion::Size(1_000_000), 
+            Criterion::Size(2_000_000), 
             Naming::Numbers,        // Đặt tên file xoay vòng là .1, .2
-            Cleanup::KeepLogFiles(20), // Chỉ giữ 2 file log
+            Cleanup::KeepLogFiles(40), // Chỉ giữ 2 file log
         )
         .duplicate_to_stdout(flexi_logger::Duplicate::All) // Hiển thị log ra cả console
         .start()

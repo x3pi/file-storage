@@ -2,6 +2,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct RetryConfig {
     pub max_retries: u32,
     pub delay_ms: u64,
@@ -15,6 +16,7 @@ impl Default for RetryConfig {
         }
     }
 }
+#[allow(dead_code)]
 pub fn is_nonce_error(error_msg: &str) -> bool {
     let error_lower = error_msg.to_lowercase();
     error_lower.contains("invalid nonce")
@@ -24,6 +26,7 @@ pub fn is_nonce_error(error_msg: &str) -> bool {
         || error_lower.contains("replacement transaction underpriced")
 }
 
+#[allow(dead_code)]
 pub async fn retry_on_nonce_error<F, Fut, T, E>(
     mut operation: F,
     config: RetryConfig,

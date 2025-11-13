@@ -68,7 +68,6 @@ pub async fn initialize_download_session<'a>(
         .call()
         .await
         .map_err(|e| format!("Failed to get download session info: {}", e))?;
-
     if session_info.fileKey == B256::ZERO {
         return Err(format!("Download key '{}' not found on-chain", download_key));
     } else if session_info.isConfirmed == true {
