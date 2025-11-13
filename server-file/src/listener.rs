@@ -20,7 +20,6 @@ pub async fn listen_download_confirmed_events(app: Arc<App>) -> Result<(), Strin
                 return Ok(());
             }
             Err(e) => {
-                log::warn!("Lỗi listener download_confirmed_events: {}. Thử lại sau 1s.", e);
                 sleep(Duration::from_secs(1)).await;
             }
         }

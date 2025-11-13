@@ -6,7 +6,7 @@ sol!(
         // --- Enums ---
         // Định nghĩa enum tương ứng với Solidity để dễ sử dụng hơn.
         // Trong ABI, nó vẫn sẽ được coi là uint8.
-        #[derive(Debug)]
+       #[derive(Debug, PartialEq, Eq)]
         enum FileStatus {
             Processing, // 0
             Active,     // 1
@@ -37,8 +37,8 @@ sol!(
         struct DownloadSession {
             bytes32 fileKey;
             address user;
-            address[] confirmations; // Thêm trường bị thiếu
-            bool isConfirmed;        // Thêm trường bị thiếu
+            address[] confirmations; 
+            bool isConfirmed;        
         }
 
         // --- Events ---
