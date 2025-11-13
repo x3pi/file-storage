@@ -1,4 +1,5 @@
 use crate::app::App;
+use crate::file_contract::Files::FileStatus;
 use crate::models::DownloadSession; // 🔥 FIX: Loại bỏ DownloadSessionCache
 use alloy::primitives::B256;
 use dashmap::mapref::one::Ref;
@@ -6,7 +7,7 @@ use futures_util::lock::Mutex;
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 
 pub async fn initialize_download_session<'a>(
@@ -72,14 +73,22 @@ pub async fn initialize_download_session<'a>(
         return Err(format!("Download key '{}' not found on-chain", download_key));
     } else if session_info.isConfirmed == true {
         return Err(format!("Download key '{}' has expired", download_key));
-    }
+    } 
 
     let file_info_onchain = contract
         .getFileInfo(session_info.fileKey)
         .call()
         .await
         .map_err(|e| format!("Failed to fetch file info: {}", e))?;
-
+    let current_time_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("System time error: {}", e))?
+        .as_secs();
+   if file_info_onchain.expireTime <= current_time_secs {
+        return Err(format!("Download key has expired"));
+    } else if file_info_onchain.status == FileStatus::Deleted {
+        return Err(format!("File  has been deleted"));
+    }
     // Đường dẫn file
     let file_key = hex::encode(session_info.fileKey);
     let level1 = &file_key[0..2];
