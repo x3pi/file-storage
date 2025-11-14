@@ -106,14 +106,15 @@ pub async fn handle_connection(
                 break; // Thoát vòng lặp
             }
         };
-
         match stream_handler.recv().await {
             Ok(Some(data)) => {
+                log::debug!("[{}] 📥 Received {} bytes from client", peer, data.len());
                 let line = String::from_utf8_lossy(&data).trim().to_string();
                 if line.is_empty() {
                     log::warn!("[{}] ⚠️ Received empty stream, skipping.", peer);
                     continue; // Chờ stream tiếp theo
                 }
+                log::debug!("[{}] 🔍 Parsing command...", peer);
 
                 let command: Command = match serde_json::from_str(&line) {
                     Ok(cmd) => cmd,
@@ -262,29 +263,47 @@ pub async fn handle_connection(
                                         serde_json::to_vec(&response).unwrap_or_default(); // Sửa lỗi unwrap
                                     response_json.push(b'\n');
 
+                                    log::debug!(
+                                        "[{}] 📤 Sending SUCCESS response for chunk {} -k {} ({} bytes)",
+                                        peer_clone,
+                                        log_chunk_index,
+                                        log_file_key,
+                                        response_json.len()
+                                    );
+
                                     // THÊM: Ghi lại thời điểm gửi xong
+                                    let send_start_time = Instant::now();
+                                    
+                                    if let Err(e) =
+                                        stream_handler.send(Bytes::from(response_json)).await
+                                    {
+                                        log::error!(
+                                            "[{}] ❌ Error sending success response: {}",
+                                            peer_clone,
+                                            e
+                                        );
+                                    } else {
+                                        log::debug!(
+                                            "[{}] ✅ SUCCESS response sent for chunk {} -k {}",
+                                            peer_clone,
+                                            log_chunk_index,
+                                            log_file_key
+                                        );
+                                    }
+
                                     let send_done_time = Instant::now();
 
                                     // THÊM: Tính toán và log thời gian
                                     let processing_duration =
                                         processing_done_time.duration_since(start_time);
                                     let send_duration =
-                                        send_done_time.duration_since(processing_done_time);
+                                        send_done_time.duration_since(send_start_time);
                                     let total_duration = send_done_time.duration_since(start_time);
                                     let processing_time_formatted = processing_done_wall_clock
                                         .format("%H:%M:%S.%3f")
                                         .to_string();
                                     let start_time_formatted =
                                         start_time_wall_clock.format("%H:%M:%S.%3f").to_string();
-                                    if let Err(e) =
-                                        stream_handler.send(Bytes::from(response_json)).await
-                                    {
-                                        log::error!(
-                                            "[{}] Error sending success response: {}",
-                                            peer_clone,
-                                            e
-                                        );
-                                    }
                                     log::info!(
                                 "[{}] 📈 [UPLOAD_TIMING] Chunk {} -k {}, .Time: Receive:{:?}, Process: {:?} | Duration: Processing: {:?}, Send: {:?}, Total: {:?}",
                                 peer_clone,

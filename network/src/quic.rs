@@ -61,17 +61,27 @@ impl QuicStreamHandler {
     // Hàm để đọc 1 request
     pub async fn recv(&mut self) -> TransportResult<Option<Bytes>> {
         match self.framed.next().await {
-            Some(Ok(bytes)) => Ok(Some(bytes.freeze())),
-            Some(Err(e)) => Err(Box::new(e)),
-            None => Ok(None),
+            Some(Ok(bytes)) => {
+                log::trace!("📥 QuicStreamHandler received {} bytes", bytes.len());
+                Ok(Some(bytes.freeze()))
+            }
+            Some(Err(e)) => {
+                log::error!("❌ QuicStreamHandler recv error: {}", e);
+                Err(Box::new(e))
+            }
+            None => {
+                Ok(None)
+            }
         }
     }
     // Hàm để gửi 1 response VÀ ĐÓNG stream
     pub async fn send(&mut self, data: Bytes) -> TransportResult<()> {
+        log::trace!("📤 QuicStreamHandler sending {} bytes", data.len());
         self.framed.send(data).await?;
         // ✅ CHỈ flush, KHÔNG chờ close → task kết thúc nhanh
         // Stream sẽ tự động close khi drop QuicStreamHandler
         self.framed.flush().await?;
+        log::trace!("✅ QuicStreamHandler flush completed");
         Ok(())
     }
 }
