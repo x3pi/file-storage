@@ -113,8 +113,8 @@ pub async fn start_chain_id_monitor(app: Arc<App>) {
         if let Some(provider) = &provider_option {
             log::debug!("Polling for chain ID over WebSocket...");
             match provider.get_chain_id().await {
-                Ok(chain_id) => {
-                    log::info!("✅ Chain ID check OK (over Ws): {}", chain_id);
+                Ok(_) => {
+                    // log::info!("✅ Chain ID check OK (over Ws): {}", chain_id);
                 }
                 Err(e) => {
                     log::warn!("Failed to get chain ID over WebSocket: {}", e);
