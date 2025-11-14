@@ -158,9 +158,10 @@ pub async fn handle_connection(
                                 }
                             };
                             log::info!(
-                                "[{}] ✅ Upload signature verified for chunk {}",
+                                "[{}] ✅ Upload signature verified for chunk {} -k {}",
                                 peer_clone,
-                                payload.chunk_index
+                                payload.chunk_index,
+                                payload.file_key
                             );
                             match verify_upload_chunk(&payload, &app_clone).await {
                                 Ok(true) => {
@@ -367,8 +368,12 @@ pub async fn handle_connection(
                                                 );
                                             }
                                         }
-                                    } else if let Err(_e) = send_result {
-                                        // log::error!("[{}] ❌ Failed to send download response: {}.", peer_clone, e);
+                                    } else if let Err(e) = send_result {
+                                        log::error!(
+                                            "[{}] ❌ Failed to send download response: {}.",
+                                            peer_clone,
+                                            e
+                                        );
                                     } else {
                                         log::warn!(
                                             "[{}] ⚠️  Sent error response to client: {}",
