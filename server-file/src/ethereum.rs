@@ -172,23 +172,15 @@ pub async fn handle_download_request(
         };
     }
     // Loại bỏ sleep và retry như yêu cầu
-    let chunk_path_clone: PathBuf = chunk_path.clone();
-    let read_result = tokio::task::spawn_blocking(move || fs::read(&chunk_path_clone)).await;
-    let chunk_data = match read_result {
-        Ok(Ok(data)) => data,
-        Ok(Err(e)) => {
+    // let chunk_path_clone: PathBuf = chunk_path.clone();
+    // let read_result = tokio::task::spawn_blocking(move || fs::read(&chunk_path_clone)).await;
+    let chunk_data = match fs::read(&chunk_path) {
+        Ok(data) => data,
+        Err(e) => {
             println!("❌ Failed to read chunk: {}", e);
             return DownloadResponse {
                 status: "ERROR".to_string(),
                 message: format!("Failed to read chunk: {}", e),
-                chunk_data_base64: None,
-            };
-        }
-        // Lỗi Task Join (Lỗi nội bộ nghiêm trọng)
-        Err(e) => {
-            return DownloadResponse {
-                status: "ERROR".to_string(),
-                message: format!("Internal server error (Task join failed): {}", e),
                 chunk_data_base64: None,
             };
         }

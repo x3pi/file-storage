@@ -13,16 +13,15 @@ use tokio::time::{sleep, Duration};
 use crate::file_contract::Files::{DownloadKeyConfirmed, FileActivated};
 use alloy::sol_types::SolEvent;
 
-pub async fn listen_download_confirmed_events(app: Arc<App>) -> Result<(), String> {
+pub async fn listen_download_confirmed_events(app: Arc<App>){
     loop {
         match listen_download_confirmed_internal(app.clone()).await {
             Ok(_) => {
-                return Ok(());
             }
             Err(_) => {
             }
         }
-        sleep(Duration::from_secs(1)).await;
+        sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -68,7 +67,7 @@ async fn process_download_confirmed_event(download_key: B256, app: &Arc<App>) {
          tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(timeout_seconds)).await;
             if let Some((_key, _session)) = app_clone.download_cache.remove(&key_to_delete) {
-                println!("✅ Removed expired downloadKey from cache: {}", key_to_delete);
+                log::info!("✅ Removed expired downloadKey from cache: {}", key_to_delete);
             }
          });
     }
@@ -77,7 +76,7 @@ async fn process_download_confirmed_event(download_key: B256, app: &Arc<App>) {
 async fn process_file_activated_event(file_key: B256, app: &Arc<App>) {
     let file_key_hex = hex::encode(file_key);
     if let Some(_removed) = app.verified_upload_cache.remove(&file_key_hex) {
-        println!(
+         log::info!(
             "✅Removed fileKey from upload signature cache: {}",
             file_key_hex
         );

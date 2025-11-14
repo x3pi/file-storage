@@ -23,4 +23,5 @@ network = { path = "../network" }
 log = "0.4"
 flexi_logger = { version = "0.28", features = ["compress", "async"] }
 num_cpus = "1.16.0"
+sysinfo = "0.31"
 [build-dependencies]

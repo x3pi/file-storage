@@ -8,6 +8,7 @@ use crate::models::{
     LogsContentResponse, LogsListResponse,
 };
 use base64::{engine::general_purpose, Engine as _};
+use chrono::Local;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -86,7 +87,10 @@ pub async fn handle_connection(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let quic_conn = match connection.as_any_mut().downcast_mut::<QuicConnection>() {
         Some(conn) => conn,
-        None => return Err("Failed to downcast to QuicConnection".into()),
+        None => {
+            log::error!("[{}] ❌ Failed to downcast to QuicConnection", peer);
+            return Err("Failed to downcast to QuicConnection".into());
+        }
     };
     loop {
         let mut stream_handler = match quic_conn.accept_stream().await {
@@ -98,6 +102,7 @@ pub async fn handle_connection(
                         break; // Thoát vòng lặp, kết thúc handle_connection
                     }
                 }
+                log::error!("[{}] ❌ Error accepting stream: {}", peer, e);
                 break; // Thoát vòng lặp
             }
         };
@@ -106,19 +111,20 @@ pub async fn handle_connection(
             Ok(Some(data)) => {
                 let line = String::from_utf8_lossy(&data).trim().to_string();
                 if line.is_empty() {
-                    log::warn!("[{}] ⚠️ Nhận được stream rỗng, bỏ qua.", peer);
+                    log::warn!("[{}] ⚠️ Received empty stream, skipping.", peer);
                     continue; // Chờ stream tiếp theo
                 }
+
                 let command: Command = match serde_json::from_str(&line) {
                     Ok(cmd) => cmd,
                     Err(e) => {
                         log::error!("[{}] ❌ Failed to parse command: {}", peer, e);
-                        log::error!("Raw data: {}", line);
+                        log::error!("[{}] Raw data: {}", peer, line);
                         // Gửi lỗi TRÊN STREAM NÀY
                         if let Err(e) =
                             send_error_response(&mut stream_handler, "Invalid command format").await
                         {
-                            eprintln!("[{}] Error sending error response: {}", peer, e);
+                            log::error!("[{}] Error sending error response: {}", peer, e);
                         }
                         continue; // Chờ stream tiếp theo
                     }
@@ -126,7 +132,7 @@ pub async fn handle_connection(
                 let app_clone = app.clone();
                 let peer_clone = peer; // SocketAddr là Copy
                 let start_time = Instant::now();
-
+                let start_time_wall_clock = Local::now();
                 tokio::spawn(async move {
                     let mut stream_handler = stream_handler;
                     let semaphore = app_clone.task_semaphore.clone();
@@ -151,7 +157,11 @@ pub async fn handle_connection(
                                     return; // Thoát task này
                                 }
                             };
-
+                            log::info!(
+                                "[{}] ✅ Upload signature verified for chunk {}",
+                                peer_clone,
+                                payload.chunk_index
+                            );
                             match verify_upload_chunk(&payload, &app_clone).await {
                                 Ok(true) => {
                                     // log::info!(
@@ -228,6 +238,11 @@ pub async fn handle_connection(
                                 })
                                 .await
                                 .map_err(|e| {
+                                    log::error!(
+                                        "[{}] ❌ Spawn_blocking task panicked: {}",
+                                        peer_clone,
+                                        e
+                                    );
                                     std::io::Error::new(
                                         std::io::ErrorKind::Other,
                                         format!("Task join error: {}", e),
@@ -235,6 +250,7 @@ pub async fn handle_connection(
                                 })
                                 .and_then(|inner_result| inner_result);
                             let processing_done_time = Instant::now();
+                            let processing_done_wall_clock = Local::now();
                             match store_result {
                                 Ok(_chunk_path) => {
                                     let response = GenericResponse {
@@ -254,7 +270,11 @@ pub async fn handle_connection(
                                     let send_duration =
                                         send_done_time.duration_since(processing_done_time);
                                     let total_duration = send_done_time.duration_since(start_time);
-
+                                    let processing_time_formatted = processing_done_wall_clock
+                                        .format("%H:%M:%S.%3f")
+                                        .to_string();
+                                    let start_time_formatted =
+                                        start_time_wall_clock.format("%H:%M:%S.%3f").to_string();
                                     if let Err(e) =
                                         stream_handler.send(Bytes::from(response_json)).await
                                     {
@@ -269,8 +289,8 @@ pub async fn handle_connection(
                                 peer_clone,
                                 log_chunk_index,
                                 log_file_key,
-                                start_time,
-                                processing_done_time,
+                                start_time_formatted,
+                                processing_time_formatted,
                                 processing_duration,
                                 send_duration,
                                 total_duration
@@ -314,13 +334,22 @@ pub async fn handle_connection(
                             };
                             let verify_result =
                                 verify_download_chunk(&payload, &app_clone, request_ip).await;
-
+                            log::info!(
+                                "[{}] ✅ Download reuqest Chunk {} -k {}",
+                                peer_clone,
+                                payload.chunk_index,
+                                payload.file_key
+                            );
                             match verify_result {
                                 Ok(true) => {
                                     let response =
                                         handle_download_request(&payload, &app_clone).await;
-                                  
+
                                     let processing_done_time = Instant::now();
+                                    let start_time_formatted =
+                                        start_time_wall_clock.format("%H:%M:%S.%3f").to_string();
+
+                                    let processing_done_wall_clock = Local::now();
                                     let send_result =
                                         send_download_response(&mut stream_handler, &response)
                                             .await;
@@ -330,9 +359,7 @@ pub async fn handle_connection(
                                             &payload.download_key,
                                             &app_clone,
                                         ) {
-                                            Ok(_) => {
-                                             
-                                            }
+                                            Ok(_) => {}
                                             Err(e) => {
                                                 log::error!(
                                                     "[{}] ⚠️  Failed to decrease chunk count for {}: {}. Client already received chunk.",
@@ -354,13 +381,16 @@ pub async fn handle_connection(
                                     let send_duration =
                                         send_done_time.duration_since(processing_done_time);
                                     let total_duration = send_done_time.duration_since(start_time);
+                                    let processing_time_formatted = processing_done_wall_clock
+                                        .format("%H:%M:%S.%3f")
+                                        .to_string();
                                     log::info!(
                                 "[{}] 📈 [DOWNLOAD_TIMING] Chunk {} -k {}, .Time: Receive:{:?}, Process: {:?} | Duration: Processing: {:?},  Send: {:?}, Total: {:?}",
                                 peer_clone,
                                 log_chunk_index,
                                 log_file_key,
-                                start_time,
-                                processing_done_time,
+                                start_time_formatted,
+                                processing_time_formatted,
                                 processing_duration,
                                 send_duration,
                                 total_duration
@@ -590,12 +620,12 @@ pub async fn handle_connection(
             }
             Ok(None) => {
                 // Stream đóng trước khi có data
-                println!("[{}] ⚠️ Stream closed prematurely (no data).", peer);
+                log::debug!("[{}] ⚠️ Stream closed prematurely (no data).", peer);
                 continue; // Chờ stream tiếp theo
             }
             Err(e) => {
                 // Lỗi đọc trên stream
-                eprintln!("[{}] ❌ Error reading from stream: {}", peer, e);
+                log::error!("[{}] ❌ Error reading from stream: {}", peer, e);
                 continue; // Chờ stream tiếp theo
             }
         }

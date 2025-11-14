@@ -52,11 +52,11 @@ pub struct DownloadSession {
     #[allow(dead_code)]
     pub file_key: String,
     pub file_owner: Address,
-    pub remaining_chunks: u32,
+    pub remaining_chunks: u64,
     #[allow(dead_code)]
-    pub total_chunks: u32,
+    pub total_chunks: u64,
     pub first_ip: IpAddr,
-    pub retry_remaining:u32,
+    pub retry_remaining:u64,
     pub confirmed_at: Option<Instant>,
     pub verified_signature: Arc<Mutex<Option<String>>>,
 }

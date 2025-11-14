@@ -11,7 +11,6 @@ mod server;
 use std::env;
 use std::fs;
 use std::sync::Arc;
-
 use crate::app::App;
 use crate::models::ConfirmationReceiver;
 use alloy::primitives::B256;
@@ -19,8 +18,19 @@ use tokio::sync::MutexGuard; // Cần thiết để định nghĩa chính xác p
 use flexi_logger::{detailed_format, Cleanup, Criterion, FileSpec, Logger, Naming};
 use network::quic::QuicTransport;
 use network::transport::Transport;
+use sysinfo::System;
 #[tokio::main]
 async fn main() {
+    let log_dir_path = "log"; // Định nghĩa đường dẫn thư mục log
+    if fs::metadata(log_dir_path).is_ok() {
+        // Nếu tồn tại, xóa toàn bộ thư mục
+        if let Err(e) = fs::remove_dir_all(log_dir_path) {
+            // Dùng eprintln! vì logger chưa được khởi tạo
+            println!("⚠️ Warning: Could not remove old log directory '{}': {}. Tiếp tục...", log_dir_path, e);
+        } else {
+            println!("♻️ Successfully removed old log directory: {}", log_dir_path);
+        }
+    }
     let _logger = Logger::try_with_str("info") // Log level mặc định
         .unwrap()
         .log_to_file(
@@ -55,24 +65,52 @@ async fn main() {
             app.storage_root.display(),
             e
         );
-    }
+    }    
+
+    tokio::spawn(async move {
+        let mut sys = System::new_all();
+        let pid = sysinfo::get_current_pid().expect("Failed to get PID");
+        
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
+        loop {
+            interval.tick().await;
+            sys.refresh_all();
+            // Lấy thông tin process hiện tại
+            let process = sys.process(pid);
+     
+            
+            if let Some(proc) = process {
+                let memory_mb = proc.memory() / 1024 / 1024; // Convert to MB
+                let cpu_usage = proc.cpu_usage();
+                
+                log::info!(
+                    "📊 [SYSTEM MONITOR]  | RAM: {} MB | CPU: {:.2}%",
+                     memory_mb, cpu_usage
+                );
+                
+            }
+        }
+    });
+    
     // Spawn confirmation worker
     let app_clone = app.clone();
     tokio::spawn(async move {
         // Lấy lock cho Mutex<Receiver>
         let mut receiver = app_clone.confirmation_receiver.lock().await;
         process_confirmation_queue(&mut receiver, app_clone.clone()).await;
+        log::error!("💀💀💀 CRITICAL: Confirmation worker died unexpectedly!");
     });
      let app_clone = app.clone();
     tokio::spawn(async move {
         listener::start_chain_id_monitor(app_clone).await;
+        log::error!("💀💀💀 CRITICAL: Chain ID monitor died unexpectedly!");
     });
+    
     // Spawn event listener (WebSocket)
     let app_clone = app.clone();
     tokio::spawn(async move {
-        if let Err(e) = listener::listen_download_confirmed_events(app_clone).await {
-            log::error!("❌ Event listener failed: {:?}", e)
-        }
+        listener::listen_download_confirmed_events(app_clone).await;
+        log::error!("💀💀💀 CRITICAL: Event listener died unexpectedly!");
     });
     let transport = QuicTransport::new();
     let addr: std::net::SocketAddr = listen_addr.parse().expect("Invalid listen address");
@@ -81,20 +119,40 @@ async fn main() {
         .await
         .expect("Could not create QUIC listener");
 
-    loop {
-        match listener.accept().await {
-            Ok((connection, peer_addr)) => {
-                let app_clone = app.clone();
-                tokio::spawn(async move {
-                    if let Err(e) =
-                        server::handle_connection(connection, peer_addr, app_clone, peer_addr.ip()).await
-                    {
-                        log::error!("❌ Error handling connection from {}: {:?}", peer_addr, e);
-                    }
-                });
+    // THÊM: Signal handler để bắt shutdown
+    let mut shutdown_signal = tokio::spawn(async {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {
+                log::warn!("🛑 Received CTRL+C signal. Server shutting down gracefully...");
             }
-            Err(e) => {
-                log::error!("❌ Connection failed: {}", e);
+            Err(err) => {
+                log::error!("❌ Error waiting for shutdown signal: {}", err);
+            }
+        }
+    });
+    loop {
+        tokio::select! {
+            _ = &mut shutdown_signal => {
+                log::info!("🛑 Shutdown signal received. Stopping server...");
+                break;
+            }
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((connection, peer_addr)) => {
+                        let app_clone = app.clone();
+                        tokio::spawn(async move {   
+                            if let Err(e) =
+                                server::handle_connection(connection, peer_addr, app_clone, peer_addr.ip()).await
+                            {
+                                log::error!("❌ Error handling connection from {}: {:?}", peer_addr, e);
+                            }
+                           
+                        });
+                    }
+                    Err(e) => {
+                        log::error!("❌ CRITICAL: Connection accept failed: {}", e);
+                    }
+                }
             }
         }
     }
@@ -115,13 +173,9 @@ async fn handle_single_confirmation(
     download_key: String,
     app: Arc<App>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Giải mã chuỗi hex sang bytes
     let download_key_bytes = hex::decode(&download_key)?;
-    // Chuyển bytes sang B256
     let download_key_b256 = B256::from_slice(&download_key_bytes);
-    // Tạo contract instance
     let contract = app.contract_with_signer().await?;
-    // Gọi confirmServerDownload
     let pending_tx = contract
         .confirmServerDownload(download_key_b256)
         .send()

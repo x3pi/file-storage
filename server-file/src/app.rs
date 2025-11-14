@@ -46,7 +46,7 @@ impl App {
         let (confirmation_sender, confirmation_receiver) = mpsc::unbounded_channel(); 
         let init_locks = Arc::new(DashMap::new());
         let num_cores = num_cpus::get();
-        let semaphore_limit = std::cmp::max(1, num_cores*2);
+        let semaphore_limit = std::cmp::max(1, num_cores);
         let task_semaphore = Arc::new(Semaphore::new(semaphore_limit));
         Ok(Self {
             config,

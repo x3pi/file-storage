@@ -57,7 +57,6 @@ pub async fn initialize_download_session<'a>(
     }
 
     let download_key_b256 = B256::from_slice(&download_key_bytes);
-
     // Gọi contract để lấy thông tin (RPC CALL - LÀM CHẬM)
     let contract = app
         .contract()
@@ -102,11 +101,10 @@ pub async fn initialize_download_session<'a>(
     let chunk_count = count_chunks(&file_path)
         .await
         .map_err(|e| format!("Failed to count chunks: {}", e))?;
-    
     let session = DownloadSession {
         download_key: download_key.to_string(),
         file_key: file_key.clone(),
-        remaining_chunks: chunk_count,
+        remaining_chunks: chunk_count ,
         file_owner: file_info_onchain.owner,
         total_chunks: chunk_count,
         first_ip: request_ip,
@@ -114,7 +112,6 @@ pub async fn initialize_download_session<'a>(
         retry_remaining: chunk_count *3,
         verified_signature: Arc::new(Mutex::new(None)),
     };
-
     // ✅ Insert vào cache
     app.download_cache.insert(download_key.to_string(), session);
     
@@ -126,12 +123,12 @@ pub async fn initialize_download_session<'a>(
     // Lock sẽ tự động được giải phóng (_lock bị drop) khi hàm kết thúc
 }
 
-pub async fn count_chunks(file_path: &Path) -> Result<u32, String> {
+pub async fn count_chunks(file_path: &Path) -> Result<u64, String> {
     if !file_path.exists() {
         return Err("File path does not exist".to_string());
     }
 
-    let mut count = 0u32;
+    let mut count = 0u64;
     let mut entries = fs::read_dir(file_path)
         .await
         .map_err(|e| format!("Failed to read directory: {}", e))?;
@@ -179,7 +176,7 @@ pub async fn list_chunks(file_path: &Path) -> Result<Vec<u64>, String> {
     chunks.sort();
     Ok(chunks)
 }
-pub fn descrease_chunk_count(download_key: &str, app: &Arc<App>) -> Result<u32, String> {
+pub fn descrease_chunk_count(download_key: &str, app: &Arc<App>) -> Result<u64, String> {
     // if let Some(mut session) = app.download_cache.get_mut(download_key) {
     let mut entry = match app.download_cache.entry(download_key.to_string()) {
         dashmap::mapref::entry::Entry::Occupied(o) => o,
