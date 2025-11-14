@@ -20,9 +20,9 @@ pub async fn listen_download_confirmed_events(app: Arc<App>) -> Result<(), Strin
                 return Ok(());
             }
             Err(_) => {
-                sleep(Duration::from_secs(1)).await;
             }
         }
+        sleep(Duration::from_secs(1)).await;
     }
 }
 
@@ -81,5 +81,50 @@ async fn process_file_activated_event(file_key: B256, app: &Arc<App>) {
             "✅Removed fileKey from upload signature cache: {}",
             file_key_hex
         );
+    }
+}
+
+pub async fn start_chain_id_monitor(app: Arc<App>) {
+    log::info!("📡 Starting Chain ID monitor (using WebSocket)...");
+    // Lấy URL từ config
+    let rpc_url = app.config.rpc_url.clone();
+    // để tái sử dụng kết nối WebSocket
+    let mut provider_option = None;
+    loop {
+        // Nếu chúng ta chưa có provider (lần đầu, hoặc sau lỗi kết nối)
+        if provider_option.is_none() {
+            let ws = WsConnect::new(&rpc_url);
+            match ProviderBuilder::new().connect_ws(ws).await {
+                Ok(p) => {
+                    provider_option = Some(p); // Lưu lại provider
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to connect WebSocket for chain ID monitor (will retry in 20s): {}",
+                        e
+                    );
+                    // Ngủ 20 giây trước khi thử kết nối lại
+                    sleep(Duration::from_secs(20)).await;
+                    continue; // Bỏ qua phần còn lại của vòng lặp, thử kết nối lại
+                }
+            }
+        }
+
+        // Nếu chúng ta CÓ provider, hãy sử dụng nó
+        if let Some(provider) = &provider_option {
+            log::debug!("Polling for chain ID over WebSocket...");
+            match provider.get_chain_id().await {
+                Ok(chain_id) => {
+                    log::info!("✅ Chain ID check OK (over Ws): {}", chain_id);
+                }
+                Err(e) => {
+                    log::warn!("Failed to get chain ID over WebSocket: {}", e);
+                    provider_option = None;
+                }
+            }
+        }
+
+        // Chờ 20 giây trước khi poll lần tiếp theo
+        sleep(Duration::from_secs(20)).await;
     }
 }

@@ -11,6 +11,7 @@ use base64::{engine::general_purpose, Engine as _};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::fs; // <--- THÊM: Import tokio::fs cho I/O bất đồng bộ
                // QUIC imports
 use bytes::Bytes;
@@ -124,12 +125,15 @@ pub async fn handle_connection(
                 };
                 let app_clone = app.clone();
                 let peer_clone = peer; // SocketAddr là Copy
-                    
+                let start_time = Instant::now();
+
                 tokio::spawn(async move {
                     let mut stream_handler = stream_handler;
                     let semaphore = app_clone.task_semaphore.clone();
                     match command {
                         Command::UploadChunk { payload } => {
+                            let log_file_key = payload.file_key.clone();
+                            let log_chunk_index = payload.chunk_index;
                             let _permit = match semaphore.acquire().await {
                                 Ok(permit) => permit,
                                 Err(e) => {
@@ -147,12 +151,7 @@ pub async fn handle_connection(
                                     return; // Thoát task này
                                 }
                             };
-                             log::info!(
-                                "[{}] 📥 Nhận download. Chunk {} -k {}",
-                                peer_clone,
-                                payload.chunk_index,
-                                payload.file_key,
-                            );
+
                             match verify_upload_chunk(&payload, &app_clone).await {
                                 Ok(true) => {
                                     // log::info!(
@@ -210,7 +209,6 @@ pub async fn handle_connection(
                             let file_key = payload.file_key.clone();
                             let chunk_index = payload.chunk_index;
                             let storage_root = app_clone.storage_root.clone();
-
                             let store_result: Result<PathBuf, std::io::Error> =
                                 tokio::task::spawn_blocking(move || {
                                     let level1 = &file_key[0..2];
@@ -236,15 +234,27 @@ pub async fn handle_connection(
                                     )
                                 })
                                 .and_then(|inner_result| inner_result);
+                            let processing_done_time = Instant::now();
                             match store_result {
                                 Ok(_chunk_path) => {
                                     let response = GenericResponse {
                                         status: "SUCCESS".to_string(),
                                         message: "Chunk stored successfully".to_string(),
                                     };
-                                    let mut response_json =
+                                    let mut response_json: Vec<u8> =
                                         serde_json::to_vec(&response).unwrap_or_default(); // Sửa lỗi unwrap
                                     response_json.push(b'\n');
+
+                                    // THÊM: Ghi lại thời điểm gửi xong
+                                    let send_done_time = Instant::now();
+
+                                    // THÊM: Tính toán và log thời gian
+                                    let processing_duration =
+                                        processing_done_time.duration_since(start_time);
+                                    let send_duration =
+                                        send_done_time.duration_since(processing_done_time);
+                                    let total_duration = send_done_time.duration_since(start_time);
+
                                     if let Err(e) =
                                         stream_handler.send(Bytes::from(response_json)).await
                                     {
@@ -254,6 +264,17 @@ pub async fn handle_connection(
                                             e
                                         );
                                     }
+                                    log::info!(
+                                "[{}] 📈 [UPLOAD_TIMING] Chunk {} -k {}, .Time: Receive:{:?}, Process: {:?} | Duration: Processing: {:?}, Send: {:?}, Total: {:?}",
+                                peer_clone,
+                                log_chunk_index,
+                                log_file_key,
+                                start_time,
+                                processing_done_time,
+                                processing_duration,
+                                send_duration,
+                                total_duration
+                            );
                                 }
                                 Err(e) => {
                                     log::error!("[{}] ❌ Failed to store chunk: {}", peer_clone, e);
@@ -273,6 +294,8 @@ pub async fn handle_connection(
                             }
                         }
                         Command::DownloadChunkRequest { payload } => {
+                            let log_file_key = payload.file_key.clone();
+                            let log_chunk_index = payload.chunk_index;
                             let _permit = match semaphore.acquire().await {
                                 Ok(permit) => permit,
                                 Err(e) => {
@@ -296,21 +319,19 @@ pub async fn handle_connection(
                                 Ok(true) => {
                                     let response =
                                         handle_download_request(&payload, &app_clone).await;
+                                  
+                                    let processing_done_time = Instant::now();
                                     let send_result =
                                         send_download_response(&mut stream_handler, &response)
                                             .await;
+                                    let send_done_time = Instant::now();
                                     if send_result.is_ok() && response.status == "SUCCESS" {
                                         match download_manager::descrease_chunk_count(
                                             &payload.download_key,
                                             &app_clone,
                                         ) {
                                             Ok(_) => {
-                                             log::info!(
-                                                "[{}] 📤 [DOWNLOAD_SENT] Gửi thành công. Chunk {} -k {}",
-                                                peer_clone,
-                                                payload.chunk_index, // chunk_index từ request
-                                                payload.file_key // file_key từ request
-                                            );
+                                             
                                             }
                                             Err(e) => {
                                                 log::error!(
@@ -328,15 +349,27 @@ pub async fn handle_connection(
                                             response.message
                                         );
                                     }
+                                    let processing_duration =
+                                        processing_done_time.duration_since(start_time);
+                                    let send_duration =
+                                        send_done_time.duration_since(processing_done_time);
+                                    let total_duration = send_done_time.duration_since(start_time);
+                                    log::info!(
+                                "[{}] 📈 [DOWNLOAD_TIMING] Chunk {} -k {}, .Time: Receive:{:?}, Process: {:?} | Duration: Processing: {:?},  Send: {:?}, Total: {:?}",
+                                peer_clone,
+                                log_chunk_index,
+                                log_file_key,
+                                start_time,
+                                processing_done_time,
+                                processing_duration,
+                                send_duration,
+                                total_duration
+                            );
                                 }
+
                                 Ok(false) => {
                                     let error_message =
                                         "Ownership or signature verification failed".to_string();
-                                    // log::error!(
-                                    //     "[{}] ❌ Verification failed: {}",
-                                    //     peer_clone,
-                                    //     error_message
-                                    // );
                                     let response = DownloadResponse {
                                         status: "ERROR".to_string(),
                                         message: error_message,

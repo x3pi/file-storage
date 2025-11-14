@@ -134,16 +134,27 @@ pub struct QuicListener {
 #[async_trait]
 impl Listener for QuicListener {
     // 🔥 THAY ĐỔI: `accept` giờ chỉ chấp nhận KẾT NỐI (Connection)
-    async fn accept(&mut self) -> TransportResult<(Box<dyn Connection>, SocketAddr)> {
-        let connecting = self.listener.accept().await.unwrap();
+   async fn accept(&mut self) -> TransportResult<(Box<dyn Connection>, SocketAddr)> {
+    // SỬA LẠI: Dùng match để xử lý `None`
+    let connecting = match self.listener.accept().await {
+        Some(conn) => conn, // OK, có kết nối
+        None => {
+            // Endpoint đã bị đóng (do lỗi hoặc server tắt)
+            // Trả về một lỗi rõ ràng thay vì panic
+            log::error!("__-QUIC listener endpoint closed. Stopping accept loop." );
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "Listener endpoint closed",
+            )));
+        }
+    };
 
-        let connection = connecting.await?;
-        let addr = connection.remote_address();
-
-        // Trả về đối tượng QuicConnection
-        let conn = Box::new(QuicConnection { connection });
-        Ok((conn, addr))
-    }
+    // Chỉ chạy tiếp nếu 'connecting' là Some
+    let connection = connecting.await?; 
+    let addr = connection.remote_address();
+    let conn = Box::new(QuicConnection { connection });
+    Ok((conn, addr))
+}
 }
 
 // --- Triển khai Transport (Sửa đổi) ---

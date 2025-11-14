@@ -63,7 +63,10 @@ async fn main() {
         let mut receiver = app_clone.confirmation_receiver.lock().await;
         process_confirmation_queue(&mut receiver, app_clone.clone()).await;
     });
-
+     let app_clone = app.clone();
+    tokio::spawn(async move {
+        listener::start_chain_id_monitor(app_clone).await;
+    });
     // Spawn event listener (WebSocket)
     let app_clone = app.clone();
     tokio::spawn(async move {
@@ -82,8 +85,6 @@ async fn main() {
         match listener.accept().await {
             Ok((connection, peer_addr)) => {
                 let app_clone = app.clone();
-                log::info!("✅ New conn IP from {}", peer_addr.ip());
-                // ✅ Spawn async task cho mỗi kết nối
                 tokio::spawn(async move {
                     if let Err(e) =
                         server::handle_connection(connection, peer_addr, app_clone, peer_addr.ip()).await
