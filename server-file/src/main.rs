@@ -31,7 +31,7 @@ async fn main() {
             println!("♻️ Successfully removed old log directory: {}", log_dir_path);
         }
     }
-    let _logger = Logger::try_with_str("debug") // Log level debug để xem chi tiết
+    let _logger = Logger::try_with_str("info") // Log level debug để xem chi tiết
         .unwrap()
         .log_to_file(
             FileSpec::default()
