@@ -7,7 +7,6 @@ use alloy::signers::Signature;
 use base64::{engine::general_purpose, Engine as _};
 use std::fs;
 use std::net::IpAddr;
-use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 // FIX: Dùng tokio::time::sleep thay vì std::thread::sleep (đã được khôi phục)
@@ -46,7 +45,7 @@ fn recover_address_from_signature(
     let signature = Signature::try_from(signature_bytes.as_slice())
         .map_err(|e| format!("Invalid signature format: {:?}", e))?;
 
-    let prefix = format!("\x19Ethereum Signed Message:\n{}", message_str.len());
+    let prefix = format!("0x00");
     let full_message = format!("{}{}", prefix, message_str);
     let message_hash = keccak256(full_message.as_bytes());
 

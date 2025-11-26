@@ -12,7 +12,7 @@ use tokio::time::{sleep, timeout};
 
 const CHUNK_SIZE: usize = 1 * 1024 * 1024; // 1 MiB
 const NUM_CONNECTIONS: usize = 10;
-const TOTAL_CHUNKS: usize = 1000;
+const TOTAL_CHUNKS: usize = 2000;
 const STREAM_CONCURRENCY_PER_CONN: usize = 10;
 const CONCURRENCY: usize = NUM_CONNECTIONS * STREAM_CONCURRENCY_PER_CONN;
 const LOG_INTERVAL: usize = 50;

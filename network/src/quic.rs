@@ -218,15 +218,15 @@ fn configure_certificates() -> (ServerConfig, ClientConfig) {
     let cert_chain = vec![rustls::Certificate(cert_der.clone())];
 
     let mut transport_config = TransportConfig::default();
-    transport_config.max_concurrent_uni_streams(VarInt::from_u32(100_000));
-    transport_config.max_concurrent_bidi_streams(VarInt::from_u32(100_000));
-    const MAX_STREAM_WINDOW: u32 = 20 * 1024 * 1024;
-    const MAX_CONN_WINDOW: u32 = 40 * 1024 * 1024;
+    transport_config.max_concurrent_uni_streams(VarInt::from_u32(10_000));
+    transport_config.max_concurrent_bidi_streams(VarInt::from_u32(10_000));
+    const MAX_STREAM_WINDOW: u32 = 5 * 1024 * 1024;
+    const MAX_CONN_WINDOW: u32 = 128 * 1024 * 1024;
     transport_config.stream_receive_window(VarInt::from_u32(MAX_STREAM_WINDOW));
     transport_config.receive_window(VarInt::from_u32(MAX_CONN_WINDOW));
     transport_config.send_window((MAX_CONN_WINDOW as u64).into());
-    transport_config.max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()));
-    transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
+    transport_config.max_idle_timeout(Some(Duration::from_secs(90).try_into().unwrap()));
+    transport_config.keep_alive_interval(Some(Duration::from_secs(10)));
     let transport = Arc::new(transport_config);
 
     let mut server_config = ServerConfig::with_single_cert(cert_chain, priv_key).unwrap();

@@ -31,7 +31,7 @@ async fn main() {
             println!("♻️ Successfully removed old log directory: {}", log_dir_path);
         }
     }
-    let _logger = Logger::try_with_str("debug") // Log level debug để xem chi tiết
+    let _logger = Logger::try_with_str("info") // Log level debug để xem chi tiết
         .unwrap()
         .log_to_file(
             FileSpec::default()
@@ -42,7 +42,7 @@ async fn main() {
         .format_for_files(detailed_format) // Format chi tiết cho file
         .format_for_stdout(detailed_format) // Format chi tiết cho console
         .rotate(
-            Criterion::Size(2_000_000), 
+            Criterion::Size(4_000_000), 
             Naming::Numbers,        // Đặt tên file xoay vòng là .1, .2
             Cleanup::KeepLogFiles(40), // Chỉ giữ 2 file log
         )
