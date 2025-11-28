@@ -7,18 +7,18 @@ mod listener;
 mod models;
 mod retry;
 mod server;
-
-use std::env;
-use std::fs;
-use std::sync::Arc;
 use crate::app::App;
 use crate::models::ConfirmationReceiver;
 use alloy::primitives::B256;
-use tokio::sync::MutexGuard; // Cần thiết để định nghĩa chính xác process_confirmation_queue
 use flexi_logger::{detailed_format, Cleanup, Criterion, FileSpec, Logger, Naming};
 use network::quic::QuicTransport;
 use network::transport::Transport;
+use rlimit::{getrlimit, Resource};
+use std::env;
+use std::fs;
+use std::sync::Arc;
 use sysinfo::System;
+use tokio::sync::MutexGuard; // Cần thiết để định nghĩa chính xác process_confirmation_queue
 #[tokio::main]
 async fn main() {
     let log_dir_path = "log"; // Định nghĩa đường dẫn thư mục log
@@ -26,24 +26,26 @@ async fn main() {
         // Nếu tồn tại, xóa toàn bộ thư mục
         if let Err(e) = fs::remove_dir_all(log_dir_path) {
             // Dùng eprintln! vì logger chưa được khởi tạo
-            println!("⚠️ Warning: Could not remove old log directory '{}': {}. Tiếp tục...", log_dir_path, e);
+            println!(
+                "⚠️ Warning: Could not remove old log directory '{}': {}. Tiếp tục...",
+                log_dir_path, e
+            );
         } else {
-            println!("♻️ Successfully removed old log directory: {}", log_dir_path);
+            println!(
+                "♻️ Successfully removed old log directory: {}",
+                log_dir_path
+            );
         }
     }
     let _logger = Logger::try_with_str("info") // Log level debug để xem chi tiết
         .unwrap()
-        .log_to_file(
-            FileSpec::default()
-                .directory("log") 
-                .basename("app")
-            )
+        .log_to_file(FileSpec::default().directory("log").basename("app"))
         .append() // <--- THÊM DÒNG NÀY
         .format_for_files(detailed_format) // Format chi tiết cho file
         .format_for_stdout(detailed_format) // Format chi tiết cho console
         .rotate(
-            Criterion::Size(2_000_000), 
-            Naming::Numbers,        // Đặt tên file xoay vòng là .1, .2
+            Criterion::Size(4_000_000),
+            Naming::Numbers,           // Đặt tên file xoay vòng là .1, .2
             Cleanup::KeepLogFiles(40), // Chỉ giữ 2 file log
         )
         .duplicate_to_stdout(flexi_logger::Duplicate::All) // Hiển thị log ra cả console
@@ -55,43 +57,44 @@ async fn main() {
         eprintln!("Example: {} 127.0.0.1:8001", args[0]);
         return;
     }
+    let (soft, hard) = getrlimit(Resource::NOFILE).unwrap();
+    log::info!("Max open files (soft): {}", soft);
+    log::info!("Max open files (hard): {}", hard);
     let listen_addr = &args[1];
     let app = Arc::new(App::setup().await.expect("Failed to initialize app"));
     // Tạo storage directory từ config
     if let Err(e) = fs::create_dir_all(&app.storage_root) {
-
         panic!(
             "Could not create storage directory '{}': {}",
             app.storage_root.display(),
             e
         );
-    }    
+    }
 
     tokio::spawn(async move {
         let mut sys = System::new_all();
         let pid = sysinfo::get_current_pid().expect("Failed to get PID");
-        
+
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
         loop {
             interval.tick().await;
             sys.refresh_all();
             // Lấy thông tin process hiện tại
             let process = sys.process(pid);
-     
-            
+
             if let Some(proc) = process {
                 let memory_mb = proc.memory() / 1024 / 1024; // Convert to MB
                 let cpu_usage = proc.cpu_usage();
-                
+
                 log::info!(
                     "📊 [SYSTEM MONITOR]  | RAM: {} MB | CPU: {:.2}%",
-                     memory_mb, cpu_usage
+                    memory_mb,
+                    cpu_usage
                 );
-                
             }
         }
     });
-    
+
     // Spawn confirmation worker
     let app_clone = app.clone();
     tokio::spawn(async move {
@@ -100,12 +103,12 @@ async fn main() {
         process_confirmation_queue(&mut receiver, app_clone.clone()).await;
         log::error!("💀💀💀 CRITICAL: Confirmation worker died unexpectedly!");
     });
-     let app_clone = app.clone();
+    let app_clone = app.clone();
     tokio::spawn(async move {
         listener::start_chain_id_monitor(app_clone).await;
         log::error!("💀💀💀 CRITICAL: Chain ID monitor died unexpectedly!");
     });
-    
+
     // Spawn event listener (WebSocket)
     let app_clone = app.clone();
     tokio::spawn(async move {
@@ -140,13 +143,13 @@ async fn main() {
                 match accept_result {
                     Ok((connection, peer_addr)) => {
                         let app_clone = app.clone();
-                        tokio::spawn(async move {   
+                        tokio::spawn(async move {
                             if let Err(e) =
                                 server::handle_connection(connection, peer_addr, app_clone, peer_addr.ip()).await
                             {
                                 log::error!("❌ Error handling connection from {}: {:?}", peer_addr, e);
                             }
-                           
+
                         });
                     }
                     Err(e) => {
