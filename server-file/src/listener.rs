@@ -75,9 +75,9 @@ async fn process_download_confirmed_event(download_key: B256, app: &Arc<App>) {
 }
 async fn process_file_activated_event(file_key: B256, app: &Arc<App>) {
     let file_key_hex = hex::encode(file_key);
-    if let Some(_removed) = app.verified_upload_cache.remove(&file_key_hex) {
+    if let Some(_removed) = app.upload_file_cache.remove(&file_key_hex) {
          log::info!(
-            "✅Removed fileKey from upload signature cache: {}",
+            "✅ Removed fileKey from upload cache (address + merkle_root): {}",
             file_key_hex
         );
     }

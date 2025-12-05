@@ -10,7 +10,7 @@ use crate::models::{
     ConfirmationReceiver,
     ConfirmationSender,
     DownloadSessionCache,
-    VerifiedUploadSignatureCache,
+    UploadFileCache,
 };
 
 // Imports cho Alloy
@@ -26,7 +26,7 @@ use crate::file_contract::Files::FilesInstance;
 pub struct App {
     pub config: AppConfig,
     pub download_cache: DownloadSessionCache,
-    pub verified_upload_cache:VerifiedUploadSignatureCache,
+    pub upload_file_cache: UploadFileCache,
     pub confirmation_sender: ConfirmationSender,
     pub confirmation_receiver: Arc<Mutex<ConfirmationReceiver>>,
     pub storage_root: PathBuf,
@@ -42,7 +42,7 @@ impl App {
         let storage_root = PathBuf::from(&config.storage_root);
         let wallet = PrivateKeySigner::from_str(&config.private_key)?;
         let download_cache: DownloadSessionCache = Arc::new(DashMap::new());
-        let verified_upload_cache: VerifiedUploadSignatureCache = Arc::new(DashMap::new());
+        let upload_file_cache: UploadFileCache = Arc::new(DashMap::new());
         let (confirmation_sender, confirmation_receiver) = mpsc::unbounded_channel(); 
         let init_locks = Arc::new(DashMap::new());
         let num_cores = num_cpus::get();
@@ -52,7 +52,7 @@ impl App {
             config,
             download_cache,
             confirmation_sender,
-            verified_upload_cache,
+            upload_file_cache,
             // Đảm bảo kiểu dữ liệu khớp
             confirmation_receiver: Arc::new(Mutex::new(confirmation_receiver)),
             storage_root,

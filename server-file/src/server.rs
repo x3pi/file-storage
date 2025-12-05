@@ -158,41 +158,8 @@ pub async fn handle_connection(
                                     return; // Thoát task này
                                 }
                             };
-                            log::info!(
-                                "[{}] ✅ Upload signature verified for chunk {} -k {}",
-                                peer_clone,
-                                payload.chunk_index,
-                                payload.file_key
-                            );
-                            match verify_upload_chunk(&payload, &app_clone).await {
-                                Ok(true) => {
-                                    // log::info!(
-                                    //     "[{}] ✅ Upload signature verified for chunk {}",
-                                    //     peer_clone,
-                                    //     payload.chunk_index
-                                    // );
-                                }
-                                Ok(false) | Err(_) => {
-                                    log::error!(
-                                        "[{}] ❌ Upload signature verification FAILED for chunk {}",
-                                        peer_clone,
-                                        payload.chunk_index
-                                    );
-                                    if let Err(e) = send_error_response(
-                                        &mut stream_handler,
-                                        "Invalid upload signature or permission denied",
-                                    )
-                                    .await
-                                    {
-                                        log::error!(
-                                            "[{}] Error sending error response: {}",
-                                            peer_clone,
-                                            e
-                                        );
-                                    }
-                                    return; // Thoát task
-                                }
-                            }
+                            
+                            // Decode chunk data first (needed for both signature and merkle verification)
                             let chunk_data = match general_purpose::STANDARD
                                 .decode(&payload.chunk_data_base64)
                             {
@@ -218,6 +185,41 @@ pub async fn handle_connection(
                                     return; // Thoát task
                                 }
                             };
+                            
+                            // ✅ UNIFIED VERIFICATION: Signature + Merkle Proof in one call
+                            match verify_upload_chunk(&payload, &chunk_data, &app_clone).await {
+                                Ok(()) => {
+                                    log::debug!(
+                                        "[{}] ✅ Upload verified (signature + merkle proof) for chunk {} -k {}",
+                                        peer_clone,
+                                        payload.chunk_index,
+                                        payload.file_key
+                                    );
+                                }
+                                Err(e) => {
+                                    log::error!(
+                                        "[{}] ❌ Upload verification FAILED for chunk {} -k {}: {}",
+                                        peer_clone,
+                                        payload.chunk_index,
+                                        payload.file_key,
+                                        e
+                                    );
+                                    if let Err(send_err) = send_error_response(
+                                        &mut stream_handler,
+                                        &format!("Verification failed: {}", e),
+                                    )
+                                    .await
+                                    {
+                                        log::error!(
+                                            "[{}] Error sending error response: {}",
+                                            peer_clone,
+                                            send_err
+                                        );
+                                    }
+                                    return; // Thoát task
+                                }
+                            }
+                            
                             let file_key = payload.file_key.clone();
                             let chunk_index = payload.chunk_index;
                             let storage_root = app_clone.storage_root.clone();

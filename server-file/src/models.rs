@@ -23,6 +23,8 @@ pub struct UploadChunkPayload {
     pub chunk_index: u64,
     pub chunk_data_base64: String,
     pub signature: String,
+    pub merkle_proof_hashes: Vec<String>, // Array of hex strings (32 bytes each)
+    pub merkle_root: String, // Hex string of merkle root (32 bytes)
 }
 #[derive(Serialize, Deserialize, Debug)]
 pub struct DownloadChunkPayload {
@@ -66,7 +68,15 @@ pub type DownloadSessionCache = Arc<DashMap<String, DownloadSession>>;
 // Cache verified signatures: (download_key + signature) -> verified owner
 #[allow(dead_code)]
 pub type VerifiedSignatureCache = Arc<DashMap<String, Address>>;
-pub type VerifiedUploadSignatureCache = Arc<DashMap<String, Address>>;
+
+// Upload verification cache: stores both verified address and merkle root
+#[derive(Debug, Clone)]
+pub struct UploadFileInfo {
+    pub verified_address: Address,
+    pub merkle_root: String,
+}
+
+pub type UploadFileCache = Arc<DashMap<String, UploadFileInfo>>;
 
 pub type ConfirmationSender = mpsc::UnboundedSender<String>;
 pub type ConfirmationReceiver = mpsc::UnboundedReceiver<String>;

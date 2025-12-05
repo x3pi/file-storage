@@ -1,6 +1,6 @@
 use crate::app::App;
 use crate::download_manager;
-use crate::models::{DownloadChunkPayload, DownloadResponse, UploadChunkPayload};
+use crate::models::{DownloadChunkPayload, DownloadResponse, UploadChunkPayload, UploadFileInfo};
 use alloy::primitives::{keccak256, Address};
 
 use alloy::signers::Signature;
@@ -9,7 +9,6 @@ use std::fs;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-// FIX: Dùng tokio::time::sleep thay vì std::thread::sleep (đã được khôi phục)
 
 // 🔥 FIX: Wrapper task bất đồng bộ cho tác vụ nặng CPU
 async fn run_recover_address_blocking(
@@ -56,31 +55,105 @@ fn recover_address_from_signature(
 
     Ok(recovered_address)
 }
+/// Verify upload chunk signature and merkle proof
+/// Combines both signature verification and merkle proof verification
 pub async fn verify_upload_chunk(
     payload: &UploadChunkPayload,
+    chunk_data: &[u8],
     app: &Arc<App>,
-) -> Result<bool, String> {
+) -> Result<(), String> {
     let admin_uploader_address = Address::from_str(app.config.address_sign_admin.as_str())
         .map_err(|_| "Invalid Admin Uploader Address".to_string())?;
-    if let Some(cached_addr) = app.verified_upload_cache.get(&payload.file_key) {
-        if *cached_addr == admin_uploader_address {
-            return Ok(true);
-        } else {
+    
+    // 1. Check cache first
+    if let Some(cached_info) = app.upload_file_cache.get(&payload.file_key) {
+        // Verify cached address matches admin
+        if cached_info.verified_address != admin_uploader_address {
             return Err("Uploader is not validator".to_string());
         }
-    }
-    let recovered_address: Address =
-        run_recover_address_blocking(payload.file_key.clone(), payload.signature.clone()).await?;
-    if recovered_address != admin_uploader_address {
-        println!(
-            "❌ Upload Rejected: Signer is {:?}, expected Admin {:?}",
-            recovered_address, admin_uploader_address
+        
+        // Verify merkle root matches cached value
+        if cached_info.merkle_root != payload.merkle_root {
+            return Err(format!(
+                "Merkle root mismatch: expected {}, got {}",
+                cached_info.merkle_root, payload.merkle_root
+            ));
+        }
+        
+        // Cache hit - skip signature verification, proceed to merkle proof
+    } else {
+        // 2. First chunk for this file - verify signature with fileKey + merkleRoot
+        let message_to_sign = format!("{}{}", payload.file_key, payload.merkle_root);
+        let recovered_address: Address =
+            run_recover_address_blocking(message_to_sign, payload.signature.clone()).await?;
+        
+        if recovered_address != admin_uploader_address {
+            log::error!(
+                "❌ Upload Rejected: Signer is {:?}, expected Admin {:?}",
+                recovered_address, admin_uploader_address
+            );
+            return Err("Signer is not the authorized admin uploader".to_string());
+        }
+        
+        // 3. Cache both address and merkle root
+        app.upload_file_cache.insert(
+            payload.file_key.clone(),
+            UploadFileInfo {
+                verified_address: recovered_address,
+                merkle_root: payload.merkle_root.clone(),
+            },
         );
-        return Err("Signer is not the authorized admin uploader".to_string());
     }
-    app.verified_upload_cache
-        .insert(payload.file_key.clone(), recovered_address);
-    Ok(true)
+    
+    // 4. Verify Merkle Proof (ALWAYS - even for cached files)
+    // Compute leaf hash from chunk data
+    let leaf_hash = keccak256(chunk_data);
+    let mut computed_hash = leaf_hash.to_vec();
+
+    // Iterate through proof levels
+    for (level, sibling_hex) in payload.merkle_proof_hashes.iter().enumerate() {
+        // Decode sibling hash from hex
+        let sibling_hash = hex::decode(sibling_hex.trim_start_matches("0x"))
+            .map_err(|e| format!("Invalid sibling hash at level {}: {}", level, e))?;
+
+        if sibling_hash.len() != 32 {
+            return Err(format!(
+                "Invalid sibling hash length at level {}: expected 32, got {}",
+                level,
+                sibling_hash.len()
+            ));
+        }
+
+        // Determine position in tree
+        let level_index = payload.chunk_index >> level;
+        let combined = if level_index % 2 == 0 {
+            // Current hash is on the left
+            [computed_hash.as_slice(), sibling_hash.as_slice()].concat()
+        } else {
+            // Current hash is on the right
+            [sibling_hash.as_slice(), computed_hash.as_slice()].concat()
+        };
+
+        // Hash the combined value
+        computed_hash = keccak256(&combined).to_vec();
+    }
+
+    // Compare with expected merkle root
+    let expected_root = hex::decode(payload.merkle_root.trim_start_matches("0x"))
+        .map_err(|e| format!("Invalid merkle root: {}", e))?;
+
+    if computed_hash != expected_root {
+        log::error!(
+            "❌ INVALID Merkle Proof for chunk {} -k {}. Computed: {}, Expected: {}",
+            payload.chunk_index,
+            payload.file_key,
+            hex::encode(&computed_hash),
+            payload.merkle_root
+        );
+        return Err("Merkle proof verification failed".to_string());
+    }
+    
+    Ok(())
 }
 
 pub async fn verify_download_chunk(
