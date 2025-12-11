@@ -60,6 +60,24 @@ async fn main() {
     let (soft, hard) = getrlimit(Resource::NOFILE).unwrap();
     log::info!("Max open files (soft): {}", soft);
     log::info!("Max open files (hard): {}", hard);
+    
+    // Validate file descriptor limit
+    const MIN_REQUIRED_FILES: u64 = 10000;
+    if soft < MIN_REQUIRED_FILES {
+        eprintln!("\n❌ ERROR: File descriptor limit too low!");
+        eprintln!("   Current soft limit: {}", soft);
+        eprintln!("   Required minimum: {}", MIN_REQUIRED_FILES);
+        eprintln!("\n📝 To fix this issue, run these commands:\n");
+        eprintln!("   # Temporary fix (until reboot):");
+        eprintln!("   ulimit -n 500288\n");
+        eprintln!("   # Permanent fix - Add these lines to /etc/security/limits.conf:");
+        eprintln!("   echo '* soft nofile 500288' | sudo tee -a /etc/security/limits.conf");
+        eprintln!("   echo '* hard nofile 500288' | sudo tee -a /etc/security/limits.conf\n");
+        eprintln!("   # For systemd services, add to your service file:");
+        eprintln!("   LimitNOFILE=500288\n");
+        std::process::exit(1);
+    }
+    
     let listen_addr = &args[1];
     let app = Arc::new(App::setup().await.expect("Failed to initialize app"));
     // Tạo storage directory từ config
