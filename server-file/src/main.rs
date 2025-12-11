@@ -62,19 +62,12 @@ async fn main() {
     log::info!("Max open files (hard): {}", hard);
     
     // Validate file descriptor limit
-    const MIN_REQUIRED_FILES: u64 = 10000;
+    const MIN_REQUIRED_FILES: u64 = 500288;
     if soft < MIN_REQUIRED_FILES {
         eprintln!("\n❌ ERROR: File descriptor limit too low!");
         eprintln!("   Current soft limit: {}", soft);
         eprintln!("   Required minimum: {}", MIN_REQUIRED_FILES);
-        eprintln!("\n📝 To fix this issue, run these commands:\n");
-        eprintln!("   # Temporary fix (until reboot):");
-        eprintln!("   ulimit -n 500288\n");
-        eprintln!("   # Permanent fix - Add these lines to /etc/security/limits.conf:");
-        eprintln!("   echo '* soft nofile 500288' | sudo tee -a /etc/security/limits.conf");
-        eprintln!("   echo '* hard nofile 500288' | sudo tee -a /etc/security/limits.conf\n");
-        eprintln!("   # For systemd services, add to your service file:");
-        eprintln!("   LimitNOFILE=500288\n");
+        eprintln!(" run sudo ./setup_ulimit.sh to increase the limit. Remember to reboot after running ./setup_ulimit.sh\n");
         std::process::exit(1);
     }
     
