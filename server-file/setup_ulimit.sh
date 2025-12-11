@@ -10,7 +10,7 @@ TARGET_LIMIT=500288
 
 echo ">>> Setting permanent ulimit to $TARGET_LIMIT ..."
 
-# 1. Update limits.conf
+# 1. Update limits.conf (permanent)
 echo "* soft nofile $TARGET_LIMIT" >> /etc/security/limits.conf
 echo "* hard nofile $TARGET_LIMIT" >> /etc/security/limits.conf
 
@@ -26,6 +26,10 @@ echo "DefaultLimitNOFILE=$TARGET_LIMIT" >> /etc/systemd/user.conf
 # 4. Reload systemd
 systemctl daemon-reload
 
+# 5. Apply temporary ulimit (effective immediately, current shell)
+echo ">>> Applying temporary ulimit (until reboot)..."
+ulimit -n "$TARGET_LIMIT"
+
 echo ">>> Done!"
-echo ">>> PLEASE REBOOT to apply all changes."
-echo "After reboot, run: ulimit -n"
+echo ">>> Temporary ulimit applied: $(ulimit -n)"
+echo ">>> PLEASE REBOOT to apply permanent changes."

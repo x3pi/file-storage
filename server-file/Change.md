@@ -7,9 +7,6 @@ Chạy lệnh sau để tăng giới hạn file descriptor:
 ```bash
 sudo ./setup_ulimit.sh
 ```
-
-**Lưu ý:** Nhớ reboot sau khi chạy lệnh trên.
-
 ---
 
 ## 2. Thay đổi cấu hình .env
