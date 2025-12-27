@@ -62,7 +62,7 @@ async fn main() {
     log::info!("Max open files (hard): {}", hard);
     
     // Validate file descriptor limit
-    const MIN_REQUIRED_FILES: u64 = 500288;
+    const MIN_REQUIRED_FILES: u64 = 500000;
     if soft < MIN_REQUIRED_FILES {
         eprintln!("\n❌ ERROR: File descriptor limit too low!");
         eprintln!("   Current soft limit: {}", soft);

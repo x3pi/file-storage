@@ -209,13 +209,16 @@ impl Transport for QuicTransport {
     }
 }
 
-// --- Cấu hình chứng chỉ & Hiệu năng (Giữ nguyên từ code của bạn) ---
+// --- Cấu hình chứng chỉ & Hiệu năng ---
 fn configure_certificates() -> (ServerConfig, ClientConfig) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert_der = cert.serialize_der().unwrap();
     let priv_key = cert.serialize_private_key_der();
-    let priv_key = rustls::PrivateKey(priv_key);
+    let priv_key_rustls = rustls::PrivateKey(priv_key);
     let cert_chain = vec![rustls::Certificate(cert_der.clone())];
+
+    // ✅ ALPN Protocol - Quan trọng cho Android/iOS compatibility
+    let alpn_protocols = vec![b"file-storage-v1".to_vec()];
 
     let mut transport_config = TransportConfig::default();
     transport_config.max_concurrent_uni_streams(VarInt::from_u32(10_000));
@@ -229,13 +232,24 @@ fn configure_certificates() -> (ServerConfig, ClientConfig) {
     transport_config.keep_alive_interval(Some(Duration::from_secs(10)));
     let transport = Arc::new(transport_config);
 
-    let mut server_config = ServerConfig::with_single_cert(cert_chain, priv_key).unwrap();
+    // ✅ Server Config với ALPN
+    let mut server_crypto = rustls::ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain.clone(), priv_key_rustls.clone())
+        .unwrap();
+    server_crypto.alpn_protocols = alpn_protocols.clone();
+    
+    let mut server_config = ServerConfig::with_crypto(Arc::new(server_crypto));
     server_config.transport = transport.clone();
 
-    let client_crypto = rustls::ClientConfig::builder()
+    // ✅ Client Config với ALPN
+    let mut client_crypto = rustls::ClientConfig::builder()
         .with_safe_defaults()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
+    client_crypto.alpn_protocols = alpn_protocols;
+    
     let mut client_config = ClientConfig::new(Arc::new(client_crypto));
     client_config.transport_config(transport);
 
