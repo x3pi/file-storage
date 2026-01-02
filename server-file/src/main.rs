@@ -142,7 +142,7 @@ async fn main() {
         log::info!("🔐 Loading QUIC private key from: {}", key);
         QuicTransport::new_with_certs(Some(cert), Some(key))
     } else {
-        eprintln!("\n❌ ERROR: QUIC certificate and private key not found!");
+        eprintln!("\n❌ ERROR: QUIC certificate and private TLS key not found!");
         std::process::exit(1);
     };
     let addr: std::net::SocketAddr = listen_addr.parse().expect("Invalid listen address");
