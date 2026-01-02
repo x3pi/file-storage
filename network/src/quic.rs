@@ -9,6 +9,8 @@ use quinn::{
 };
 use std::any::Any; // ✅ THÊM
 use std::convert::TryInto;
+use std::fs;
+use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -176,7 +178,16 @@ pub struct QuicTransport {
 }
 impl QuicTransport {
     pub fn new() -> Self {
-        let (server_config, client_config) = configure_certificates();
+        Self::new_with_certs(None, None)
+    }
+
+    /// Tạo QuicTransport với certificate và private key từ file
+    /// 
+    /// # Arguments
+    /// * `cert_path` - Đường dẫn đến file certificate (PEM format). Nếu None, sẽ tự động tạo certificate.
+    /// * `key_path` - Đường dẫn đến file private key (PEM format). Nếu None, sẽ tự động tạo key.
+    pub fn new_with_certs(cert_path: Option<&str>, key_path: Option<&str>) -> Self {
+        let (server_config, client_config) = configure_certificates(cert_path, key_path);
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
         endpoint.set_default_client_config(client_config.clone());
         Self {
@@ -185,6 +196,7 @@ impl QuicTransport {
             client_config,
         }
     }
+
     pub fn get_client_config(&self) -> ClientConfig {
         self.client_config.clone()
     }
@@ -210,13 +222,68 @@ impl Transport for QuicTransport {
 }
 
 // --- Cấu hình chứng chỉ & Hiệu năng ---
-fn configure_certificates() -> (ServerConfig, ClientConfig) {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    let cert_der = cert.serialize_der().unwrap();
-    let priv_key = cert.serialize_private_key_der();
-    let priv_key_rustls = rustls::PrivateKey(priv_key);
-    let cert_chain = vec![rustls::Certificate(cert_der.clone())];
+fn configure_certificates(
+    cert_path: Option<&str>,
+    key_path: Option<&str>,
+) -> (ServerConfig, ClientConfig) {
+    let (cert_der, priv_key_der): (Vec<u8>, Vec<u8>) = if let (Some(cert_file), Some(key_file)) =
+        (cert_path, key_path)
+    {
+        // Load certificate từ file PEM
+        log::info!("Loading certificate from file: {}", cert_file);
+        log::info!("Loading private key from file: {}", key_file);
 
+        let cert_pem = fs::read_to_string(cert_file)
+            .unwrap_or_else(|e| panic!("Failed to read certificate file {}: {}", cert_file, e));
+        let key_pem = fs::read_to_string(key_file)
+            .unwrap_or_else(|e| panic!("Failed to read private key file {}: {}", key_file, e));
+
+        // Parse certificate PEM
+        let cert_chain_bytes = cert_pem.as_bytes();
+        let certs = rustls_pemfile::certs(&mut BufReader::new(cert_chain_bytes))
+            .expect("Failed to parse certificate PEM");
+        
+        if certs.is_empty() {
+            panic!("No certificates found in certificate file: {}", cert_file);
+        }
+        let cert_der = certs[0].clone();
+
+        // Parse private key PEM - thử PKCS8 trước, sau đó thử PKCS1 (RSA)
+        let key_bytes = key_pem.as_bytes();
+        let mut keys = rustls_pemfile::pkcs8_private_keys(&mut BufReader::new(key_bytes))
+            .unwrap_or_else(|e| {
+                log::warn!("Failed to parse private key as PKCS8, trying PKCS1: {}", e);
+                vec![]
+            });
+
+        if keys.is_empty() {
+            // Thử PKCS1 format (RSA)
+            keys = rustls_pemfile::rsa_private_keys(&mut BufReader::new(key_bytes))
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "Failed to parse private key PEM (tried PKCS8 and PKCS1): {}",
+                        e
+                    )
+                });
+        }
+
+        if keys.is_empty() {
+            panic!("No private keys found in key file: {}", key_file);
+        }
+
+        log::info!("Successfully loaded certificate and private key from files");
+        (cert_der, keys[0].clone())
+    } else {
+        // Fallback: Tự động tạo certificate (giữ nguyên logic cũ)
+        log::info!("No certificate files provided, generating self-signed certificate");
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_der = cert.serialize_der().unwrap();
+        let priv_key = cert.serialize_private_key_der();
+        (cert_der, priv_key)
+    };
+
+    let priv_key_rustls = rustls::PrivateKey(priv_key_der);
+    let cert_chain = vec![rustls::Certificate(cert_der)];
     // ✅ ALPN Protocol - Quan trọng cho Android/iOS compatibility
     let alpn_protocols = vec![b"file-storage-v1".to_vec()];
 

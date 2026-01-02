@@ -81,7 +81,6 @@ async fn main() {
             e
         );
     }
-
     tokio::spawn(async move {
         let mut sys = System::new_all();
         let pid = sysinfo::get_current_pid().expect("Failed to get PID");
@@ -96,7 +95,6 @@ async fn main() {
             if let Some(proc) = process {
                 let memory_mb = proc.memory() / 1024 / 1024; // Convert to MB
                 let cpu_usage = proc.cpu_usage();
-
                 log::info!(
                     "📊 [SYSTEM MONITOR]  | RAM: {} MB | CPU: {:.2}%",
                     memory_mb,
@@ -126,7 +124,27 @@ async fn main() {
         listener::listen_download_confirmed_events(app_clone).await;
         log::error!("💀💀💀 CRITICAL: Event listener died unexpectedly!");
     });
-    let transport = QuicTransport::new();
+
+    // Load certificate và private key từ file trong thư mục hiện tại (cùng cấp với src)
+    let cert_path = if fs::metadata("certificate.pem").is_ok() {
+        Some("certificate.pem")
+    } else {
+        None
+    };
+
+    let key_path = if fs::metadata("private.key").is_ok() {
+        Some("private.key")
+    } else {
+        None
+    };
+    let transport = if let (Some(cert), Some(key)) = (cert_path, key_path) {
+        log::info!("🔐 Loading QUIC certificate from: {}", cert);
+        log::info!("🔐 Loading QUIC private key from: {}", key);
+        QuicTransport::new_with_certs(Some(cert), Some(key))
+    } else {
+        eprintln!("\n❌ ERROR: QUIC certificate and private key not found!");
+        std::process::exit(1);
+    };
     let addr: std::net::SocketAddr = listen_addr.parse().expect("Invalid listen address");
     let mut listener = transport
         .listen(addr)

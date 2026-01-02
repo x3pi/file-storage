@@ -269,6 +269,7 @@ dependencies = [
  "rand 0.7.3",
  "rcgen",
  "rustls",
+ "rustls-pemfile",
  "thiserror",
  "tokio",
  "tokio-rustls",

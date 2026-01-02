@@ -431,6 +431,10 @@ pub async fn handle_connection(
                                         message: error_message,
                                         chunk_data_base64: None,
                                     };
+                                    log::error!(
+                                        "❌ Download verification FAILED: {}",
+                                        response.message
+                                    );
                                     if let Err(e) =
                                         send_download_response(&mut stream_handler, &response).await
                                     {
