@@ -167,11 +167,20 @@ pub async fn verify_download_chunk(
     let session_first_ip = session_ref.first_ip;
     let session_owner = session_ref.file_owner;
     let signature_cache = session_ref.verified_signature.clone();
+    let is_public = session_ref.is_public;
+    let whitelist = session_ref.whitelist.clone();
     drop(session_ref);
 
     if session_first_ip != request_ip {
         return Err("IP address mismatch".to_string());
     }
+    
+    // Nếu file là public, cho phép tải ngay
+    if is_public {
+        log::info!("File is public, allowing download without signature verification");
+        return Ok(true);
+    }
+    
     // 1. Lấy cache chữ ký của session
     let cache_guard = signature_cache.lock().await;
     if let Some(cached_sig) = cache_guard.as_ref() {
@@ -195,13 +204,21 @@ pub async fn verify_download_chunk(
         run_recover_address_blocking(payload.download_key.clone(), payload.signature.clone())
             .await?;
 
-    // Verify owner
+    // Verify owner hoặc kiểm tra whitelist
     if recovered_address != session_owner {
-        println!(
-            "❌ Not match file owner: {}, recovered address: {}",
-            session_owner, recovered_address
-        );
-        return Err("Signer address does not match file owner".to_string());
+        // Nếu không phải owner, kiểm tra xem có trong whitelist không
+        if whitelist.contains(&recovered_address) {
+            log::info!(
+                "✅ Download allowed: Address {:?} is in whitelist for file",
+                recovered_address
+            );
+        } else {
+            log::error!(
+                "❌ Not match file owner: {}, recovered address: {}, and not in whitelist",
+                session_owner, recovered_address
+            );
+            return Err("Signer address does not match file owner and is not in whitelist".to_string());
+        }
     }
 
     let mut cache_guard = signature_cache.lock().await;

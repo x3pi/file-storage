@@ -3,7 +3,7 @@ use futures_util::lock::Mutex;
 use serde::{Deserialize, Serialize};
 use dashmap::DashMap;
 use tokio::sync::mpsc;
-use std::{net::IpAddr, sync::Arc, time::Instant};
+use std::{collections::HashSet, net::IpAddr, sync::Arc, time::Instant};
 
 // --- Structs cho giao tiếp client-server ---
 #[derive(Serialize, Deserialize, Debug)]
@@ -61,6 +61,8 @@ pub struct DownloadSession {
     pub retry_remaining:u64,
     pub confirmed_at: Option<Instant>,
     pub verified_signature: Arc<Mutex<Option<String>>>,
+    pub is_public: bool,
+    pub whitelist: HashSet<Address>,
 }
 // DashMap: downloadKey -> DownloadSession
 pub type DownloadSessionCache = Arc<DashMap<String, DownloadSession>>;

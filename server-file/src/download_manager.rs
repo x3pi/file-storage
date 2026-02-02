@@ -101,6 +101,24 @@ pub async fn initialize_download_session<'a>(
     let chunk_count = count_chunks(&file_path)
         .await
         .map_err(|e| format!("Failed to count chunks: {}", e))?;
+    
+    // Gọi isPublicFile để kiểm tra xem file có public không
+    let is_public = contract
+        .isPublicFile(session_info.fileKey)
+        .call()
+        .await
+        .map_err(|e| format!("Failed to check if file is public: {}", e))?;
+    
+    // Gọi getWhitelist để lấy danh sách ví được phép tải
+    let whitelist_addresses = contract
+        .getWhitelist(session_info.fileKey)
+        .call()
+        .await
+        .map_err(|e| format!("Failed to get whitelist: {}", e))?;
+    
+    // Chuyển đổi Vec<Address> thành HashSet<Address> để tra cứu nhanh
+    let whitelist: std::collections::HashSet<_> = whitelist_addresses.into_iter().collect();
+    
     let session = DownloadSession {
         download_key: download_key.to_string(),
         file_key: file_key.clone(),
@@ -111,10 +129,11 @@ pub async fn initialize_download_session<'a>(
         confirmed_at: None,
         retry_remaining: chunk_count *3,
         verified_signature: Arc::new(Mutex::new(None)),
+        is_public,
+        whitelist,
     };
     // ✅ Insert vào cache
     app.download_cache.insert(download_key.to_string(), session);
-    
     // Trả về session từ cache
     app.download_cache
         .get(download_key)
