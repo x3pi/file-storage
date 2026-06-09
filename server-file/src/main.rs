@@ -21,25 +21,35 @@ use sysinfo::System;
 use tokio::sync::MutexGuard; // Cần thiết để định nghĩa chính xác process_confirmation_queue
 #[tokio::main]
 async fn main() {
-    let log_dir_path = "log"; // Định nghĩa đường dẫn thư mục log
-    if fs::metadata(log_dir_path).is_ok() {
-        // Nếu tồn tại, xóa toàn bộ thư mục
-        if let Err(e) = fs::remove_dir_all(log_dir_path) {
+    let args: Vec<String> = env::args().collect();
+    if args.len() != 2 {
+        eprintln!("Usage: {} <host:port>", args[0]);
+        std::process::exit(1);
+    }
+    let server_addr = &args[1];
+
+    // Lấy port để tạo tên thư mục log riêng biệt (vd: log_7081)
+    let port = server_addr.split(':').last().unwrap_or("unknown");
+    let log_dir_path = format!("log_{}", port); // Định nghĩa đường dẫn thư mục log
+
+    if fs::metadata(&log_dir_path).is_ok() {
+        if let Err(e) = fs::remove_dir_all(&log_dir_path) {
             // Dùng eprintln! vì logger chưa được khởi tạo
-            println!(
+            eprintln!(
                 "⚠️ Warning: Could not remove old log directory '{}': {}. Tiếp tục...",
                 log_dir_path, e
             );
         } else {
-            println!(
+            eprintln!(
                 "♻️ Successfully removed old log directory: {}",
                 log_dir_path
             );
         }
     }
+
     let _logger = Logger::try_with_str("info") // Log level debug để xem chi tiết
         .unwrap()
-        .log_to_file(FileSpec::default().directory("log").basename("app"))
+        .log_to_file(FileSpec::default().directory(&log_dir_path).basename("app"))
         .append() // <--- THÊM DÒNG NÀY
         .format_for_files(detailed_format) // Format chi tiết cho file
         .format_for_stdout(detailed_format) // Format chi tiết cho console
@@ -51,12 +61,6 @@ async fn main() {
         .duplicate_to_stdout(flexi_logger::Duplicate::All) // Hiển thị log ra cả console
         .start()
         .expect("Could not start logger");
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: {} <listen_address:port>", args[0]);
-        eprintln!("Example: {} 127.0.0.1:8001", args[0]);
-        return;
-    }
     let (soft, hard) = getrlimit(Resource::NOFILE).unwrap();
     log::info!("Max open files (soft): {}", soft);
     log::info!("Max open files (hard): {}", hard);
@@ -71,8 +75,9 @@ async fn main() {
         std::process::exit(1);
     }
     
-    let listen_addr = &args[1];
-    let app = Arc::new(App::setup().await.expect("Failed to initialize app"));
+    let listen_addr = server_addr;
+    let log_dir = std::path::PathBuf::from(&log_dir_path);
+    let app = Arc::new(App::setup(log_dir).await.expect("Failed to initialize app"));
     // Tạo storage directory từ config
     if let Err(e) = fs::create_dir_all(&app.storage_root) {
         panic!(

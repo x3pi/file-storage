@@ -505,7 +505,7 @@ pub async fn handle_connection(
                         Command::GetLogList { payload: _ } => {
                             log::debug!("[{}] Handling GetLogList (no semaphore)", peer_clone);
 
-                            let logs_dir = PathBuf::from("./log");
+                            let logs_dir = app_clone.log_dir.clone();
                             let mut files_with_meta = Vec::new();
 
                             let mut entries = match fs::read_dir(&logs_dir).await {
@@ -583,7 +583,7 @@ pub async fn handle_connection(
                         Command::GetLogContent { payload } => {
                             log::debug!("[{}] Handling GetLogContent (no semaphore)", peer_clone);
 
-                            let logs_dir = PathBuf::from("./log");
+                            let logs_dir = app_clone.log_dir.clone();
                             let file_to_read_path = logs_dir.join(&payload.file_name);
 
                             let message: String;

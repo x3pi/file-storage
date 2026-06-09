@@ -30,6 +30,7 @@ pub struct App {
     pub confirmation_sender: ConfirmationSender,
     pub confirmation_receiver: Arc<Mutex<ConfirmationReceiver>>,
     pub storage_root: PathBuf,
+    pub log_dir: PathBuf,
     pub wallet: PrivateKeySigner,
     pub init_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
     pub task_semaphore: Arc<Semaphore>,
@@ -37,7 +38,7 @@ pub struct App {
 
 impl App {
 
-    pub async fn setup() -> Result<Self> {
+    pub async fn setup(log_dir: PathBuf) -> Result<Self> {
         let config = AppConfig::from_env()?;
         let storage_root = PathBuf::from(&config.storage_root);
         let wallet = PrivateKeySigner::from_str(&config.private_key)?;
@@ -53,9 +54,9 @@ impl App {
             download_cache,
             confirmation_sender,
             upload_file_cache,
-            // Đảm bảo kiểu dữ liệu khớp
             confirmation_receiver: Arc::new(Mutex::new(confirmation_receiver)),
             storage_root,
+            log_dir,
             wallet,
             init_locks,
             task_semaphore,

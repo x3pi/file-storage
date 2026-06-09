@@ -1,5 +1,6 @@
 server-file/target
-server-file/log/*
+server-file/log_*
 server-file/storage_7081
 server-file/storage_7082
+
 
