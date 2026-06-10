@@ -131,16 +131,40 @@ async fn main() {
     });
 
     // Load certificate và private key từ file trong thư mục hiện tại (cùng cấp với src)
-    let cert_path = if fs::metadata("certificate.pem").is_ok() {
-        Some("certificate.pem")
+    if let Ok(cwd) = env::current_dir() {
+        log::info!("🔍 [Debug] Current working directory: {}", cwd.display());
+        eprintln!("🔍 [Debug] Current working directory: {}", cwd.display());
     } else {
-        None
+        log::error!("🔍 [Debug] Failed to get current working directory");
+        eprintln!("🔍 [Debug] Failed to get current working directory");
+    }
+
+    let cwd = env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let cert_abs_path = cwd.join("certificate.pem");
+    let key_abs_path = cwd.join("private.key");
+
+    let cert_path = match fs::metadata("certificate.pem") {
+        Ok(_) => {
+            log::info!("🔍 [Debug] '{}' exists and is accessible.", cert_abs_path.display());
+            Some("certificate.pem")
+        }
+        Err(e) => {
+            log::error!("❌ [Debug] Failed to read metadata of '{}': {}", cert_abs_path.display(), e);
+            eprintln!("❌ [Debug] Failed to read metadata of '{}': {}", cert_abs_path.display(), e);
+            None
+        }
     };
 
-    let key_path = if fs::metadata("private.key").is_ok() {
-        Some("private.key")
-    } else {
-        None
+    let key_path = match fs::metadata("private.key") {
+        Ok(_) => {
+            log::info!("🔍 [Debug] '{}' exists and is accessible.", key_abs_path.display());
+            Some("private.key")
+        }
+        Err(e) => {
+            log::error!("❌ [Debug] Failed to read metadata of '{}': {}", key_abs_path.display(), e);
+            eprintln!("❌ [Debug] Failed to read metadata of '{}': {}", key_abs_path.display(), e);
+            None
+        }
     };
     let transport = if let (Some(cert), Some(key)) = (cert_path, key_path) {
         log::info!("🔐 Loading QUIC certificate from: {}", cert);
