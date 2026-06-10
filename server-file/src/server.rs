@@ -380,7 +380,7 @@ pub async fn handle_connection(
                                         match download_manager::descrease_chunk_count(
                                             &payload.download_key,
                                             &app_clone,
-                                        ) {
+                                        ).await {
                                             Ok(_) => {}
                                             Err(e) => {
                                                 log::error!(

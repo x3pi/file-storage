@@ -9,6 +9,7 @@ pub struct AppConfig {
     pub storage_root: String,
     pub address_sign_admin: String,
     pub session_timeout_seconds: u64,
+    pub http_addr: String, // NEW: Địa chỉ HTTP server
 }
 impl AppConfig {
     pub fn from_env() -> Result<Self> {
@@ -26,6 +27,7 @@ impl AppConfig {
             storage_root: std::env::var("STORAGE_ROOT").unwrap_or_else(|_| "./storage".to_string()),
             address_sign_admin: std::env::var("ADDRESS_SIGN_ADMIN")?,
             session_timeout_seconds: std::env::var("SESSION_TIMEOUT_SECONDS").unwrap_or_else(|_| "900".to_string()).parse()?,
+            http_addr: std::env::var("HTTP_ADDR").unwrap_or_else(|_| "0.0.0.0:7082".to_string()),
         })
     }
 }

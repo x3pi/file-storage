@@ -63,6 +63,7 @@ pub struct DownloadSession {
     pub verified_signature: Arc<Mutex<Option<String>>>,
     pub is_public: bool,
     pub whitelist: HashSet<Address>,
+    pub created_at: Instant, // Lưu thời gian tạo session để Sweeper quét
 }
 // DashMap: downloadKey -> DownloadSession
 pub type DownloadSessionCache = Arc<DashMap<String, DownloadSession>>;
@@ -80,8 +81,8 @@ pub struct UploadFileInfo {
 
 pub type UploadFileCache = Arc<DashMap<String, UploadFileInfo>>;
 
-pub type ConfirmationSender = mpsc::UnboundedSender<String>;
-pub type ConfirmationReceiver = mpsc::UnboundedReceiver<String>;
+pub type ConfirmationSender = mpsc::Sender<String>;
+pub type ConfirmationReceiver = mpsc::Receiver<String>;
 
 
 

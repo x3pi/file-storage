@@ -15,13 +15,17 @@ pub async fn initialize_download_session<'a>(
     app: &'a Arc<App>,
     request_ip: IpAddr,
 ) -> Result<Ref<'a, String, DownloadSession>, String> {
-   let timeout_duration = Duration::from_secs(app.config.session_timeout_seconds);
+    let timeout_duration = Duration::from_secs(app.config.session_timeout_seconds);
 
     // --- Logic xử lý Timeout (On-Access Expiration) ---
     if let Some(session_ref) = app.download_cache.get(download_key) {
         if let Some(confirmed_at) = session_ref.confirmed_at {
             if confirmed_at.elapsed() > timeout_duration {
-                log::info!("Removing expired download key ({}s timeout): {}", app.config.session_timeout_seconds, download_key);
+                log::info!(
+                    "Removing expired download key ({}s timeout): {}",
+                    app.config.session_timeout_seconds,
+                    download_key
+                );
                 app.download_cache.remove(download_key);
             }
         }
@@ -43,11 +47,11 @@ pub async fn initialize_download_session<'a>(
     if let Some(session_ref) = app.download_cache.get(download_key) {
         return Ok(session_ref);
     }
-    
+
     // ----------- SLOW PATH (CHỈ MỘT LUỒNG CHẠY Ở ĐÂY) -----------
     let download_key_clean = download_key.trim_start_matches("0x");
-    let download_key_bytes = hex::decode(download_key_clean)
-        .map_err(|e| format!("Invalid download key hex: {}", e))?;
+    let download_key_bytes =
+        hex::decode(download_key_clean).map_err(|e| format!("Invalid download key hex: {}", e))?;
 
     if download_key_bytes.len() != 32 {
         return Err(format!(
@@ -62,17 +66,20 @@ pub async fn initialize_download_session<'a>(
         .contract()
         .await
         .map_err(|e| format!("Failed to create contract instance: {}", e))?;
-        
+
     let session_info = contract
         .getDownloadSessionInfo(download_key_b256)
         .call()
         .await
         .map_err(|e| format!("Failed to get download session info: {}", e))?;
     if session_info.fileKey == B256::ZERO {
-        return Err(format!("Download key '{}' not found on-chain", download_key));
+        return Err(format!(
+            "Download key '{}' not found on-chain",
+            download_key
+        ));
     } else if session_info.isConfirmed == true {
         return Err(format!("Download key '{}' has expired", download_key));
-    } 
+    }
 
     let file_info_onchain = contract
         .getFileInfo(session_info.fileKey)
@@ -83,7 +90,7 @@ pub async fn initialize_download_session<'a>(
         .duration_since(UNIX_EPOCH)
         .map_err(|e| format!("System time error: {}", e))?
         .as_secs();
-   if file_info_onchain.expireTime <= current_time_secs {
+    if file_info_onchain.expireTime <= current_time_secs {
         return Err(format!("Download key has expired"));
     } else if file_info_onchain.status == FileStatus::Deleted {
         return Err(format!("File  has been deleted"));
@@ -95,42 +102,43 @@ pub async fn initialize_download_session<'a>(
     let file_path = Path::new(&app.config.storage_root)
         .join(level1)
         .join(level2)
-    .join(&file_key);
+        .join(&file_key);
 
     // Đếm số chunks
     let chunk_count = count_chunks(&file_path)
         .await
         .map_err(|e| format!("Failed to count chunks: {}", e))?;
-    
+
     // Gọi isPublicFile để kiểm tra xem file có public không
     let is_public = contract
         .isPublicFile(session_info.fileKey)
         .call()
         .await
         .map_err(|e| format!("Failed to check if file is public: {}", e))?;
-    
+
     // Gọi getWhitelist để lấy danh sách ví được phép tải
     let whitelist_addresses = contract
         .getWhitelist(session_info.fileKey)
         .call()
         .await
         .map_err(|e| format!("Failed to get whitelist: {}", e))?;
-    
+
     // Chuyển đổi Vec<Address> thành HashSet<Address> để tra cứu nhanh
     let whitelist: std::collections::HashSet<_> = whitelist_addresses.into_iter().collect();
-    
+
     let session = DownloadSession {
         download_key: download_key.to_string(),
         file_key: file_key.clone(),
-        remaining_chunks: chunk_count ,
+        remaining_chunks: chunk_count,
         file_owner: file_info_onchain.owner,
         total_chunks: chunk_count,
         first_ip: request_ip,
         confirmed_at: None,
-        retry_remaining: chunk_count *3,
+        retry_remaining: chunk_count * 3,
         verified_signature: Arc::new(Mutex::new(None)),
         is_public,
         whitelist,
+        created_at: std::time::Instant::now(), // Ghi nhận thời điểm bắt đầu tải
     };
     // ✅ Insert vào cache
     app.download_cache.insert(download_key.to_string(), session);
@@ -176,8 +184,17 @@ pub async fn list_chunks(file_path: &Path) -> Result<Vec<u64>, String> {
     let mut entries = fs::read_dir(file_path)
         .await
         .map_err(|e| format!("Failed to read directory: {}", e))?;
-    while let Some(entry) = entries.next_entry().await.map_err(|e| format!("Failed to read entry: {}", e))? {
-        if entry.file_type().await.map_err(|e| format!("Failed to get file type: {}", e))?.is_file() {
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| format!("Failed to read entry: {}", e))?
+    {
+        if entry
+            .file_type()
+            .await
+            .map_err(|e| format!("Failed to get file type: {}", e))?
+            .is_file()
+        {
             // Lấy tên file
             if let Some(file_name_str) = entry.file_name().to_str() {
                 // Parse tên file (là chunk index) sang u64
@@ -185,7 +202,10 @@ pub async fn list_chunks(file_path: &Path) -> Result<Vec<u64>, String> {
                     Ok(index) => chunks.push(index),
                     Err(_) => {
                         // Bỏ qua các file không phải là số
-                        log::warn!("Found non-numeric file in chunk directory: {}", file_name_str);
+                        log::warn!(
+                            "Found non-numeric file in chunk directory: {}",
+                            file_name_str
+                        );
                     }
                 }
             }
@@ -195,30 +215,32 @@ pub async fn list_chunks(file_path: &Path) -> Result<Vec<u64>, String> {
     chunks.sort();
     Ok(chunks)
 }
-pub fn descrease_chunk_count(download_key: &str, app: &Arc<App>) -> Result<u64, String> {
-    // if let Some(mut session) = app.download_cache.get_mut(download_key) {
-    let mut entry = match app.download_cache.entry(download_key.to_string()) {
-        dashmap::mapref::entry::Entry::Occupied(o) => o,
-        dashmap::mapref::entry::Entry::Vacant(_) => {
-            return Err("Download session not found".to_string())
-        }
-    };
-    let session = entry.get_mut();
-    if session.remaining_chunks > 0 {
-        session.remaining_chunks -= 1;
-        let remaining = session.remaining_chunks;
-        if remaining == 0 {
-            // ✅ FIX: `send()` trên UnboundedSender trả về Result (đã fix trong app.rs)
-            if let Err(e) = app.confirmation_sender.send(download_key.to_string()) {
-                println!("❌ Failed to send to confirmation queue: {:?}", e);
+pub async fn descrease_chunk_count(download_key: &str, app: &Arc<App>) -> Result<u64, String> {
+    let (remaining, should_confirm) = {
+        let mut entry = match app.download_cache.entry(download_key.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(o) => o,
+            dashmap::mapref::entry::Entry::Vacant(_) => {
+                return Err("Download session not found".to_string())
             }
+        };
+        let session = entry.get_mut();
+        if session.remaining_chunks > 0 {
+            session.remaining_chunks -= 1;
+            let rem = session.remaining_chunks;
+            (rem, rem == 0)
+        } else if session.retry_remaining > 0 {
+            session.retry_remaining -= 1;
+            (session.remaining_chunks, false)
+        } else {
+            return Err("No remaining chunks".to_string());
         }
-        return Ok(remaining);
-    } else if session.retry_remaining > 0 {
-        session.retry_remaining -= 1;
-        let remaining = session.remaining_chunks;
-        return Ok(remaining);
-    }  else {
-        return Err("No remaining chunks".to_string());
+    }; // Lock trên DashMap entry tự động giải phóng ở đây
+
+    if should_confirm {
+        // Dùng send().await để đợi nếu queue đầy
+        if let Err(e) = app.confirmation_sender.send(download_key.to_string()).await {
+            println!("❌ Failed to send to confirmation queue: {:?}", e);
+        }
     }
+    Ok(remaining)
 }
