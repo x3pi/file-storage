@@ -25,8 +25,8 @@ rlimit = "0.10"
 flexi_logger = { version = "0.28", features = ["compress", "async"] }
 num_cpus = "1.16.0"
 sysinfo = "0.31"
-axum = "0.7"
-axum-server = { version = "0.6", features = ["tls-rustls"] }
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "limit", "fs"] }
+# WebTransport (HTTP/3 over QUIC) — thay thế HTTPS Axum cho Web Client
+wtransport = "0.7"
+sha2 = "0.10"
+
 [build-dependencies]

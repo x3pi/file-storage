@@ -3,7 +3,7 @@ mod config;
 mod download_manager;
 mod ethereum;
 mod file_contract;
-mod http_server;
+mod wt_server;
 mod listener;
 mod models;
 mod retry;
@@ -231,18 +231,19 @@ async fn main() {
         }
     });
 
-    let http_addr = app.config.http_addr.clone();
+    let wt_addr_str = app.config.wt_addr.clone();
+    let wt_addr: std::net::SocketAddr = wt_addr_str.parse().expect("Invalid WT_ADDR");
     log::info!(
-        "🚀 Starting Storage Node on QUIC {} & HTTP {}",
+        "🚀 Starting Storage Node on QUIC {} & WebTransport {}",
         quic_addr,
-        http_addr
+        wt_addr
     );
 
     crate::sweeper::spawn_background_sweeper(app.clone());
 
-    let app_for_http = app.clone();
+    let app_for_wt = app.clone();
     tokio::spawn(async move {
-        http_server::run_http_server(app_for_http, &http_addr, cert_abs_path, key_abs_path).await;
+        wt_server::run_wt_server(app_for_wt, wt_addr, cert_abs_path, key_abs_path).await;
     });
 
     loop {
