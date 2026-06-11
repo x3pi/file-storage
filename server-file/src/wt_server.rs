@@ -10,17 +10,18 @@
 ///            "payload": { "download_key": "...", "chunk_index": 0, "signature": "..." } }
 ///
 /// Frame format (Response thành công):
-///   [4 byte BE uint32 length][1 byte ID length][ID bytes][raw chunk bytes]
-///   length = 1 + id.len() + chunk.len()
+///   [4 byte BE uint32 length][2 byte JSON length][JSON header bytes][raw chunk bytes]
+///   JSON: { "id": "...", "command": "...", "status": "success", "chunk_index": 0 }
 ///
 /// Frame format (Response lỗi):
-///   [4 byte BE uint32 length][0xFF][1 byte ID length][ID bytes][error message UTF-8]
+///   [4 byte BE uint32 length][2 byte JSON length][JSON header bytes]
+///   JSON: { "id": "...", "command": "...", "status": "error", "message": "..." }
 use crate::app::App;
 use crate::download_manager;
 use crate::ethereum::{handle_download_request, verify_download_chunk};
 use crate::models::DownloadChunkPayload;
 use base64::{engine::general_purpose, Engine as _};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -144,7 +145,7 @@ async fn handle_stream(
         Ok(b) => b,
         Err(e) => {
             log::warn!("[WT][{}] Failed to read frame: {}", peer_ip, e);
-            let _ = send_error_frame(&mut send, "", &format!("frame_read_error: {}", e)).await;
+            let _ = send_error_frame(&mut send, "", "", &format!("frame_read_error: {}", e)).await;
             return;
         }
     };
@@ -153,15 +154,17 @@ async fn handle_stream(
         Ok(r) => r,
         Err(e) => {
             log::warn!("[WT][{}] Invalid JSON: {}", peer_ip, e);
-            let _ = send_error_frame(&mut send, "", &format!("invalid_json: {}", e)).await;
+            let _ = send_error_frame(&mut send, "", "", &format!("invalid_json: {}", e)).await;
             return;
         }
     };
 
     if req.command != "download_chunk" {
-        let _ = send_error_frame(&mut send, &req.id, "unsupported command").await;
+        let _ = send_error_frame(&mut send, &req.id, &req.command, "unsupported command").await;
         return;
     }
+
+    let resp_command = "chunk_response";
 
     // --- Xây dựng payload để tái dụng business logic hiện có ---
     let mut dl_payload = DownloadChunkPayload {
@@ -175,11 +178,11 @@ async fn handle_stream(
     match verify_download_chunk(&dl_payload, &app, peer_ip).await {
         Ok(true) => {}
         Ok(false) => {
-            let _ = send_error_frame(&mut send, &req.id, "verification failed").await;
+            let _ = send_error_frame(&mut send, &req.id, resp_command, "verification failed").await;
             return;
         }
         Err(e) => {
-            let _ = send_error_frame(&mut send, &req.id, &e).await;
+            let _ = send_error_frame(&mut send, &req.id, resp_command, &e).await;
             return;
         }
     }
@@ -191,7 +194,7 @@ async fn handle_stream(
         }
         None => {
             let _ =
-                send_error_frame(&mut send, &req.id, "session not found after verify").await;
+                send_error_frame(&mut send, &req.id, resp_command, "session not found after verify").await;
             return;
         }
     }
@@ -199,7 +202,7 @@ async fn handle_stream(
     // --- Lấy chunk data (tái dụng logic hiện có) ---
     let response = handle_download_request(&dl_payload, &app).await;
     if response.status != "SUCCESS" {
-        let _ = send_error_frame(&mut send, &req.id, &response.message).await;
+        let _ = send_error_frame(&mut send, &req.id, resp_command, &response.message).await;
         return;
     }
 
@@ -211,13 +214,13 @@ async fn handle_stream(
     {
         Some(Ok(data)) => data,
         _ => {
-            let _ = send_error_frame(&mut send, &req.id, "failed to decode chunk data").await;
+            let _ = send_error_frame(&mut send, &req.id, resp_command, "failed to decode chunk data").await;
             return;
         }
     };
 
-    // --- Gửi Response: [4 byte length][1 byte ID len][ID bytes][raw chunk] ---
-    if let Err(e) = send_chunk_frame(&mut send, &req.id, &chunk_data).await {
+    // --- Gửi Response: [4 byte length][2 byte JSON len][JSON bytes][raw chunk] ---
+    if let Err(e) = send_chunk_frame(&mut send, &req.id, resp_command, req.payload.chunk_index, &chunk_data).await {
         log::error!("[WT][{}] Failed to send chunk frame: {}", peer_ip, e);
         return;
     }
@@ -268,31 +271,52 @@ async fn read_frame(stream: &mut wtransport::RecvStream) -> Result<Vec<u8>, Stri
     Ok(buf)
 }
 
+#[derive(Serialize)]
+struct ResponseHeader<'a> {
+    id: &'a str,
+    command: &'a str,
+    status: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chunk_index: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<&'a str>,
+}
+
 /// Gửi response chunk thành công:
-/// [4 byte BE uint32 length][1 byte ID length][ID bytes][raw chunk bytes]
+/// [4 byte BE uint32 length][2 byte JSON length][JSON bytes][raw chunk bytes]
 async fn send_chunk_frame(
     stream: &mut wtransport::SendStream,
     id: &str,
+    command: &str,
+    chunk_index: u64,
     data: &[u8],
 ) -> Result<(), String> {
     use tokio::io::AsyncWriteExt;
 
-    let id_bytes = id.as_bytes();
-    let id_len = id_bytes.len() as u8;
-    let payload_len = 1 + id_bytes.len() + data.len();
+    let header = ResponseHeader {
+        id,
+        command,
+        status: "success",
+        chunk_index: Some(chunk_index),
+        message: None,
+    };
+    let json_bytes = serde_json::to_vec(&header).map_err(|e| format!("serialize json: {}", e))?;
+    
+    let json_len = json_bytes.len() as u16;
+    let payload_len = 2 + json_bytes.len() + data.len();
 
     stream
         .write_all(&(payload_len as u32).to_be_bytes())
         .await
         .map_err(|e| format!("write len: {}", e))?;
     stream
-        .write_all(&[id_len])
+        .write_all(&json_len.to_be_bytes())
         .await
-        .map_err(|e| format!("write id_len: {}", e))?;
+        .map_err(|e| format!("write json_len: {}", e))?;
     stream
-        .write_all(id_bytes)
+        .write_all(&json_bytes)
         .await
-        .map_err(|e| format!("write id: {}", e))?;
+        .map_err(|e| format!("write json: {}", e))?;
     stream
         .write_all(data)
         .await
@@ -305,40 +329,39 @@ async fn send_chunk_frame(
 }
 
 /// Gửi error frame:
-/// [4 byte BE uint32 length][0xFF][1 byte ID length][ID bytes][error UTF-8 bytes]
+/// [4 byte BE uint32 length][2 byte JSON length][JSON bytes]
 async fn send_error_frame(
     stream: &mut wtransport::SendStream,
     id: &str,
+    command: &str,
     msg: &str,
 ) -> Result<(), String> {
     use tokio::io::AsyncWriteExt;
 
-    let id_bytes = id.as_bytes();
-    let id_len = id_bytes.len() as u8;
-    let msg_bytes = msg.as_bytes();
+    let header = ResponseHeader {
+        id,
+        command,
+        status: "error",
+        chunk_index: None,
+        message: Some(msg),
+    };
+    let json_bytes = serde_json::to_vec(&header).map_err(|e| format!("serialize json: {}", e))?;
     
-    let payload_len = 1 + 1 + id_bytes.len() + msg_bytes.len();
+    let json_len = json_bytes.len() as u16;
+    let payload_len = 2 + json_bytes.len();
     
     stream
         .write_all(&(payload_len as u32).to_be_bytes())
         .await
         .map_err(|e| format!("write err len: {}", e))?;
     stream
-        .write_all(&[0xFF])
+        .write_all(&json_len.to_be_bytes())
         .await
-        .map_err(|e| format!("write 0xFF: {}", e))?;
+        .map_err(|e| format!("write json_len: {}", e))?;
     stream
-        .write_all(&[id_len])
+        .write_all(&json_bytes)
         .await
-        .map_err(|e| format!("write id_len: {}", e))?;
-    stream
-        .write_all(id_bytes)
-        .await
-        .map_err(|e| format!("write id: {}", e))?;
-    stream
-        .write_all(msg_bytes)
-        .await
-        .map_err(|e| format!("write err msg: {}", e))?;
+        .map_err(|e| format!("write json: {}", e))?;
     let _ = stream.flush().await;
     Ok(())
 }
