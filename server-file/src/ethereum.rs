@@ -5,7 +5,7 @@ use alloy::primitives::{keccak256, Address};
 
 use alloy::signers::Signature;
 use base64::{engine::general_purpose, Engine as _};
-use std::fs;
+use tokio::fs;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -263,7 +263,7 @@ pub async fn handle_download_request(
     // Loại bỏ sleep và retry như yêu cầu
     // let chunk_path_clone: PathBuf = chunk_path.clone();
     // let read_result = tokio::task::spawn_blocking(move || fs::read(&chunk_path_clone)).await;
-    let chunk_data = match fs::read(&chunk_path) {
+    let chunk_data = match fs::read(&chunk_path).await {
         Ok(data) => data,
         Err(e) => {
             println!("❌ Failed to read chunk: {}", e);

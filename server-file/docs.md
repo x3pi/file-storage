@@ -1,0 +1,1 @@
+Ở local cần gọi ./gen_key.sh để tạo key test ở local

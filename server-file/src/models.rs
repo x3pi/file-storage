@@ -1,5 +1,5 @@
 use alloy::primitives::Address;
-use futures_util::lock::Mutex;
+use tokio::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use dashmap::DashMap;
 use tokio::sync::mpsc;

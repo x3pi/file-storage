@@ -150,7 +150,7 @@ pub async fn start_chain_id_monitor(app: Arc<App>) {
                 Ok(p) => {
                     provider_option = Some(p); // Lưu lại provider
                 }
-                Err(e) => {
+                Err(_e) => {
                     // log::warn!(
                     //     "Failed to connect WebSocket for chain ID monitor (will retry in 20s): {}",
                     //     e

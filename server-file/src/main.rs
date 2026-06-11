@@ -6,7 +6,7 @@ mod file_contract;
 mod wt_server;
 mod listener;
 mod models;
-mod retry;
+
 mod server;
 mod sweeper;
 use crate::app::App;

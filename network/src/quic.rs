@@ -80,10 +80,14 @@ impl QuicStreamHandler {
     pub async fn send(&mut self, data: Bytes) -> TransportResult<()> {
         log::trace!("📤 QuicStreamHandler sending {} bytes", data.len());
         self.framed.send(data).await?;
-        // ✅ CHỈ flush, KHÔNG chờ close → task kết thúc nhanh
-        // Stream sẽ tự động close khi drop QuicStreamHandler
-        self.framed.flush().await?;
-        log::trace!("✅ QuicStreamHandler flush completed");
+        // Đóng luồng gửi (SendStream) một cách tử tế để tránh RESET_STREAM
+        self.framed.close().await?;
+        
+        // Đọc nốt dữ liệu còn sót lại (nếu có) trên RecvStream cho đến EOF 
+        // để tránh lỗi STOP_SENDING gửi về client khi drop stream
+        while let Some(_) = self.framed.next().await {}
+
+        log::trace!("✅ QuicStreamHandler close completed");
         Ok(())
     }
 }

@@ -4,3 +4,8 @@ server-file/storage_7081
 server-file/storage_7082
 
 
+
+server-file/certificate.pem
+server-file/private.key
+server-file/fullchain.crt
+server-file/real_private.key

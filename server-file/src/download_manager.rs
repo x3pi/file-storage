@@ -3,7 +3,7 @@ use crate::file_contract::Files::FileStatus;
 use crate::models::DownloadSession; // 🔥 FIX: Loại bỏ DownloadSessionCache
 use alloy::primitives::B256;
 use dashmap::mapref::one::Ref;
-use futures_util::lock::Mutex;
+use tokio::sync::Mutex;
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -142,6 +142,10 @@ pub async fn initialize_download_session<'a>(
     };
     // ✅ Insert vào cache
     app.download_cache.insert(download_key.to_string(), session);
+    
+    // 🧹 DỌN DẸP: Xóa lock khỏi bộ nhớ sau khi khởi tạo xong để tránh rò rỉ RAM (Memory Leak)
+    app.init_locks.remove(download_key);
+
     // Trả về session từ cache
     app.download_cache
         .get(download_key)

@@ -10,18 +10,18 @@
 ///            "payload": { "download_key": "...", "chunk_index": 0, "signature": "..." } }
 ///
 /// Frame format (Response thành công):
-///   [4 byte BE uint32 length][32 byte SHA-256][raw chunk bytes]
-///   length = 32 + chunk.len()
+///   [4 byte BE uint32 length][1 byte ID length][ID bytes][raw chunk bytes]
+///   length = 1 + id.len() + chunk.len()
 ///
 /// Frame format (Response lỗi):
-///   [4 byte BE uint32 length][0xFF][error message UTF-8]
+///   [4 byte BE uint32 length][0xFF][1 byte ID length][ID bytes][error message UTF-8]
 use crate::app::App;
 use crate::download_manager;
 use crate::ethereum::{handle_download_request, verify_download_chunk};
 use crate::models::DownloadChunkPayload;
 use base64::{engine::general_purpose, Engine as _};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
+
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use wtransport::endpoint::IncomingSession;
@@ -144,7 +144,7 @@ async fn handle_stream(
         Ok(b) => b,
         Err(e) => {
             log::warn!("[WT][{}] Failed to read frame: {}", peer_ip, e);
-            let _ = send_error_frame(&mut send, "frame_read_error", &e).await;
+            let _ = send_error_frame(&mut send, "", &format!("frame_read_error: {}", e)).await;
             return;
         }
     };
@@ -153,7 +153,7 @@ async fn handle_stream(
         Ok(r) => r,
         Err(e) => {
             log::warn!("[WT][{}] Invalid JSON: {}", peer_ip, e);
-            let _ = send_error_frame(&mut send, "invalid_json", &e.to_string()).await;
+            let _ = send_error_frame(&mut send, "", &format!("invalid_json: {}", e)).await;
             return;
         }
     };
@@ -216,11 +216,8 @@ async fn handle_stream(
         }
     };
 
-    // Tính SHA-256 để client tự verify tính toàn vẹn dữ liệu
-    let sha256_bytes: [u8; 32] = Sha256::digest(&chunk_data).into();
-
-    // --- Gửi Response: [4 byte length][32 byte sha256][raw chunk] ---
-    if let Err(e) = send_chunk_frame(&mut send, &sha256_bytes, &chunk_data).await {
+    // --- Gửi Response: [4 byte length][1 byte ID len][ID bytes][raw chunk] ---
+    if let Err(e) = send_chunk_frame(&mut send, &req.id, &chunk_data).await {
         log::error!("[WT][{}] Failed to send chunk frame: {}", peer_ip, e);
         return;
     }
@@ -235,6 +232,14 @@ async fn handle_stream(
         chunk_data.len(),
         &req.payload.download_key[..8.min(req.payload.download_key.len())]
     );
+    // Đóng luồng gửi tử tế (Graceful Shutdown)
+    let _ = send.finish().await;
+
+    // Đọc cạn luồng nhận để không quăng lỗi STOP_SENDING
+    let mut buf = [0u8; 128];
+    while let Ok(Some(_)) = recv.read(&mut buf).await {
+        // Đọc cho đến khi EOF (None) hoặc lỗi
+    }
 }
 
 // ─── Framing Helpers ────────────────────────────────────────────────────────
@@ -264,23 +269,30 @@ async fn read_frame(stream: &mut wtransport::RecvStream) -> Result<Vec<u8>, Stri
 }
 
 /// Gửi response chunk thành công:
-/// [4 byte BE uint32 length][32 byte SHA-256][raw chunk bytes]
+/// [4 byte BE uint32 length][1 byte ID length][ID bytes][raw chunk bytes]
 async fn send_chunk_frame(
     stream: &mut wtransport::SendStream,
-    sha256: &[u8; 32],
+    id: &str,
     data: &[u8],
 ) -> Result<(), String> {
     use tokio::io::AsyncWriteExt;
 
-    let payload_len = 32 + data.len();
+    let id_bytes = id.as_bytes();
+    let id_len = id_bytes.len() as u8;
+    let payload_len = 1 + id_bytes.len() + data.len();
+
     stream
         .write_all(&(payload_len as u32).to_be_bytes())
         .await
         .map_err(|e| format!("write len: {}", e))?;
     stream
-        .write_all(sha256)
+        .write_all(&[id_len])
         .await
-        .map_err(|e| format!("write sha256: {}", e))?;
+        .map_err(|e| format!("write id_len: {}", e))?;
+    stream
+        .write_all(id_bytes)
+        .await
+        .map_err(|e| format!("write id: {}", e))?;
     stream
         .write_all(data)
         .await
@@ -293,16 +305,20 @@ async fn send_chunk_frame(
 }
 
 /// Gửi error frame:
-/// [4 byte BE uint32 length][0xFF][error UTF-8 bytes]
+/// [4 byte BE uint32 length][0xFF][1 byte ID length][ID bytes][error UTF-8 bytes]
 async fn send_error_frame(
     stream: &mut wtransport::SendStream,
-    _id: &str,
+    id: &str,
     msg: &str,
 ) -> Result<(), String> {
     use tokio::io::AsyncWriteExt;
 
+    let id_bytes = id.as_bytes();
+    let id_len = id_bytes.len() as u8;
     let msg_bytes = msg.as_bytes();
-    let payload_len = 1 + msg_bytes.len();
+    
+    let payload_len = 1 + 1 + id_bytes.len() + msg_bytes.len();
+    
     stream
         .write_all(&(payload_len as u32).to_be_bytes())
         .await
@@ -311,6 +327,14 @@ async fn send_error_frame(
         .write_all(&[0xFF])
         .await
         .map_err(|e| format!("write 0xFF: {}", e))?;
+    stream
+        .write_all(&[id_len])
+        .await
+        .map_err(|e| format!("write id_len: {}", e))?;
+    stream
+        .write_all(id_bytes)
+        .await
+        .map_err(|e| format!("write id: {}", e))?;
     stream
         .write_all(msg_bytes)
         .await

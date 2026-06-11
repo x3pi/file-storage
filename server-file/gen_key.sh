@@ -14,7 +14,7 @@ prompt = no
 CN = quic-local
 
 [v3_req]
-keyUsage = keyEncipherment, dataEncipherment
+keyUsage = digitalSignature, keyEncipherment, dataEncipherment
 extendedKeyUsage = serverAuth
 subjectAltName = @alt_names
 
@@ -24,17 +24,23 @@ IP.1  = 127.0.0.1
 IP.2  = 192.168.1.234
 EOF
 
-# Generate private key
-openssl genrsa -out private.key 2048
+# Generate ECDSA P-256 private key (bắt buộc cho WebTransport)
+# Rustls yêu cầu định dạng PKCS#8 nên phải convert từ SEC1 sang PKCS#8
+openssl ecparam -name prime256v1 -genkey -noout -out temp.key
+openssl pkcs8 -topk8 -nocrypt -in temp.key -out private.key
+rm temp.key
 
 # Generate self-signed certificate
 openssl req -new -x509 \
   -key private.key \
   -out certificate.pem \
-  -days 365 \
+  -days 13 \
   -config cert.conf \
   -extensions v3_req
 
 echo "✅ Done!"
 echo " - private.key"
 echo " - certificate.pem"
+
+openssl x509 -in certificate.pem -outform der | openssl dgst -sha256 -binary | xxd -i
+
