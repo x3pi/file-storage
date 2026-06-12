@@ -29,3 +29,53 @@ pub fn spawn_background_sweeper(app: Arc<App>) {
         }
     });
 }
+
+pub fn spawn_confirmation_retry_worker(app: Arc<App>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(120)).await; // Chạy mỗi 2 phút
+
+            let pending_file = app.storage_root.join("pending_confirmations.txt");
+            let processing_file = app.storage_root.join("processing_confirmations.txt");
+
+            if !pending_file.exists() {
+                continue;
+            }
+
+            // Đổi tên file để tránh xung đột với các task đang ghi
+            if let Err(e) = tokio::fs::rename(&pending_file, &processing_file).await {
+                log::error!("❌ Failed to rename pending file: {}", e);
+                continue;
+            }
+
+            // Đọc file
+            match tokio::fs::read_to_string(&processing_file).await {
+                Ok(content) => {
+                    let mut count = 0;
+                    for line in content.lines() {
+                        let key = line.trim();
+                        if !key.is_empty() {
+                            // Dùng send().await để hút từ từ vào queue, nếu queue đang đầy thì worker sẽ chờ ở đây, điều tiết lưu lượng
+                            if let Err(e) = app.confirmation_sender.send(key.to_string()).await {
+                                log::error!("❌ Worker failed to send to confirmation queue: {:?}", e);
+                            } else {
+                                count += 1;
+                            }
+                        }
+                    }
+                    if count > 0 {
+                        log::info!("♻️ Đã khôi phục thành công {} confirmations từ ổ đĩa vào hàng đợi.", count);
+                    }
+                }
+                Err(e) => {
+                    log::error!("❌ Failed to read processing file: {}", e);
+                }
+            }
+
+            // Xóa file sau khi xử lý xong (dù thành công hay thất bại đọc nội dung)
+            if let Err(e) = tokio::fs::remove_file(&processing_file).await {
+                log::error!("❌ Failed to remove processing file: {}", e);
+            }
+        }
+    });
+}

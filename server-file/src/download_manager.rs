@@ -241,9 +241,39 @@ pub async fn descrease_chunk_count(download_key: &str, app: &Arc<App>) -> Result
     }; // Lock trên DashMap entry tự động giải phóng ở đây
 
     if should_confirm {
-        // Dùng send().await để đợi nếu queue đầy
-        if let Err(e) = app.confirmation_sender.send(download_key.to_string()).await {
-            println!("❌ Failed to send to confirmation queue: {:?}", e);
+        // Dùng try_send() cho bounded channel
+        if let Err(e) = app.confirmation_sender.try_send(download_key.to_string()) {
+            match e {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                    log::warn!("⚠️ Confirmation queue full! Falling back to disk for {}", download_key);
+                    // Ghi ra file pending trên đĩa cứng
+                    let pending_file_path = app.storage_root.join("pending_confirmations.txt");
+                    // Dùng tokio::task::spawn để không block luồng hiện tại
+                    let key_to_write = download_key.to_string();
+                    tokio::spawn(async move {
+                        let mut file = match tokio::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&pending_file_path)
+                            .await
+                        {
+                            Ok(f) => f,
+                            Err(e) => {
+                                log::error!("❌ CRITICAL: Failed to open pending_confirmations.txt: {}", e);
+                                return;
+                            }
+                        };
+                        use tokio::io::AsyncWriteExt;
+                        let line = format!("{}\n", key_to_write);
+                        if let Err(err) = file.write_all(line.as_bytes()).await {
+                            log::error!("❌ CRITICAL: Failed to write to pending_confirmations.txt: {}", err);
+                        }
+                    });
+                }
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                    log::error!("❌ Failed to send to confirmation queue: Channel closed");
+                }
+            }
         }
     }
     Ok(remaining)

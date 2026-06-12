@@ -37,11 +37,11 @@ impl App {
         let wallet = PrivateKeySigner::from_str(&config.private_key)?;
         let download_cache: DownloadSessionCache = Arc::new(DashMap::new());
         let upload_file_cache: UploadFileCache = Arc::new(DashMap::new());
-        let (confirmation_sender, confirmation_receiver) = mpsc::channel(2000);
+        let (confirmation_sender, confirmation_receiver) = mpsc::channel(200_000);
         let init_locks = Arc::new(DashMap::new());
-        let num_cores = num_cpus::get();
-        // [FIX] Tăng giới hạn semaphore để tránh bị block cho workload I/O (tokio FS ops và HTTP endpoints)
-        let semaphore_limit = std::cmp::max(1000, num_cores * 50);
+        // [FIX] Tối ưu giới hạn semaphore cho máy 6 Core, 16GB RAM.
+        // Cấp 3000 luồng (tốn ~4-6GB RAM buffer), giữ lại ~10GB RAM cho hệ điều hành làm Page Cache đệm ổ cứng.
+        let semaphore_limit = 3000;
         let task_semaphore = Arc::new(Semaphore::new(semaphore_limit));
         Ok(Self {
             config,

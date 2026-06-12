@@ -376,6 +376,10 @@ pub async fn handle_connection(
                                         send_download_response(&mut stream_handler, &response)
                                             .await;
                                     let send_done_time = Instant::now();
+
+                                    // Nhả semaphore permit ở đây để không làm nghẽn node nếu confirmation_sender bị chặn
+                                    drop(_permit);
+
                                     if send_result.is_ok() && response.status == "SUCCESS" {
                                         match download_manager::descrease_chunk_count(
                                             &payload.download_key,

@@ -240,6 +240,7 @@ async fn main() {
     );
 
     crate::sweeper::spawn_background_sweeper(app.clone());
+    crate::sweeper::spawn_confirmation_retry_worker(app.clone());
 
     let app_for_wt = app.clone();
     tokio::spawn(async move {
