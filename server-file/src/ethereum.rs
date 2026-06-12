@@ -240,20 +240,23 @@ pub async fn handle_download_request(
         .join(level2) // Cấp 2
         .join(&payload.file_key)
         .join(payload.chunk_index.to_string());
-    // Initialize download session
-    let session = match app.download_cache.get(&payload.download_key) {
-        Some(s) => s,
-        None => {
-            return DownloadResponse {
-                status: "ERROR".to_string(),
-                message: "Download session not found, please verify first.".to_string(),
-                chunk_data_base64: None,
-            };
-        }
+    // Initialize download session and check permissions (scope limits lock lifetime)
+    let has_permission = {
+        let session = match app.download_cache.get(&payload.download_key) {
+            Some(s) => s,
+            None => {
+                return DownloadResponse {
+                    status: "ERROR".to_string(),
+                    message: "Download session not found, please verify first.".to_string(),
+                    chunk_data_base64: None,
+                };
+            }
+        };
+        session.remaining_chunks > 0 || session.retry_remaining > 0
     };
 
     // Check permission
-    if session.remaining_chunks == 0 && session.retry_remaining == 0 {
+    if !has_permission {
         return DownloadResponse {
             status: "ERROR".to_string(),
             message: "No remaining downloads for this key".to_string(),

@@ -18,17 +18,22 @@ pub async fn initialize_download_session<'a>(
     let timeout_duration = Duration::from_secs(app.config.session_timeout_seconds);
 
     // --- Logic xử lý Timeout (On-Access Expiration) ---
+    let mut remove_key = false;
     if let Some(session_ref) = app.download_cache.get(download_key) {
         if let Some(confirmed_at) = session_ref.confirmed_at {
             if confirmed_at.elapsed() > timeout_duration {
-                log::info!(
-                    "Removing expired download key ({}s timeout): {}",
-                    app.config.session_timeout_seconds,
-                    download_key
-                );
-                app.download_cache.remove(download_key);
+                remove_key = true;
             }
         }
+    }
+    
+    if remove_key {
+        log::info!(
+            "Removing expired download key ({}s timeout): {}",
+            app.config.session_timeout_seconds,
+            download_key
+        );
+        app.download_cache.remove(download_key);
     }
     if let Some(session_ref) = app.download_cache.get(download_key) {
         return Ok(session_ref);
