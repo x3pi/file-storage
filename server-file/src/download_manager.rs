@@ -160,36 +160,34 @@ pub async fn initialize_download_session<'a>(
 }
 
 pub async fn count_chunks(file_path: &Path) -> Result<u64, String> {
-    if !file_path.exists() {
-        return Err("File path does not exist".to_string());
-    }
-
-    let mut count = 0u64;
-    let mut entries = fs::read_dir(file_path)
-        .await
-        .map_err(|e| format!("Failed to read directory: {}", e))?;
-
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|e| format!("Failed to read entry: {}", e))?
-    {
-        if entry
-            .file_type()
-            .await
-            .map_err(|e| format!("Failed to get file type: {}", e))?
-            .is_file()
-        {
-            count += 1;
-        }
-    }
-    Ok(count)
+    list_chunks(file_path).await.map(|v| v.len() as u64)
 }
+
 pub async fn list_chunks(file_path: &Path) -> Result<Vec<u64>, String> {
     if !file_path.exists() {
         return Err("File path does not exist".to_string());
     }
     let mut chunks = Vec::new();
+
+    // 1. CÁCH MỚI: Đọc từ file .meta (nếu có)
+    if let Some(file_name) = file_path.file_name() {
+        let file_key = file_name.to_string_lossy().to_string();
+        let meta_path = file_path.join(format!("{}.meta", file_key));
+        if meta_path.exists() {
+            if let Ok(content) = fs::read_to_string(&meta_path).await {
+                for line in content.lines() {
+                    if let Ok(index) = line.trim().parse::<u64>() {
+                        chunks.push(index);
+                    }
+                }
+            }
+            chunks.sort();
+            chunks.dedup(); // Loại bỏ trùng lặp nếu có retry
+            return Ok(chunks);
+        }
+    }
+
+    // 2. CÁCH CŨ: Duyệt thư mục tìm các file chunk lẻ
     let mut entries = fs::read_dir(file_path)
         .await
         .map_err(|e| format!("Failed to read directory: {}", e))?;
@@ -204,13 +202,10 @@ pub async fn list_chunks(file_path: &Path) -> Result<Vec<u64>, String> {
             .map_err(|e| format!("Failed to get file type: {}", e))?
             .is_file()
         {
-            // Lấy tên file
             if let Some(file_name_str) = entry.file_name().to_str() {
-                // Parse tên file (là chunk index) sang u64
                 match file_name_str.parse::<u64>() {
                     Ok(index) => chunks.push(index),
                     Err(_) => {
-                        // Bỏ qua các file không phải là số
                         log::warn!(
                             "Found non-numeric file in chunk directory: {}",
                             file_name_str
@@ -220,7 +215,6 @@ pub async fn list_chunks(file_path: &Path) -> Result<Vec<u64>, String> {
             }
         }
     }
-    // Sắp xếp lại cho dễ nhìn
     chunks.sort();
     Ok(chunks)
 }

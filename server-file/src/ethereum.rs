@@ -263,16 +263,46 @@ pub async fn handle_download_request(
             chunk_data_base64: None,
         };
     }
-    // Loại bỏ sleep và retry như yêu cầu
-    // let chunk_path_clone: PathBuf = chunk_path.clone();
-    // let read_result = tokio::task::spawn_blocking(move || fs::read(&chunk_path_clone)).await;
-    let chunk_data = match fs::read(&chunk_path).await {
+    // Đường dẫn cho cách cũ (từng chunk riêng lẻ)
+    let chunk_path = app
+        .storage_root
+        .join(level1)
+        .join(level2)
+        .join(&payload.file_key)
+        .join(payload.chunk_index.to_string());
+        
+    // Đường dẫn cho cách mới (.bin)
+    let bin_path = app
+        .storage_root
+        .join(level1)
+        .join(level2)
+        .join(&payload.file_key)
+        .join(format!("{}.bin", payload.file_key));
+
+    let chunk_data_result = if bin_path.exists() {
+        // CÁCH MỚI: Đọc từ file .bin với Seek
+        let offset = (payload.chunk_index as u64) * 256000;
+        async {
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+            let mut file = fs::File::open(&bin_path).await?;
+            file.seek(std::io::SeekFrom::Start(offset)).await?;
+            let mut buf = vec![0u8; 256000];
+            let n = file.read(&mut buf).await?;
+            buf.truncate(n);
+            Ok::<Vec<u8>, std::io::Error>(buf)
+        }
+        .await
+    } else {
+        // CÁCH CŨ: Đọc toàn bộ file chunk lẻ
+        fs::read(&chunk_path).await
+    };
+
+    let chunk_data = match chunk_data_result {
         Ok(data) => data,
-        Err(e) => {
-            println!("❌ Failed to read chunk: {}", e);
+        Err(_) => {
             return DownloadResponse {
                 status: "ERROR".to_string(),
-                message: format!("Failed to read chunk: {}", e),
+                message: "Chunk data not found".to_string(),
                 chunk_data_base64: None,
             };
         }

@@ -222,15 +222,32 @@ pub async fn handle_connection(
                                     let file_dir: PathBuf =
                                         storage_root.join(level1).join(level2).join(&file_key);
                                     std::fs::create_dir_all(&file_dir)?;
-                                    let chunk_path = file_dir.join(chunk_index.to_string());
-                                    if chunk_path.exists() {
-                                        return Err(std::io::Error::new(
-                                            std::io::ErrorKind::AlreadyExists,
-                                            format!("Chunk {} already exists on disk", chunk_index),
-                                        ));
-                                    }
-                                    std::fs::write(&chunk_path, chunk_data)?;
-                                    Ok(chunk_path)
+                                    
+                                    // CÁCH MỚI: Ghi vào [file_key].bin
+                                    let bin_path = file_dir.join(format!("{}.bin", file_key));
+                                    let meta_path = file_dir.join(format!("{}.meta", file_key));
+                                    
+                                    use std::fs::OpenOptions;
+                                    use std::io::{Seek, SeekFrom, Write};
+                                    
+                                    let mut file = OpenOptions::new()
+                                        .write(true)
+                                        .create(true)
+                                        .open(&bin_path)?;
+                                        
+                                    // Chunk size luôn là 250KB = 256000 bytes
+                                    let offset = (chunk_index as u64) * 256000;
+                                    file.seek(SeekFrom::Start(offset))?;
+                                    file.write_all(&chunk_data)?;
+                                    
+                                    // Ghi index vào file meta
+                                    let mut meta_file = OpenOptions::new()
+                                        .append(true)
+                                        .create(true)
+                                        .open(&meta_path)?;
+                                    meta_file.write_all(format!("{}\n", chunk_index).as_bytes())?;
+                                    
+                                    Ok(bin_path)
                                 })
                                 .await
                                 .map_err(|e| {
