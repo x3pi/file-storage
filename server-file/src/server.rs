@@ -159,30 +159,22 @@ pub async fn handle_connection(
                                 }
                             };
                             
-                            // Decode chunk data first (needed for both signature and merkle verification)
-                            let chunk_data = match general_purpose::STANDARD
-                                .decode(&payload.chunk_data_base64)
-                            {
-                                Ok(data) => data,
-                                Err(e) => {
+                            // ✅ RECEIVE FRAME 2: Binary Chunk Data
+                            let chunk_data = match stream_handler.recv().await {
+                                Ok(Some(data)) => data.to_vec(),
+                                _ => {
                                     log::error!(
-                                        "[{}] Failed to decode chunk data: {}",
+                                        "[{}] ❌ Failed to receive binary chunk data (Frame 2) for chunk {} -k {}",
                                         peer_clone,
-                                        e
+                                        log_chunk_index,
+                                        log_file_key
                                     );
-                                    if let Err(e) = send_error_response(
+                                    let _ = send_error_response(
                                         &mut stream_handler,
-                                        "Invalid Base64 data",
+                                        "Failed to receive binary chunk data",
                                     )
-                                    .await
-                                    {
-                                        log::error!(
-                                            "[{}] Error sending error response: {}",
-                                            peer_clone,
-                                            e
-                                        );
-                                    }
-                                    return; // Thoát task
+                                    .await;
+                                    return;
                                 }
                             };
                             

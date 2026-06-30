@@ -9,3 +9,5 @@ server-file/certificate.pem
 server-file/private.key
 server-file/fullchain.crt
 server-file/real_private.key
+server-file/cert.conf
+server-file/file-storage.code-workspace

@@ -21,7 +21,6 @@ pub enum Command {
 pub struct UploadChunkPayload {
     pub file_key: String,
     pub chunk_index: u64,
-    pub chunk_data_base64: String,
     pub signature: String,
     pub merkle_proof_hashes: Vec<String>, // Array of hex strings (32 bytes each)
     pub merkle_root: String, // Hex string of merkle root (32 bytes)
