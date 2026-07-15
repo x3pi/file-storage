@@ -7,7 +7,7 @@ use crate::models::{
     Command, DownloadResponse, GenericResponse, ListChunksResponse, LogFileContent,
     LogsContentResponse, LogsListResponse, CHUNK_SIZE,
 };
-use base64::{engine::general_purpose, Engine as _};
+
 use chrono::Local;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -35,11 +35,18 @@ async fn send_error_response(
 async fn send_download_response(
     stream: &mut QuicStreamHandler, // Nhận stream
     response: &DownloadResponse,
+    chunk_data: Option<Vec<u8>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut response_json = serde_json::to_vec(response)?;
     response_json.push(b'\n');
-    // ✅ GỌI stream.send
+    // ✅ GỌI stream.send FRAME 1: Metadata (JSON)
     stream.send(Bytes::from(response_json)).await?;
+    
+    // ✅ GỌI stream.send FRAME 2: Binary data (nếu có)
+    if let Some(data) = chunk_data {
+        stream.send(Bytes::from(data)).await?;
+    }
+    
     Ok(())
 }
 async fn send_list_chunks_response(
@@ -106,39 +113,52 @@ pub async fn handle_connection(
                 break; // Thoát vòng lặp
             }
         };
-        match stream_handler.recv().await {
-            Ok(Some(data)) => {
-                log::debug!("[{}] 📥 Received {} bytes from client", peer, data.len());
+        let app_clone = app.clone();
+        let peer_clone = peer; // SocketAddr là Copy
+        tokio::spawn(async move {
+            let mut stream_handler = stream_handler;
+            let semaphore = app_clone.task_semaphore.clone();
+            
+            loop {
+                let data = match stream_handler.recv().await {
+                    Ok(Some(d)) => d,
+                    Ok(None) => {
+                        log::debug!("[{}] ⚠️ Stream closed by client.", peer_clone);
+                        break; // Khách hàng đã ngắt kết nối
+                    }
+                    Err(e) => {
+                        log::debug!("[{}] ❌ Error reading from stream: {}", peer_clone, e);
+                        break;
+                    }
+                };
+
+                log::debug!("[{}] 📥 Received {} bytes from client", peer_clone, data.len());
                 let line = String::from_utf8_lossy(&data).trim().to_string();
                 if line.is_empty() {
-                    log::warn!("[{}] ⚠️ Received empty stream, skipping.", peer);
-                    continue; // Chờ stream tiếp theo
+                    log::warn!("[{}] ⚠️ Received empty stream, skipping.", peer_clone);
+                    continue; // Chờ lệnh tiếp theo
                 }
-                log::debug!("[{}] 🔍 Parsing command...", peer);
+                log::debug!("[{}] 🔍 Parsing command...", peer_clone);
 
                 let command: Command = match serde_json::from_str(&line) {
                     Ok(cmd) => cmd,
                     Err(e) => {
-                        log::error!("[{}] ❌ Failed to parse command: {}", peer, e);
-                        log::error!("[{}] Raw data: {}", peer, line);
-                        // Gửi lỗi TRÊN STREAM NÀY
+                        log::error!("[{}] ❌ Failed to parse command: {}", peer_clone, e);
+                        log::error!("[{}] Raw data: {}", peer_clone, line);
                         if let Err(e) =
                             send_error_response(&mut stream_handler, "Invalid command format").await
                         {
-                            log::error!("[{}] Error sending error response: {}", peer, e);
+                            log::error!("[{}] Error sending error response: {}", peer_clone, e);
                         }
-                        continue; // Chờ stream tiếp theo
+                        continue; // Chờ lệnh tiếp theo
                     }
                 };
-                let app_clone = app.clone();
-                let peer_clone = peer; // SocketAddr là Copy
+                
                 let start_time = Instant::now();
                 let start_time_wall_clock = Local::now();
-                tokio::spawn(async move {
-                    let mut stream_handler = stream_handler;
-                    let semaphore = app_clone.task_semaphore.clone();
-                    match command {
-                        Command::UploadChunk { payload } => {
+                
+                match command {
+                    Command::UploadChunk { payload } => {
                             let log_file_key = payload.file_key.clone();
                             let log_chunk_index = payload.chunk_index;
                             let _permit = match semaphore.acquire().await {
@@ -229,27 +249,30 @@ pub async fn handle_connection(
                                     let meta_path = file_dir.join(format!("{}.meta", file_key));
                                     
                                     use std::fs::OpenOptions;
-                                    use std::io::{Seek, SeekFrom, Write};
+                                    use std::io::Write;
+                                    use std::os::unix::fs::FileExt;
                                     
-                                    let open_files = file_cache.entry(file_key.clone()).or_insert_with(|| {
-                                        let bin_file = OpenOptions::new()
-                                            .write(true)
-                                            .create(true)
-                                            .open(&bin_path).unwrap();
-                                        let meta_file = OpenOptions::new()
-                                            .append(true)
-                                            .create(true)
-                                            .open(&meta_path).unwrap();
-                                        crate::models::OpenFiles {
-                                            bin_file: std::sync::Arc::new(std::sync::Mutex::new(bin_file)),
-                                            meta_file: std::sync::Arc::new(std::sync::Mutex::new(meta_file)),
-                                        }
-                                    });
+                                    let open_files = if let Some(files) = file_cache.get(&file_key) {
+                                        files.value().clone()
+                                    } else {
+                                        file_cache.entry(file_key.clone()).or_insert_with(|| {
+                                            let bin_file = OpenOptions::new()
+                                                .write(true)
+                                                .create(true)
+                                                .open(&bin_path).unwrap();
+                                            let meta_file = OpenOptions::new()
+                                                .append(true)
+                                                .create(true)
+                                                .open(&meta_path).unwrap();
+                                            crate::models::OpenFiles {
+                                                bin_file: std::sync::Arc::new(bin_file),
+                                                meta_file: std::sync::Arc::new(std::sync::Mutex::new(meta_file)),
+                                            }
+                                        }).value().clone()
+                                    };
                                         
                                     let offset = (chunk_index as u64) * CHUNK_SIZE;
-                                    let mut bin_file_guard = open_files.bin_file.lock().unwrap();
-                                    bin_file_guard.seek(SeekFrom::Start(offset))?;
-                                    bin_file_guard.write_all(&chunk_data)?;
+                                    open_files.bin_file.write_all_at(&chunk_data, offset)?;
                                     
                                     // Ghi index vào file meta
                                     let mut meta_file_guard = open_files.meta_file.lock().unwrap();
@@ -381,7 +404,7 @@ pub async fn handle_connection(
                             );
                             match verify_result {
                                 Ok(true) => {
-                                    let response =
+                                    let (response, chunk_data) =
                                         handle_download_request(&payload, &app_clone).await;
 
                                     let processing_done_time = Instant::now();
@@ -390,7 +413,7 @@ pub async fn handle_connection(
 
                                     let processing_done_wall_clock = Local::now();
                                     let send_result =
-                                        send_download_response(&mut stream_handler, &response)
+                                        send_download_response(&mut stream_handler, &response, chunk_data)
                                             .await;
                                     let send_done_time = Instant::now();
 
@@ -450,14 +473,13 @@ pub async fn handle_connection(
                                     let response = DownloadResponse {
                                         status: "ERROR".to_string(),
                                         message: error_message,
-                                        chunk_data_base64: None,
                                     };
                                     log::error!(
                                         "❌ Download verification FAILED: {}",
                                         response.message
                                     );
                                     if let Err(e) =
-                                        send_download_response(&mut stream_handler, &response).await
+                                        send_download_response(&mut stream_handler, &response, None).await
                                     {
                                         log::error!(
                                             "[{}] Error sending error response: {}",
@@ -471,10 +493,9 @@ pub async fn handle_connection(
                                     let response = DownloadResponse {
                                         status: "ERROR".to_string(),
                                         message: format!("Verification error: {}", er),
-                                        chunk_data_base64: None,
                                     };
                                     if let Err(e) =
-                                        send_download_response(&mut stream_handler, &response).await
+                                        send_download_response(&mut stream_handler, &response, None).await
                                     {
                                         log::error!(
                                             "[{}] Error sending error response: {}",
@@ -666,21 +687,10 @@ pub async fn handle_connection(
                                 );
                             }
                         }
-                    }
-                }); // Kết thúc tokio::spawn
-            }
-            Ok(None) => {
-                // Stream đóng trước khi có data
-                log::debug!("[{}] ⚠️ Stream closed prematurely (no data).", peer);
-                continue; // Chờ stream tiếp theo
-            }
-            Err(e) => {
-                // Lỗi đọc trên stream
-                log::error!("[{}] ❌ Error reading from stream: {}", peer, e);
-                continue; // Chờ stream tiếp theo
-            }
-        }
-    } // Kết thúc vòng lặp loop (chờ stream mới)
+                    } // end match command
+                } // end loop
+            }); // end tokio::spawn
+    } // end loop accept stream
 
     Ok(())
 }

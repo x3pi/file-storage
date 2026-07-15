@@ -76,18 +76,12 @@ impl QuicStreamHandler {
             }
         }
     }
-    // Hàm để gửi 1 response VÀ ĐÓNG stream
+    // Hàm để gửi 1 response VÀ GIỮ MỞ stream để tái sử dụng
     pub async fn send(&mut self, data: Bytes) -> TransportResult<()> {
         log::trace!("📤 QuicStreamHandler sending {} bytes", data.len());
         self.framed.send(data).await?;
-        // Đóng luồng gửi (SendStream) một cách tử tế để tránh RESET_STREAM
-        self.framed.close().await?;
-        
-        // Đọc nốt dữ liệu còn sót lại (nếu có) trên RecvStream cho đến EOF 
-        // để tránh lỗi STOP_SENDING gửi về client khi drop stream
-        while let Some(_) = self.framed.next().await {}
-
-        log::trace!("✅ QuicStreamHandler close completed");
+        // Đã xóa self.framed.close().await? để cho phép tái sử dụng stream
+        log::trace!("✅ QuicStreamHandler send completed");
         Ok(())
     }
 }

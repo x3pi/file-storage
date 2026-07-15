@@ -4,7 +4,7 @@ use crate::models::{CHUNK_SIZE, DownloadChunkPayload, DownloadResponse, UploadCh
 use alloy::primitives::{keccak256, Address};
 
 use alloy::signers::Signature;
-use base64::{engine::general_purpose, Engine as _};
+
 use tokio::fs;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -231,25 +231,18 @@ pub async fn verify_download_chunk(
 pub async fn handle_download_request(
     payload: &DownloadChunkPayload,
     app: &Arc<App>,
-) -> DownloadResponse {
+) -> (DownloadResponse, Option<Vec<u8>>) {
     let level1 = &payload.file_key[0..2];
     let level2 = &payload.file_key[2..4];
-    let chunk_path = app
-        .storage_root
-        .join(level1) // Cấp 1
-        .join(level2) // Cấp 2
-        .join(&payload.file_key)
-        .join(payload.chunk_index.to_string());
     // Initialize download session and check permissions (scope limits lock lifetime)
     let has_permission = {
         let session = match app.download_cache.get(&payload.download_key) {
             Some(s) => s,
             None => {
-                return DownloadResponse {
+                return (DownloadResponse {
                     status: "ERROR".to_string(),
                     message: "Download session not found, please verify first.".to_string(),
-                    chunk_data_base64: None,
-                };
+                }, None);
             }
         };
         session.remaining_chunks > 0 || session.retry_remaining > 0
@@ -257,11 +250,10 @@ pub async fn handle_download_request(
 
     // Check permission
     if !has_permission {
-        return DownloadResponse {
+        return (DownloadResponse {
             status: "ERROR".to_string(),
             message: "No remaining downloads for this key".to_string(),
-            chunk_data_base64: None,
-        };
+        }, None);
     }
     // Đường dẫn cho cách cũ (từng chunk riêng lẻ)
     let chunk_path = app
@@ -280,18 +272,46 @@ pub async fn handle_download_request(
         .join(format!("{}.bin", payload.file_key));
 
     let chunk_data_result = if bin_path.exists() {
-        // CÁCH MỚI: Đọc từ file .bin với Seek
         let offset = (payload.chunk_index as u64) * CHUNK_SIZE;
-        async {
-            use tokio::io::{AsyncReadExt, AsyncSeekExt};
-            let mut file = fs::File::open(&bin_path).await?;
-            file.seek(std::io::SeekFrom::Start(offset)).await?;
+        let file_key = payload.file_key.clone();
+        let file_cache = app.file_cache.clone();
+        let bin_path_clone = bin_path.clone();
+
+        let chunk_data_result: Result<Vec<u8>, std::io::Error> = tokio::task::spawn_blocking(move || {
+            use std::fs::OpenOptions;
+            use std::os::unix::fs::FileExt;
+
+            let open_files = if let Some(files) = file_cache.get(&file_key) {
+                files.value().clone()
+            } else {
+                file_cache.entry(file_key.clone()).or_insert_with(|| {
+                    let meta_path = bin_path_clone.with_extension("meta");
+                    let bin_file = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true) // create just in case, though it should exist
+                        .open(&bin_path_clone)
+                        .expect("Failed to open .bin file");
+                    let meta_file = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .open(&meta_path)
+                        .expect("Failed to open .meta file");
+                    crate::models::OpenFiles {
+                        bin_file: Arc::new(bin_file),
+                        meta_file: Arc::new(std::sync::Mutex::new(meta_file)),
+                    }
+                }).value().clone()
+            };
+
             let mut buf = vec![0u8; CHUNK_SIZE as usize];
-            let n = file.read(&mut buf).await?;
+            let n = open_files.bin_file.read_at(&mut buf, offset)?;
             buf.truncate(n);
-            Ok::<Vec<u8>, std::io::Error>(buf)
-        }
-        .await
+            Ok(buf)
+        }).await.unwrap_or_else(|e| Err(std::io::Error::new(std::io::ErrorKind::Other, e)));
+        
+        chunk_data_result
     } else {
         // CÁCH CŨ: Đọc toàn bộ file chunk lẻ
         fs::read(&chunk_path).await
@@ -300,17 +320,15 @@ pub async fn handle_download_request(
     let chunk_data = match chunk_data_result {
         Ok(data) => data,
         Err(_) => {
-            return DownloadResponse {
+            return (DownloadResponse {
                 status: "ERROR".to_string(),
                 message: "Chunk data not found".to_string(),
-                chunk_data_base64: None,
-            };
+            }, None);
         }
     };
 
-    DownloadResponse {
+    (DownloadResponse {
         status: "SUCCESS".to_string(),
-        message: "Chunk retrieved successfully".to_string(),
-        chunk_data_base64: Some(general_purpose::STANDARD.encode(chunk_data)),
-    }
+        message: String::new(),
+    }, Some(chunk_data))
 }

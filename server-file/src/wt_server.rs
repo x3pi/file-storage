@@ -200,21 +200,17 @@ async fn handle_stream(
     }
 
     // --- Lấy chunk data (tái dụng logic hiện có) ---
-    let response = handle_download_request(&dl_payload, &app).await;
+    let (response, chunk_data_opt) = handle_download_request(&dl_payload, &app).await;
     if response.status != "SUCCESS" {
         let _ = send_error_frame(&mut send, &req.id, resp_command, &response.message).await;
         return;
     }
 
-    // Decode base64 → raw bytes (handle_download_request vẫn trả về base64)
-    let chunk_data = match response
-        .chunk_data_base64
-        .as_deref()
-        .map(|b| general_purpose::STANDARD.decode(b))
-    {
-        Some(Ok(data)) => data,
-        _ => {
-            let _ = send_error_frame(&mut send, &req.id, resp_command, "failed to decode chunk data").await;
+    // Lấy raw bytes trực tiếp (không còn base64)
+    let chunk_data = match chunk_data_opt {
+        Some(data) => data,
+        None => {
+            let _ = send_error_frame(&mut send, &req.id, resp_command, "failed to get chunk data").await;
             return;
         }
     };

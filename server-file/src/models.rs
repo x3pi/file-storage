@@ -43,8 +43,8 @@ pub struct GenericResponse {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct DownloadResponse {
     pub status: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub message: String,
-    pub chunk_data_base64: Option<String>,
 }
 
 
@@ -87,7 +87,7 @@ pub type ConfirmationReceiver = mpsc::Receiver<String>;
 
 #[derive(Clone)]
 pub struct OpenFiles {
-    pub bin_file: Arc<std::sync::Mutex<std::fs::File>>,
+    pub bin_file: Arc<std::fs::File>,
     pub meta_file: Arc<std::sync::Mutex<std::fs::File>>,
 }
 pub type FileCache = Arc<DashMap<String, OpenFiles>>;
