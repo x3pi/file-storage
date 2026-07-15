@@ -5,7 +5,7 @@ use crate::download_manager;
 use crate::ethereum::{handle_download_request, verify_download_chunk, verify_upload_chunk};
 use crate::models::{
     Command, DownloadResponse, GenericResponse, ListChunksResponse, LogFileContent,
-    LogsContentResponse, LogsListResponse,
+    LogsContentResponse, LogsListResponse, CHUNK_SIZE,
 };
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Local;
@@ -214,6 +214,7 @@ pub async fn handle_connection(
                             
                             let file_key = payload.file_key.clone();
                             let chunk_index = payload.chunk_index;
+                            let file_cache = app_clone.file_cache.clone();
                             let storage_root = app_clone.storage_root.clone();
                             let store_result: Result<PathBuf, std::io::Error> =
                                 tokio::task::spawn_blocking(move || {
@@ -230,22 +231,29 @@ pub async fn handle_connection(
                                     use std::fs::OpenOptions;
                                     use std::io::{Seek, SeekFrom, Write};
                                     
-                                    let mut file = OpenOptions::new()
-                                        .write(true)
-                                        .create(true)
-                                        .open(&bin_path)?;
+                                    let open_files = file_cache.entry(file_key.clone()).or_insert_with(|| {
+                                        let bin_file = OpenOptions::new()
+                                            .write(true)
+                                            .create(true)
+                                            .open(&bin_path).unwrap();
+                                        let meta_file = OpenOptions::new()
+                                            .append(true)
+                                            .create(true)
+                                            .open(&meta_path).unwrap();
+                                        crate::models::OpenFiles {
+                                            bin_file: std::sync::Arc::new(std::sync::Mutex::new(bin_file)),
+                                            meta_file: std::sync::Arc::new(std::sync::Mutex::new(meta_file)),
+                                        }
+                                    });
                                         
-                                    // Chunk size luôn là 250KB = 256000 bytes
-                                    let offset = (chunk_index as u64) * 256000;
-                                    file.seek(SeekFrom::Start(offset))?;
-                                    file.write_all(&chunk_data)?;
+                                    let offset = (chunk_index as u64) * CHUNK_SIZE;
+                                    let mut bin_file_guard = open_files.bin_file.lock().unwrap();
+                                    bin_file_guard.seek(SeekFrom::Start(offset))?;
+                                    bin_file_guard.write_all(&chunk_data)?;
                                     
                                     // Ghi index vào file meta
-                                    let mut meta_file = OpenOptions::new()
-                                        .append(true)
-                                        .create(true)
-                                        .open(&meta_path)?;
-                                    meta_file.write_all(format!("{}\n", chunk_index).as_bytes())?;
+                                    let mut meta_file_guard = open_files.meta_file.lock().unwrap();
+                                    meta_file_guard.write_all(format!("{}\n", chunk_index).as_bytes())?;
                                     
                                     Ok(bin_path)
                                 })

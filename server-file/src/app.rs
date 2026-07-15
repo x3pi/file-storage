@@ -1,6 +1,7 @@
 use crate::config::AppConfig;
 use crate::models::{
     ConfirmationReceiver, ConfirmationSender, DownloadSessionCache, UploadFileCache,
+    FileCache,
 };
 use anyhow::Result;
 use dashmap::DashMap;
@@ -21,6 +22,7 @@ pub struct App {
     pub config: AppConfig,
     pub download_cache: DownloadSessionCache,
     pub upload_file_cache: UploadFileCache,
+    pub file_cache: FileCache,
     pub confirmation_sender: ConfirmationSender,
     pub confirmation_receiver: Arc<Mutex<ConfirmationReceiver>>,
     pub storage_root: PathBuf,
@@ -37,6 +39,7 @@ impl App {
         let wallet = PrivateKeySigner::from_str(&config.private_key)?;
         let download_cache: DownloadSessionCache = Arc::new(DashMap::new());
         let upload_file_cache: UploadFileCache = Arc::new(DashMap::new());
+        let file_cache: FileCache = Arc::new(DashMap::new());
         let (confirmation_sender, confirmation_receiver) = mpsc::channel(200_000);
         let init_locks = Arc::new(DashMap::new());
         // [FIX] Tối ưu giới hạn semaphore cho máy 6 Core, 16GB RAM.
@@ -48,6 +51,7 @@ impl App {
             download_cache,
             confirmation_sender,
             upload_file_cache,
+            file_cache,
             confirmation_receiver: Arc::new(Mutex::new(confirmation_receiver)),
             storage_root,
             log_dir,

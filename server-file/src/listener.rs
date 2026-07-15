@@ -84,6 +84,9 @@ async fn process_file_activated_event(file_key: B256, app: &Arc<App>) {
             file_key_hex
         );
     }
+    if let Some((_, _)) = app.file_cache.remove(&file_key_hex) {
+        log::info!("✅ Closed and removed file handle from file_cache: {}", file_key_hex);
+    }
 }
 
 async fn process_file_deleted_event(file_key: B256, app: &Arc<App>) {
@@ -133,6 +136,9 @@ async fn process_file_deleted_event(file_key: B256, app: &Arc<App>) {
     // Xóa khỏi cache nếu đang có
     if let Some(_removed) = app.upload_file_cache.remove(&file_key_hex) {
         log::info!("✅ Removed fileKey from upload cache: {}", file_key_hex);
+    }
+    if let Some((_, _)) = app.file_cache.remove(&file_key_hex) {
+        log::info!("✅ Closed and removed file handle from file_cache: {}", file_key_hex);
     }
 }
 

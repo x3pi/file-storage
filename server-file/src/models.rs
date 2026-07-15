@@ -6,6 +6,8 @@ use tokio::sync::mpsc;
 use std::{collections::HashSet, net::IpAddr, sync::Arc, time::Instant};
 
 // --- Structs cho giao tiếp client-server ---
+pub const CHUNK_SIZE: u64 = 1_048_576;
+
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "command")]
 #[serde(rename_all = "PascalCase")]
@@ -82,6 +84,13 @@ pub type UploadFileCache = Arc<DashMap<String, UploadFileInfo>>;
 
 pub type ConfirmationSender = mpsc::Sender<String>;
 pub type ConfirmationReceiver = mpsc::Receiver<String>;
+
+#[derive(Clone)]
+pub struct OpenFiles {
+    pub bin_file: Arc<std::sync::Mutex<std::fs::File>>,
+    pub meta_file: Arc<std::sync::Mutex<std::fs::File>>,
+}
+pub type FileCache = Arc<DashMap<String, OpenFiles>>;
 
 
 

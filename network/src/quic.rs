@@ -294,7 +294,7 @@ fn configure_certificates(
     let mut transport_config = TransportConfig::default();
     transport_config.max_concurrent_uni_streams(VarInt::from_u32(10_000));
     transport_config.max_concurrent_bidi_streams(VarInt::from_u32(10_000));
-    const MAX_STREAM_WINDOW: u32 = 5 * 1024 * 1024;
+    const MAX_STREAM_WINDOW: u32 = 20 * 1024 * 1024;
     const MAX_CONN_WINDOW: u32 = 128 * 1024 * 1024;
     transport_config.stream_receive_window(VarInt::from_u32(MAX_STREAM_WINDOW));
     transport_config.receive_window(VarInt::from_u32(MAX_CONN_WINDOW));

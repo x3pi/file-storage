@@ -1,6 +1,6 @@
 use crate::app::App;
 use crate::download_manager;
-use crate::models::{DownloadChunkPayload, DownloadResponse, UploadChunkPayload, UploadFileInfo};
+use crate::models::{CHUNK_SIZE, DownloadChunkPayload, DownloadResponse, UploadChunkPayload, UploadFileInfo};
 use alloy::primitives::{keccak256, Address};
 
 use alloy::signers::Signature;
@@ -281,12 +281,12 @@ pub async fn handle_download_request(
 
     let chunk_data_result = if bin_path.exists() {
         // CÁCH MỚI: Đọc từ file .bin với Seek
-        let offset = (payload.chunk_index as u64) * 256000;
+        let offset = (payload.chunk_index as u64) * CHUNK_SIZE;
         async {
             use tokio::io::{AsyncReadExt, AsyncSeekExt};
             let mut file = fs::File::open(&bin_path).await?;
             file.seek(std::io::SeekFrom::Start(offset)).await?;
-            let mut buf = vec![0u8; 256000];
+            let mut buf = vec![0u8; CHUNK_SIZE as usize];
             let n = file.read(&mut buf).await?;
             buf.truncate(n);
             Ok::<Vec<u8>, std::io::Error>(buf)
