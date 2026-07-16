@@ -1,7 +1,7 @@
 use crate::config::AppConfig;
 use crate::models::{
     ConfirmationReceiver, ConfirmationSender, DownloadSessionCache, UploadFileCache,
-    FileCache,
+    FileCache, ChunkTracker, UploadBatchSender, UploadBatchReceiver,
 };
 use anyhow::Result;
 use dashmap::DashMap;
@@ -30,6 +30,9 @@ pub struct App {
     pub wallet: PrivateKeySigner,
     pub init_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
     pub task_semaphore: Arc<Semaphore>,
+    pub chunk_tracker: ChunkTracker,
+    pub upload_batch_sender: UploadBatchSender,
+    pub upload_batch_receiver: Arc<Mutex<UploadBatchReceiver>>,
 }
 
 impl App {
@@ -40,7 +43,9 @@ impl App {
         let download_cache: DownloadSessionCache = Arc::new(DashMap::new());
         let upload_file_cache: UploadFileCache = Arc::new(DashMap::new());
         let file_cache: FileCache = Arc::new(DashMap::new());
-        let (confirmation_sender, confirmation_receiver) = mpsc::channel(200_000);
+        let chunk_tracker: ChunkTracker = Arc::new(DashMap::new());
+        let (confirmation_sender, confirmation_receiver) = mpsc::channel(1_000);
+        let (upload_batch_sender, upload_batch_receiver) = mpsc::channel(1_000);
         let init_locks = Arc::new(DashMap::new());
         // [FIX] Tối ưu giới hạn semaphore cho máy 6 Core, 16GB RAM.
         // Cấp 3000 luồng (tốn ~4-6GB RAM buffer), giữ lại ~10GB RAM cho hệ điều hành làm Page Cache đệm ổ cứng.
@@ -58,6 +63,9 @@ impl App {
             wallet,
             init_locks,
             task_semaphore,
+            chunk_tracker,
+            upload_batch_sender,
+            upload_batch_receiver: Arc::new(Mutex::new(upload_batch_receiver)),
         })
     }
 

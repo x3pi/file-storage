@@ -100,7 +100,7 @@ pub async fn handle_connection(
         }
     };
     loop {
-        let mut stream_handler = match quic_conn.accept_stream().await {
+        let stream_handler = match quic_conn.accept_stream().await {
             Ok(handler) => handler,
             Err(e) => {
                 // Kiểm tra xem có phải lỗi đóng kết nối bình thường không
@@ -198,6 +198,25 @@ pub async fn handle_connection(
                                 }
                             };
                             
+                            // ✅ DUPLICATE CHUNK EARLY CHECK
+                            let is_duplicate = {
+                                if let Some(set) = app_clone.chunk_tracker.get(&payload.file_key) {
+                                    set.contains(&payload.chunk_index)
+                                } else {
+                                    false
+                                }
+                            };
+
+                            if is_duplicate {
+                                let response = GenericResponse {
+                                    status: "SUCCESS".to_string(), // Trả SUCCESS để Go Client không hủy toàn bộ tiến trình upload
+                                    message: "Chunk already received".to_string(),
+                                };
+                                let mut response_json = serde_json::to_vec(&response).unwrap_or_default();
+                                response_json.push(b'\n');
+                                let _ = stream_handler.send(Bytes::from(response_json)).await;
+                                return; // Thoát luôn, tiết kiệm CPU và Ổ cứng!
+                            }
                             // ✅ UNIFIED VERIFICATION: Signature + Merkle Proof in one call
                             match verify_upload_chunk(&payload, &chunk_data, &app_clone).await {
                                 Ok(()) => {
@@ -297,21 +316,56 @@ pub async fn handle_connection(
                             let processing_done_wall_clock = Local::now();
                             match store_result {
                                 Ok(_chunk_path) => {
+                                    // TRACK CHUNK: Ghi nhận ngay khi lưu ổ cứng thành công
+                                    let total_chunks = if let Some(info) = app_clone.upload_file_cache.get(&log_file_key) {
+                                        info.total_chunks
+                                    } else {
+                                        0
+                                    };
+                                    
+                                    if total_chunks == 0 {
+                                        let response = GenericResponse {
+                                            status: "ERROR".to_string(),
+                                            message: "File not found in cache or total_chunks is 0".to_string(),
+                                        };
+                                        let mut response_json: Vec<u8> = serde_json::to_vec(&response).unwrap_or_default();
+                                        response_json.push(b'\n');
+                                        let _ = stream_handler.send(Bytes::from(response_json)).await;
+                                        log::error!("[{}] ❌ Error: Missing total_chunks for file {}", peer_clone, log_file_key);
+                                        continue;
+                                    }
+
+                                    // Tính toán nhanh số chunk (Chỉ tốn ~2 nano-giây, cực kỳ nhẹ)
+                                    let expected_chunks = if log_chunk_index % 2 == 0 {
+                                        (total_chunks + 1) / 2
+                                    } else {
+                                        total_chunks / 2
+                                    };
+
+                                    let is_completed = {
+                                        let mut set = app_clone.chunk_tracker
+                                            .entry(log_file_key.clone())
+                                            .or_insert_with(std::collections::HashSet::new);
+                                        set.insert(log_chunk_index);
+                                        set.len() as u64 == expected_chunks
+                                    };
+                                    
+                                    let mut status_str = "SUCCESS";
+                                    if is_completed {
+                                        log::info!("[{}] 🎯 File {} fully received for this node ({} / {} total chunks). Queueing for confirm.", peer_clone, log_file_key, expected_chunks, total_chunks);
+                                        let _ = app_clone.upload_batch_sender.send(log_file_key.clone()).await;
+                                        // Clean up
+                                        app_clone.chunk_tracker.remove(&log_file_key);
+                                        status_str = "COMPLETED";
+                                    }
+
                                     let response = GenericResponse {
-                                        status: "SUCCESS".to_string(),
+                                        status: status_str.to_string(),
                                         message: "Chunk stored successfully".to_string(),
                                     };
                                     let mut response_json: Vec<u8> =
                                         serde_json::to_vec(&response).unwrap_or_default(); // Sửa lỗi unwrap
                                     response_json.push(b'\n');
-
-                                    log::debug!(
-                                        "[{}] 📤 Sending SUCCESS response for chunk {} -k {} ({} bytes)",
-                                        peer_clone,
-                                        log_chunk_index,
-                                        log_file_key,
-                                        response_json.len()
-                                    );
 
                                     // THÊM: Ghi lại thời điểm gửi xong
                                     let send_start_time = Instant::now();

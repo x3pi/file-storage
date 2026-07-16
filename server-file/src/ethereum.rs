@@ -94,6 +94,22 @@ pub async fn verify_upload_chunk(
             );
             return Err("Signer is not the authorized admin uploader".to_string());
         }
+
+        // Fetch total_chunks from SC
+        let contract = app.contract().await.map_err(|e| format!("Contract err: {}", e))?;
+        let decoded = hex::decode(payload.file_key.trim_start_matches("0x"))
+            .map_err(|e| format!("Invalid file_key hex: {}", e))?;
+        let mut key_bytes = [0u8; 32];
+        if decoded.len() == 32 {
+            key_bytes.copy_from_slice(&decoded);
+        } else {
+            return Err("Invalid file_key length".to_string());
+        }
+        
+        let result = contract.getFileInfo(alloy::primitives::B256::from(key_bytes)).call().await
+            .map_err(|e| format!("getFileInfo failed: {}", e))?;
+            
+        let total_chunks = result.totalChunks;
         
         // 3. Cache both address and merkle root
         app.upload_file_cache.insert(
@@ -101,6 +117,7 @@ pub async fn verify_upload_chunk(
             UploadFileInfo {
                 verified_address: recovered_address,
                 merkle_root: payload.merkle_root.clone(),
+                total_chunks,
             },
         );
     }
@@ -255,15 +272,7 @@ pub async fn handle_download_request(
             message: "No remaining downloads for this key".to_string(),
         }, None);
     }
-    // Đường dẫn cho cách cũ (từng chunk riêng lẻ)
-    let chunk_path = app
-        .storage_root
-        .join(level1)
-        .join(level2)
-        .join(&payload.file_key)
-        .join(payload.chunk_index.to_string());
-        
-    // Đường dẫn cho cách mới (.bin)
+    // Đường dẫn file gộp chung (.bin)
     let bin_path = app
         .storage_root
         .join(level1)
@@ -271,51 +280,44 @@ pub async fn handle_download_request(
         .join(&payload.file_key)
         .join(format!("{}.bin", payload.file_key));
 
-    let chunk_data_result = if bin_path.exists() {
-        let offset = (payload.chunk_index as u64) * CHUNK_SIZE;
-        let file_key = payload.file_key.clone();
-        let file_cache = app.file_cache.clone();
-        let bin_path_clone = bin_path.clone();
+    let offset = (payload.chunk_index as u64) * CHUNK_SIZE;
+    let file_key = payload.file_key.clone();
+    let file_cache = app.file_cache.clone();
+    let bin_path_clone = bin_path.clone();
 
-        let chunk_data_result: Result<Vec<u8>, std::io::Error> = tokio::task::spawn_blocking(move || {
-            use std::fs::OpenOptions;
-            use std::os::unix::fs::FileExt;
+    let chunk_data_result: Result<Vec<u8>, std::io::Error> = tokio::task::spawn_blocking(move || {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::FileExt;
 
-            let open_files = if let Some(files) = file_cache.get(&file_key) {
-                files.value().clone()
-            } else {
-                file_cache.entry(file_key.clone()).or_insert_with(|| {
-                    let meta_path = bin_path_clone.with_extension("meta");
-                    let bin_file = OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create(true) // create just in case, though it should exist
-                        .open(&bin_path_clone)
-                        .expect("Failed to open .bin file");
-                    let meta_file = OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create(true)
-                        .open(&meta_path)
-                        .expect("Failed to open .meta file");
-                    crate::models::OpenFiles {
-                        bin_file: Arc::new(bin_file),
-                        meta_file: Arc::new(std::sync::Mutex::new(meta_file)),
-                    }
-                }).value().clone()
-            };
+        let open_files = if let Some(files) = file_cache.get(&file_key) {
+            files.value().clone()
+        } else {
+            file_cache.entry(file_key.clone()).or_insert_with(|| {
+                let meta_path = bin_path_clone.with_extension("meta");
+                let bin_file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true) // create just in case, though it should exist
+                    .open(&bin_path_clone)
+                    .expect("Failed to open .bin file");
+                let meta_file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .open(&meta_path)
+                    .expect("Failed to open .meta file");
+                crate::models::OpenFiles {
+                    bin_file: Arc::new(bin_file),
+                    meta_file: Arc::new(std::sync::Mutex::new(meta_file)),
+                }
+            }).value().clone()
+        };
 
-            let mut buf = vec![0u8; CHUNK_SIZE as usize];
-            let n = open_files.bin_file.read_at(&mut buf, offset)?;
-            buf.truncate(n);
-            Ok(buf)
-        }).await.unwrap_or_else(|e| Err(std::io::Error::new(std::io::ErrorKind::Other, e)));
-        
-        chunk_data_result
-    } else {
-        // CÁCH CŨ: Đọc toàn bộ file chunk lẻ
-        fs::read(&chunk_path).await
-    };
+        let mut buf = vec![0u8; CHUNK_SIZE as usize];
+        let n = open_files.bin_file.read_at(&mut buf, offset)?;
+        buf.truncate(n);
+        Ok(buf)
+    }).await.unwrap_or_else(|e| Err(std::io::Error::new(std::io::ErrorKind::Other, e)));
 
     let chunk_data = match chunk_data_result {
         Ok(data) => data,
@@ -331,4 +333,58 @@ pub async fn handle_download_request(
         status: "SUCCESS".to_string(),
         message: String::new(),
     }, Some(chunk_data))
+}
+
+pub async fn confirm_upload_batch(app: Arc<App>, file_keys: Vec<String>) -> Result<(), String> {
+    if file_keys.is_empty() {
+        return Ok(());
+    }
+
+    let contract = app.contract_with_signer().await.map_err(|e| e.to_string())?;
+
+    let mut keys = Vec::new();
+    for key_hex in file_keys {
+        let decoded = hex::decode(key_hex.trim_start_matches("0x"))
+            .unwrap_or_default();
+        if decoded.len() == 32 {
+            let mut byte_array = [0u8; 32];
+            byte_array.copy_from_slice(&decoded);
+            keys.push(alloy::primitives::B256::from(byte_array));
+        }
+    }
+
+    if keys.is_empty() {
+        return Ok(());
+    }
+
+    let pending_tx = contract.confirmServerUploadBatch(keys).send().await
+        .map_err(|e| format!("Failed to send tx: {}", e))?;
+
+    let receipt = pending_tx.get_receipt().await
+        .map_err(|e| format!("Failed to get receipt: {}", e))?;
+
+    if receipt.status() {
+        log::info!("✅ confirmServerUploadBatch success! TxHash: {}", receipt.transaction_hash);
+    } else {
+        log::error!("❌ confirmServerUploadBatch failed! TxHash: {}", receipt.transaction_hash);
+    }
+
+    Ok(())
+}
+
+pub async fn handle_confirm_download(
+    download_key: String,
+    app: std::sync::Arc<crate::app::App>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let download_key_bytes = hex::decode(&download_key)?;
+    let download_key_b256 = alloy::primitives::B256::from_slice(&download_key_bytes);
+    let contract = app.contract_with_signer().await?;
+    let pending_tx = contract
+        .confirmServerDownload(download_key_b256)
+        .send()
+        .await?;
+
+    // Đợi transaction được mine
+    pending_tx.get_receipt().await?;
+    Ok(())
 }

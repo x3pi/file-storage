@@ -10,8 +10,6 @@ mod models;
 mod server;
 mod sweeper;
 use crate::app::App;
-use crate::models::ConfirmationReceiver;
-use alloy::primitives::B256;
 use flexi_logger::{detailed_format, Cleanup, Criterion, FileSpec, Logger, Naming};
 use network::transport::Transport;
 use rlimit::{getrlimit, Resource};
@@ -19,7 +17,6 @@ use std::env;
 use std::fs;
 use std::sync::Arc;
 use sysinfo::System;
-use tokio::sync::MutexGuard; // Cần thiết để định nghĩa chính xác process_confirmation_queue
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = env::args().collect();
@@ -127,14 +124,7 @@ async fn main() {
         }
     });
 
-    // Spawn confirmation worker
-    let app_clone = app.clone();
-    tokio::spawn(async move {
-        // Lấy lock cho Mutex<Receiver>
-        let mut receiver = app_clone.confirmation_receiver.lock().await;
-        process_confirmation_queue(&mut receiver, app_clone.clone()).await;
-        log::error!("💀💀💀 CRITICAL: Confirmation worker died unexpectedly!");
-    });
+    // (Download confirmation worker has been merged into TX Manager below to prevent nonce collisions)
     let app_clone = app.clone();
     tokio::spawn(async move {
         listener::start_chain_id_monitor(app_clone).await;
@@ -146,6 +136,46 @@ async fn main() {
     tokio::spawn(async move {
         listener::listen_download_confirmed_events(app_clone).await;
         log::error!("💀💀💀 CRITICAL: Event listener died unexpectedly!");
+    });
+
+    // ==========================================
+    // TRANSACTION MANAGER (SINGLE WORKER)
+    // ==========================================
+    // Giải quyết triệt để lỗi Nonce Conflict do dùng chung 1 ví
+    let app_clone = app.clone();
+    tokio::spawn(async move {
+        let mut download_receiver = app_clone.confirmation_receiver.lock().await;
+        let mut upload_receiver = app_clone.upload_batch_receiver.lock().await;
+        
+        loop {
+            tokio::select! {
+                // 1. ƯU TIÊN UPLOAD: Xử lý ngay lập tức và gom tất cả những file đang chờ
+                Some(file_key) = upload_receiver.recv() => {
+                    let mut current_batch = vec![file_key];
+                    
+                    // Vét sạch (drain) tất cả các file upload khác đang nằm trong ống chờ
+                    while let Ok(other_key) = upload_receiver.try_recv() {
+                        if !current_batch.contains(&other_key) {
+                            current_batch.push(other_key);
+                        }
+                        if current_batch.len() >= 50 { break; } // Giới hạn mảng tối đa 50
+                    }
+                    
+                    log::info!("🚀 [TX Manager] Priority Upload Confirm ({} files)", current_batch.len());
+                    if let Err(e) = crate::ethereum::confirm_upload_batch(app_clone.clone(), current_batch).await {
+                        log::error!("❌ [TX Manager] confirm_upload_batch error: {}", e);
+                    }
+                }
+
+                // 2. XỬ LÝ DOWNLOAD
+                Some(download_key) = download_receiver.recv() => {
+                    log::info!("⏳ [TX Manager] Processing Download Confirm: {}", download_key);
+                    if let Err(e) = crate::ethereum::handle_confirm_download(download_key, app_clone.clone()).await {
+                        log::error!("❌ Error processing download confirmation: {:?}", e);
+                    }
+                }
+            }
+        }
     });
 
     // Load certificate và private key từ file trong thư mục hiện tại (cùng cấp với src)
@@ -273,32 +303,4 @@ async fn main() {
             }
         }
     }
-}
-async fn process_confirmation_queue(
-    receiver: &mut MutexGuard<'_, ConfirmationReceiver>,
-    app: Arc<App>,
-) {
-    while let Some(download_key) = receiver.recv().await {
-        let app_clone = app.clone();
-        if let Err(e) = handle_single_confirmation(download_key, app_clone).await {
-            log::error!("❌ Error processing single confirmation: {:?}", e);
-        }
-    }
-}
-
-async fn handle_single_confirmation(
-    download_key: String,
-    app: Arc<App>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let download_key_bytes = hex::decode(&download_key)?;
-    let download_key_b256 = B256::from_slice(&download_key_bytes);
-    let contract = app.contract_with_signer().await?;
-    let pending_tx = contract
-        .confirmServerDownload(download_key_b256)
-        .send()
-        .await?;
-
-    // Đợi transaction được mine
-    pending_tx.get_receipt().await?;
-    Ok(())
 }

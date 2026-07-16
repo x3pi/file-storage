@@ -1,7 +1,7 @@
 use alloy::primitives::Address;
 use tokio::sync::Mutex;
 use serde::{Deserialize, Serialize};
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use tokio::sync::mpsc;
 use std::{collections::HashSet, net::IpAddr, sync::Arc, time::Instant};
 
@@ -78,12 +78,17 @@ pub type VerifiedSignatureCache = Arc<DashMap<String, Address>>;
 pub struct UploadFileInfo {
     pub verified_address: Address,
     pub merkle_root: String,
+    pub total_chunks: u64,
 }
 
 pub type UploadFileCache = Arc<DashMap<String, UploadFileInfo>>;
+pub type ChunkTracker = Arc<DashMap<String, HashSet<u64>>>;
 
 pub type ConfirmationSender = mpsc::Sender<String>;
 pub type ConfirmationReceiver = mpsc::Receiver<String>;
+
+pub type UploadBatchSender = mpsc::Sender<String>;
+pub type UploadBatchReceiver = mpsc::Receiver<String>;
 
 #[derive(Clone)]
 pub struct OpenFiles {

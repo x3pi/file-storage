@@ -20,7 +20,7 @@ use crate::app::App;
 use crate::download_manager;
 use crate::ethereum::{handle_download_request, verify_download_chunk};
 use crate::models::DownloadChunkPayload;
-use base64::{engine::general_purpose, Engine as _};
+
 use serde::{Deserialize, Serialize};
 
 use std::net::{IpAddr, SocketAddr};

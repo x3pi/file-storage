@@ -55,5 +55,8 @@ sol!(
         // Sửa kiểu trả về của hàm này để sử dụng struct `DownloadSession` đã được định nghĩa lại ở trên
         function getDownloadSessionInfo(bytes32 downloadKey) external view returns (DownloadSession memory);
         function getWhitelist(bytes32 fileKey) external view returns (address[] memory);
+        
+        // V2 Functions
+        function confirmServerUploadBatch(bytes32[] calldata fileKeys) external;
     }
 );
