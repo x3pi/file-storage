@@ -1,7 +1,7 @@
 use alloy::primitives::Address;
 use tokio::sync::Mutex;
 use serde::{Deserialize, Serialize};
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use tokio::sync::mpsc;
 use std::{collections::HashSet, net::IpAddr, sync::Arc, time::Instant};
 
@@ -65,6 +65,7 @@ pub struct DownloadSession {
     pub is_public: bool,
     pub whitelist: HashSet<Address>,
     pub created_at: Instant, // Lưu thời gian tạo session để Sweeper quét
+    pub file_handle: Arc<std::fs::File>,
 }
 // DashMap: downloadKey -> DownloadSession
 pub type DownloadSessionCache = Arc<DashMap<String, DownloadSession>>;

@@ -2,10 +2,7 @@ use crate::app::App;
 use crate::download_manager;
 use crate::models::{CHUNK_SIZE, DownloadChunkPayload, DownloadResponse, UploadChunkPayload, UploadFileInfo};
 use alloy::primitives::{keccak256, Address};
-
 use alloy::signers::Signature;
-
-use tokio::fs;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -67,59 +64,78 @@ pub async fn verify_upload_chunk(
     
     // 1. Check cache first
     if let Some(cached_info) = app.upload_file_cache.get(&payload.file_key) {
-        // Verify cached address matches admin
         if cached_info.verified_address != admin_uploader_address {
             return Err("Uploader is not validator".to_string());
         }
-        
-        // Verify merkle root matches cached value
         if cached_info.merkle_root != payload.merkle_root {
             return Err(format!(
                 "Merkle root mismatch: expected {}, got {}",
                 cached_info.merkle_root, payload.merkle_root
             ));
         }
-        
-        // Cache hit - skip signature verification, proceed to merkle proof
     } else {
-        // 2. First chunk for this file - verify signature with fileKey + merkleRoot
-        let message_to_sign = format!("{}{}", payload.file_key, payload.merkle_root);
-        let recovered_address: Address =
-            run_recover_address_blocking(message_to_sign, payload.signature.clone()).await?;
-        
-        if recovered_address != admin_uploader_address {
-            log::error!(
-                "❌ Upload Rejected: Signer is {:?}, expected Admin {:?}",
-                recovered_address, admin_uploader_address
-            );
-            return Err("Signer is not the authorized admin uploader".to_string());
-        }
+        let lock_key = format!("upload_{}", payload.file_key);
+        let lock_arc = {
+            let entry = app
+                .init_locks
+                .entry(lock_key.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
+            Arc::clone(entry.value())
+        };
+        let _lock = lock_arc.lock().await;
 
-        // Fetch total_chunks from SC
-        let contract = app.contract().await.map_err(|e| format!("Contract err: {}", e))?;
-        let decoded = hex::decode(payload.file_key.trim_start_matches("0x"))
-            .map_err(|e| format!("Invalid file_key hex: {}", e))?;
-        let mut key_bytes = [0u8; 32];
-        if decoded.len() == 32 {
-            key_bytes.copy_from_slice(&decoded);
+        // Double check cache
+        if let Some(cached_info) = app.upload_file_cache.get(&payload.file_key) {
+            if cached_info.verified_address != admin_uploader_address {
+                return Err("Uploader is not validator".to_string());
+            }
+            if cached_info.merkle_root != payload.merkle_root {
+                return Err(format!(
+                    "Merkle root mismatch: expected {}, got {}",
+                    cached_info.merkle_root, payload.merkle_root
+                ));
+            }
         } else {
-            return Err("Invalid file_key length".to_string());
-        }
-        
-        let result = contract.getFileInfo(alloy::primitives::B256::from(key_bytes)).call().await
-            .map_err(|e| format!("getFileInfo failed: {}", e))?;
+            // 2. First chunk for this file - verify signature with fileKey + merkleRoot
+            let message_to_sign = format!("{}{}", payload.file_key, payload.merkle_root);
+            let recovered_address: Address =
+                run_recover_address_blocking(message_to_sign, payload.signature.clone()).await?;
             
-        let total_chunks = result.totalChunks;
-        
-        // 3. Cache both address and merkle root
-        app.upload_file_cache.insert(
-            payload.file_key.clone(),
-            UploadFileInfo {
-                verified_address: recovered_address,
-                merkle_root: payload.merkle_root.clone(),
-                total_chunks,
-            },
-        );
+            if recovered_address != admin_uploader_address {
+                log::error!(
+                    "❌ Upload Rejected: Signer is {:?}, expected Admin {:?}",
+                    recovered_address, admin_uploader_address
+                );
+                return Err("Signer is not the authorized admin uploader".to_string());
+            }
+
+            // Fetch total_chunks from SC
+            let contract = app.contract().await.map_err(|e| format!("Contract err: {}", e))?;
+            let decoded = hex::decode(payload.file_key.trim_start_matches("0x"))
+                .map_err(|e| format!("Invalid file_key hex: {}", e))?;
+            let mut key_bytes = [0u8; 32];
+            if decoded.len() == 32 {
+                key_bytes.copy_from_slice(&decoded);
+            } else {
+                return Err("Invalid file_key length".to_string());
+            }
+            
+            let result = contract.getFileInfo(alloy::primitives::B256::from(key_bytes)).call().await
+                .map_err(|e| format!("getFileInfo failed: {}", e))?;
+                
+            let total_chunks = result.totalChunks;
+            
+            // 3. Cache both address and merkle root
+            app.upload_file_cache.insert(
+                payload.file_key.clone(),
+                UploadFileInfo {
+                    verified_address: recovered_address,
+                    merkle_root: payload.merkle_root.clone(),
+                    total_chunks,
+                },
+            );
+        }
+        app.init_locks.remove(&lock_key);
     }
     
     // 4. Verify Merkle Proof (ALWAYS - even for cached files)
@@ -249,10 +265,8 @@ pub async fn handle_download_request(
     payload: &DownloadChunkPayload,
     app: &Arc<App>,
 ) -> (DownloadResponse, Option<Vec<u8>>) {
-    let level1 = &payload.file_key[0..2];
-    let level2 = &payload.file_key[2..4];
     // Initialize download session and check permissions (scope limits lock lifetime)
-    let has_permission = {
+    let (has_permission, file_handle) = {
         let session = match app.download_cache.get(&payload.download_key) {
             Some(s) => s,
             None => {
@@ -262,7 +276,7 @@ pub async fn handle_download_request(
                 }, None);
             }
         };
-        session.remaining_chunks > 0 || session.retry_remaining > 0
+        (session.remaining_chunks > 0 || session.retry_remaining > 0, session.file_handle.clone())
     };
 
     // Check permission
@@ -272,50 +286,16 @@ pub async fn handle_download_request(
             message: "No remaining downloads for this key".to_string(),
         }, None);
     }
-    // Đường dẫn file gộp chung (.bin)
-    let bin_path = app
-        .storage_root
-        .join(level1)
-        .join(level2)
-        .join(&payload.file_key)
-        .join(format!("{}.bin", payload.file_key));
 
     let offset = (payload.chunk_index as u64) * CHUNK_SIZE;
-    let file_key = payload.file_key.clone();
-    let file_cache = app.file_cache.clone();
-    let bin_path_clone = bin_path.clone();
 
     let chunk_data_result: Result<Vec<u8>, std::io::Error> = tokio::task::spawn_blocking(move || {
-        use std::fs::OpenOptions;
         use std::os::unix::fs::FileExt;
 
-        let open_files = if let Some(files) = file_cache.get(&file_key) {
-            files.value().clone()
-        } else {
-            file_cache.entry(file_key.clone()).or_insert_with(|| {
-                let meta_path = bin_path_clone.with_extension("meta");
-                let bin_file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true) // create just in case, though it should exist
-                    .open(&bin_path_clone)
-                    .expect("Failed to open .bin file");
-                let meta_file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .open(&meta_path)
-                    .expect("Failed to open .meta file");
-                crate::models::OpenFiles {
-                    bin_file: Arc::new(bin_file),
-                    meta_file: Arc::new(std::sync::Mutex::new(meta_file)),
-                }
-            }).value().clone()
-        };
-
         let mut buf = vec![0u8; CHUNK_SIZE as usize];
-        let n = open_files.bin_file.read_at(&mut buf, offset)?;
+        let n = file_handle.read_at(&mut buf, offset)?;
         buf.truncate(n);
+        
         Ok(buf)
     }).await.unwrap_or_else(|e| Err(std::io::Error::new(std::io::ErrorKind::Other, e)));
 

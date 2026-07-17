@@ -224,13 +224,13 @@ async fn handle_stream(
     // Cập nhật số chunk còn lại trong session
     let _ = download_manager::descrease_chunk_count(&req.payload.download_key, &app).await;
 
-    log::info!(
-        "[WT][{}] ✅ chunk_index={} size={}B key={}",
-        peer_ip,
-        req.payload.chunk_index,
-        chunk_data.len(),
-        &req.payload.download_key[..8.min(req.payload.download_key.len())]
-    );
+    // log::info!(
+    //     "[WT][{}] ✅ chunk_index={} size={}B key={}",
+    //     peer_ip,
+    //     req.payload.chunk_index,
+    //     chunk_data.len(),
+    //     &req.payload.download_key[..8.min(req.payload.download_key.len())]
+    // );
     // Đóng luồng gửi tử tế (Graceful Shutdown)
     let _ = send.finish().await;
 

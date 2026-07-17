@@ -131,6 +131,11 @@ pub async fn initialize_download_session<'a>(
     // Chuyển đổi Vec<Address> thành HashSet<Address> để tra cứu nhanh
     let whitelist: std::collections::HashSet<_> = whitelist_addresses.into_iter().collect();
 
+    // Mở file .bin MỘT LẦN DUY NHẤT cho toàn bộ Session
+    let bin_path = file_path.join(format!("{}.bin", file_key));
+    let bin_file = std::fs::File::open(&bin_path)
+        .map_err(|e| format!("Failed to open .bin file at {:?}: {}", bin_path, e))?;
+
     let session = DownloadSession {
         download_key: download_key.to_string(),
         file_key: file_key.clone(),
@@ -144,6 +149,7 @@ pub async fn initialize_download_session<'a>(
         is_public,
         whitelist,
         created_at: std::time::Instant::now(), // Ghi nhận thời điểm bắt đầu tải
+        file_handle: Arc::new(bin_file),
     };
     // ✅ Insert vào cache
     app.download_cache.insert(download_key.to_string(), session);

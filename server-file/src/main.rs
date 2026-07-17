@@ -45,7 +45,7 @@ async fn main() {
         }
     }
 
-    let _logger = Logger::try_with_str("info") // Log level debug để xem chi tiết
+    let _logger = Logger::try_with_env_or_str("info, alloy_transport_ws=off, alloy_rpc_client=off") // Ẩn log của alloy để tránh spam khi mất kết nối
         .unwrap()
         .log_to_file(FileSpec::default().directory(&log_dir_path).basename("app"))
         .append() // <--- THÊM DÒNG NÀY
