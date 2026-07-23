@@ -356,7 +356,8 @@ pub async fn handle_confirm_download(
     download_key: String,
     app: std::sync::Arc<crate::app::App>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let download_key_bytes = hex::decode(&download_key)?;
+    let download_key_clean = download_key.trim_start_matches("0x");
+    let download_key_bytes = hex::decode(download_key_clean)?;
     let download_key_b256 = alloy::primitives::B256::from_slice(&download_key_bytes);
     let contract = app.contract_with_signer().await?;
     let pending_tx = contract
