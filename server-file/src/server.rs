@@ -466,13 +466,15 @@ pub async fn handle_connection(
                                         start_time_wall_clock.format("%H:%M:%S.%3f").to_string();
 
                                     let processing_done_wall_clock = Local::now();
+                                    
+                                    // Nhả semaphore permit NGAY SAU KHI đọc disk xong!
+                                    // Tránh việc Client chết đột ngột khiến write_all bị kẹt 90 giây làm cạn kiệt Semaphore.
+                                    drop(_permit);
+
                                     let send_result =
                                         send_download_response(&mut stream_handler, &response, chunk_data)
                                             .await;
                                     let send_done_time = Instant::now();
-
-                                    // Nhả semaphore permit ở đây để không làm nghẽn node nếu confirmation_sender bị chặn
-                                    drop(_permit);
 
                                     if send_result.is_ok() && response.status == "SUCCESS" {
                                         match download_manager::descrease_chunk_count(

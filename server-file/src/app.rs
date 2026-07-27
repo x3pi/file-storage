@@ -47,9 +47,11 @@ impl App {
         let (confirmation_sender, confirmation_receiver) = mpsc::channel(1_000);
         let (upload_batch_sender, upload_batch_receiver) = mpsc::channel(1_000);
         let init_locks = Arc::new(DashMap::new());
-        // [FIX] Tối ưu giới hạn semaphore cho máy 6 Core, 16GB RAM.
-        // Cấp 3000 luồng (tốn ~4-6GB RAM buffer), giữ lại ~10GB RAM cho hệ điều hành làm Page Cache đệm ổ cứng.
-        let semaphore_limit = 3000;
+        // [LOAD TEST] Bỏ giới hạn luồng để kiểm thử tải tối đa.
+        // Dùng Semaphore::MAX_PERMITS để không giới hạn số luồng đồng thời.
+        // ⚠️ WARNING: Nhớ restore về 3000 sau khi test xong để tránh OOM!
+        // let semaphore_limit = tokio::sync::Semaphore::MAX_PERMITS;
+        let semaphore_limit = 200;
         let task_semaphore = Arc::new(Semaphore::new(semaphore_limit));
         Ok(Self {
             config,
