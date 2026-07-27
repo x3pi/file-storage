@@ -432,8 +432,40 @@ pub async fn handle_connection(
                         Command::DownloadChunkRequest { payload } => {
                             let log_file_key = payload.file_key.clone();
                             let log_chunk_index = payload.chunk_index;
+
+                            // 🔍 DEBUG: Log số permit còn trống TRƯỚC KHI chờ
+                            let available_before = semaphore.available_permits();
+                            if available_before == 0 {
+                                log::warn!(
+                                    "[{}] ⏳ [SEMAPHORE] Chunk {} đang CHỜ permit (0 permits còn trống, limit=200)!",
+                                    peer_clone,
+                                    log_chunk_index
+                                );
+                            } else {
+                                log::debug!(
+                                    "[{}] 🎟️ [SEMAPHORE] Chunk {} - còn {} permits trống",
+                                    peer_clone,
+                                    log_chunk_index,
+                                    available_before
+                                );
+                            }
+
+                            let acquire_start = Instant::now();
                             let _permit = match semaphore.acquire().await {
-                                Ok(permit) => permit,
+                                Ok(permit) => {
+                                    let wait_ms = acquire_start.elapsed().as_millis();
+                                    if wait_ms > 100 {
+                                        // Chỉ log khi chờ > 100ms (có dấu hiệu nghẽn)
+                                        log::warn!(
+                                            "[{}] ⚠️ [SEMAPHORE] Chunk {} chờ permit MẤT {}ms (nghẽn!). Còn {} permits sau khi lấy.",
+                                            peer_clone,
+                                            log_chunk_index,
+                                            wait_ms,
+                                            semaphore.available_permits()
+                                        );
+                                    }
+                                    permit
+                                }
                                 Err(e) => {
                                     log::error!(
                                         "[{}] Semaphore closed, cannot process download: {}",

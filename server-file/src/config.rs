@@ -3,7 +3,8 @@ use alloy::{
     primitives::Address,
 };
 pub struct AppConfig {
-    pub rpc_url: String,
+    pub rpc_url: String, // Dùng cho HTTP (eth_call)
+    pub rpc_url_ws: String, // Dùng cho WebSockets (subscribe)
     pub contract_address: Address,
     pub private_key: String,
     pub storage_root: String,
@@ -22,6 +23,7 @@ impl AppConfig {
         }
         Ok(Self {
             rpc_url: std::env::var("RPC_URL")?,
+            rpc_url_ws: std::env::var("RPC_URL_WS").unwrap_or_else(|_| std::env::var("RPC_URL").unwrap()),
             contract_address: std::env::var("CONTRACT_ADDRESS")?.parse()?,
             private_key: std::env::var("PRIVATE_KEY")?,
             storage_root: std::env::var("STORAGE_ROOT").unwrap_or_else(|_| "./storage".to_string()),

@@ -33,6 +33,7 @@ pub struct App {
     pub chunk_tracker: ChunkTracker,
     pub upload_batch_sender: UploadBatchSender,
     pub upload_batch_receiver: Arc<Mutex<UploadBatchReceiver>>,
+    pub http_client: alloy::transports::http::Client,
 }
 
 impl App {
@@ -49,10 +50,16 @@ impl App {
         let init_locks = Arc::new(DashMap::new());
         // [LOAD TEST] Bỏ giới hạn luồng để kiểm thử tải tối đa.
         // Dùng Semaphore::MAX_PERMITS để không giới hạn số luồng đồng thời.
-        // ⚠️ WARNING: Nhớ restore về 3000 sau khi test xong để tránh OOM!
         // let semaphore_limit = tokio::sync::Semaphore::MAX_PERMITS;
-        let semaphore_limit = 200;
+        let semaphore_limit = 3000;
         let task_semaphore = Arc::new(Semaphore::new(semaphore_limit));
+        
+        // Khởi tạo HTTP Client 1 lần duy nhất để dùng chung Connection Pool (tránh lỗi TCP Handshake 700ms)
+        let http_client = alloy::transports::http::Client::builder()
+            .pool_idle_timeout(std::time::Duration::from_secs(60))
+            .pool_max_idle_per_host(1000)
+            .build()?;
+
         Ok(Self {
             config,
             download_cache,
@@ -68,13 +75,22 @@ impl App {
             chunk_tracker,
             upload_batch_sender,
             upload_batch_receiver: Arc::new(Mutex::new(upload_batch_receiver)),
+            http_client,
         })
     }
 
     /// Tạo contract instance cho READ operations (view functions)
     pub async fn contract(&self) -> Result<FilesInstance<impl alloy::providers::Provider + Clone>> {
-        let provider = ProviderBuilder::new().connect(&self.config.rpc_url).await?;
-        // Truy cập contract_address qua config
+        use alloy::providers::RootProvider;
+        use alloy::transports::http::Http;
+        use alloy::rpc::client::RpcClient;
+        use url::Url;
+
+        let url = Url::parse(&self.config.rpc_url)?;
+        let http_transport = Http::with_client(self.http_client.clone(), url);
+        let rpc_client = RpcClient::new(http_transport, true);
+        let provider = RootProvider::new(rpc_client);
+
         Ok(FilesInstance::new(self.config.contract_address, provider))
     }
 

@@ -25,7 +25,7 @@ pub async fn listen_download_confirmed_events(app: Arc<App>) {
 
 async fn listen_download_confirmed_internal(app: Arc<App>) -> Result<(), String> {
     // Kết nối WebSocket
-    let ws = WsConnect::new(&app.config.rpc_url);
+    let ws = WsConnect::new(&app.config.rpc_url_ws);
     let provider = ProviderBuilder::new()
         .connect_ws(ws)
         .await
@@ -145,7 +145,7 @@ async fn process_file_deleted_event(file_key: B256, app: &Arc<App>) {
 pub async fn start_chain_id_monitor(app: Arc<App>) {
     log::info!("📡 Starting Chain ID monitor (using WebSocket)...");
     // Lấy URL từ config
-    let rpc_url = app.config.rpc_url.clone();
+    let rpc_url = app.config.rpc_url_ws.clone();
     // để tái sử dụng kết nối WebSocket
     let mut provider_option = None;
     loop {

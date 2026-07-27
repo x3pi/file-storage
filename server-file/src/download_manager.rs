@@ -66,6 +66,10 @@ pub async fn initialize_download_session<'a>(
     }
 
     let download_key_b256 = B256::from_slice(&download_key_bytes);
+    
+    // 🔍 DEBUG RPC TIMING
+    let rpc_start = std::time::Instant::now();
+    
     // Gọi contract để lấy thông tin (RPC CALL - LÀM CHẬM)
     let contract = app
         .contract()
@@ -77,6 +81,9 @@ pub async fn initialize_download_session<'a>(
         .call()
         .await
         .map_err(|e| format!("Failed to get download session info: {}", e))?;
+        
+    let rpc_mid = rpc_start.elapsed().as_millis();
+
     if session_info.fileKey == B256::ZERO {
         return Err(format!(
             "Download key '{}' not found on-chain",
@@ -91,6 +98,13 @@ pub async fn initialize_download_session<'a>(
         .call()
         .await
         .map_err(|e| format!("Failed to fetch file info: {}", e))?;
+        
+    let rpc_total = rpc_start.elapsed().as_millis();
+    if rpc_total > 500 {
+        log::warn!("⚠️ [RPC_SLOW] getDownloadSessionInfo mất {}ms, getFileInfo mất thêm {}ms. (Total: {}ms) - download_key: {}", 
+            rpc_mid, rpc_total - rpc_mid, rpc_total, download_key);
+    }
+
     let current_time_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| format!("System time error: {}", e))?
