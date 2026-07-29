@@ -312,6 +312,11 @@ pub async fn handle_connection(
                                     )
                                 })
                                 .and_then(|inner_result| inner_result);
+
+                            // Nhả semaphore permit NGAY SAU KHI ghi disk xong
+                            // Tránh việc Client mạng chậm hoặc chết đột ngột làm cạn kiệt Semaphore.
+                            drop(_permit);
+
                             let processing_done_time = Instant::now();
                             let processing_done_wall_clock = Local::now();
                             match store_result {

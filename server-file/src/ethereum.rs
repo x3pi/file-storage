@@ -139,53 +139,65 @@ pub async fn verify_upload_chunk(
     }
     
     // 4. Verify Merkle Proof (ALWAYS - even for cached files)
-    // Compute leaf hash from chunk data
-    let leaf_hash = keccak256(chunk_data);
-    let mut computed_hash = leaf_hash.to_vec();
+    let chunk_data_owned = chunk_data.to_vec();
+    let merkle_proof_hashes = payload.merkle_proof_hashes.clone();
+    let chunk_index = payload.chunk_index;
+    let merkle_root_expected = payload.merkle_root.clone();
+    let file_key = payload.file_key.clone();
 
-    // Iterate through proof levels
-    for (level, sibling_hex) in payload.merkle_proof_hashes.iter().enumerate() {
-        // Decode sibling hash from hex
-        let sibling_hash = hex::decode(sibling_hex.trim_start_matches("0x"))
-            .map_err(|e| format!("Invalid sibling hash at level {}: {}", level, e))?;
+    tokio::task::spawn_blocking(move || {
+        // Compute leaf hash from chunk data
+        let leaf_hash = keccak256(&chunk_data_owned);
+        let mut computed_hash = leaf_hash.to_vec();
 
-        if sibling_hash.len() != 32 {
-            return Err(format!(
-                "Invalid sibling hash length at level {}: expected 32, got {}",
-                level,
-                sibling_hash.len()
-            ));
+        // Iterate through proof levels
+        for (level, sibling_hex) in merkle_proof_hashes.iter().enumerate() {
+            // Decode sibling hash from hex
+            let sibling_hash = hex::decode(sibling_hex.trim_start_matches("0x"))
+                .map_err(|e| format!("Invalid sibling hash at level {}: {}", level, e))?;
+
+            if sibling_hash.len() != 32 {
+                return Err(format!(
+                    "Invalid sibling hash length at level {}: expected 32, got {}",
+                    level,
+                    sibling_hash.len()
+                ));
+            }
+
+            // Determine position in tree
+            let level_index = chunk_index >> level;
+            let combined = if level_index % 2 == 0 {
+                // Current hash is on the left
+                [computed_hash.as_slice(), sibling_hash.as_slice()].concat()
+            } else {
+                // Current hash is on the right
+                [sibling_hash.as_slice(), computed_hash.as_slice()].concat()
+            };
+
+            // Hash the combined value
+            computed_hash = keccak256(&combined).to_vec();
         }
 
-        // Determine position in tree
-        let level_index = payload.chunk_index >> level;
-        let combined = if level_index % 2 == 0 {
-            // Current hash is on the left
-            [computed_hash.as_slice(), sibling_hash.as_slice()].concat()
-        } else {
-            // Current hash is on the right
-            [sibling_hash.as_slice(), computed_hash.as_slice()].concat()
-        };
+        // Compare with expected merkle root
+        let expected_root = hex::decode(merkle_root_expected.trim_start_matches("0x"))
+            .map_err(|e| format!("Invalid merkle root: {}", e))?;
 
-        // Hash the combined value
-        computed_hash = keccak256(&combined).to_vec();
-    }
+        if computed_hash != expected_root {
+            log::error!(
+                "❌ INVALID Merkle Proof for chunk {} -k {}. Computed: {}, Expected: {}",
+                chunk_index,
+                file_key,
+                hex::encode(&computed_hash),
+                merkle_root_expected
+            );
+            return Err("Merkle proof verification failed".to_string());
+        }
+        
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))??;
 
-    // Compare with expected merkle root
-    let expected_root = hex::decode(payload.merkle_root.trim_start_matches("0x"))
-        .map_err(|e| format!("Invalid merkle root: {}", e))?;
-
-    if computed_hash != expected_root {
-        log::error!(
-            "❌ INVALID Merkle Proof for chunk {} -k {}. Computed: {}, Expected: {}",
-            payload.chunk_index,
-            payload.file_key,
-            hex::encode(&computed_hash),
-            payload.merkle_root
-        );
-        return Err("Merkle proof verification failed".to_string());
-    }
-    
     Ok(())
 }
 
