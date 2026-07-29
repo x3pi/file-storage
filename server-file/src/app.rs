@@ -109,4 +109,56 @@ impl App {
         // Truy cập contract_address qua config
         Ok(FilesInstance::new(self.config.contract_address, provider))
     }
+
+    pub async fn write_chunk(&self, file_key: &str, chunk_index: u64, chunk_data: &[u8]) -> Result<(), std::io::Error> {
+        let file_key_owned = file_key.to_string();
+        let chunk_data_owned = chunk_data.to_vec();
+        let file_cache = self.file_cache.clone();
+        let storage_root = self.storage_root.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let level1 = &file_key_owned[0..2];
+            let level2 = &file_key_owned[2..4];
+            let file_dir: PathBuf = storage_root.join(level1).join(level2).join(&file_key_owned);
+            std::fs::create_dir_all(&file_dir)?;
+
+            let bin_path = file_dir.join(format!("{}.bin", file_key_owned));
+            let meta_path = file_dir.join(format!("{}.meta", file_key_owned));
+
+            use std::fs::OpenOptions;
+            use std::io::Write;
+            use std::os::unix::fs::FileExt;
+
+            let open_files = if let Some(files) = file_cache.get(&file_key_owned) {
+                files.value().clone()
+            } else {
+                file_cache.entry(file_key_owned.clone()).or_insert_with(|| {
+                    let bin_file = OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .open(&bin_path).unwrap();
+                    let meta_file = OpenOptions::new()
+                        .append(true)
+                        .create(true)
+                        .open(&meta_path).unwrap();
+                    crate::models::OpenFiles {
+                        bin_file: std::sync::Arc::new(bin_file),
+                        meta_file: std::sync::Arc::new(std::sync::Mutex::new(meta_file)),
+                    }
+                }).value().clone()
+            };
+
+            let chunk_size = 1024 * 1024; // 1MB
+            let offset = chunk_index * chunk_size;
+            open_files.bin_file.write_all_at(&chunk_data_owned, offset)?;
+
+            let mut meta_file_guard = open_files.meta_file.lock().unwrap();
+            meta_file_guard.write_all(format!("{}\n", chunk_index).as_bytes())?;
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Task join error: {}", e)))
+        .and_then(|inner_result| inner_result)
+    }
 }

@@ -4,7 +4,7 @@ use crate::models::{CHUNK_SIZE, DownloadChunkPayload, DownloadResponse, UploadCh
 use alloy::primitives::{keccak256, Address};
 use alloy::signers::Signature;
 use std::net::IpAddr;
-use std::str::FromStr;
+
 use std::sync::Arc;
 
 // 🔥 FIX: Wrapper task bất đồng bộ cho tác vụ nặng CPU
@@ -59,13 +59,10 @@ pub async fn verify_upload_chunk(
     chunk_data: &[u8],
     app: &Arc<App>,
 ) -> Result<(), String> {
-    let admin_uploader_address = Address::from_str(app.config.address_sign_admin.as_str())
-        .map_err(|_| "Invalid Admin Uploader Address".to_string())?;
-    
     // 1. Check cache first
     if let Some(cached_info) = app.upload_file_cache.get(&payload.file_key) {
-        if cached_info.verified_address != admin_uploader_address {
-            return Err("Uploader is not validator".to_string());
+        if cached_info.signature != payload.signature {
+            return Err("Signature mismatch with cached signature".to_string());
         }
         if cached_info.merkle_root != payload.merkle_root {
             return Err(format!(
@@ -86,8 +83,8 @@ pub async fn verify_upload_chunk(
 
         // Double check cache
         if let Some(cached_info) = app.upload_file_cache.get(&payload.file_key) {
-            if cached_info.verified_address != admin_uploader_address {
-                return Err("Uploader is not validator".to_string());
+            if cached_info.signature != payload.signature {
+                return Err("Signature mismatch with cached signature".to_string());
             }
             if cached_info.merkle_root != payload.merkle_root {
                 return Err(format!(
@@ -96,20 +93,7 @@ pub async fn verify_upload_chunk(
                 ));
             }
         } else {
-            // 2. First chunk for this file - verify signature with fileKey + merkleRoot
-            let message_to_sign = format!("{}{}", payload.file_key, payload.merkle_root);
-            let recovered_address: Address =
-                run_recover_address_blocking(message_to_sign, payload.signature.clone()).await?;
-            
-            if recovered_address != admin_uploader_address {
-                log::error!(
-                    "❌ Upload Rejected: Signer is {:?}, expected Admin {:?}",
-                    recovered_address, admin_uploader_address
-                );
-                return Err("Signer is not the authorized admin uploader".to_string());
-            }
-
-            // Fetch total_chunks from SC
+            // Fetch file owner from SC
             let contract = app.contract().await.map_err(|e| format!("Contract err: {}", e))?;
             let decoded = hex::decode(payload.file_key.trim_start_matches("0x"))
                 .map_err(|e| format!("Invalid file_key hex: {}", e))?;
@@ -123,13 +107,28 @@ pub async fn verify_upload_chunk(
             let result = contract.getFileInfo(alloy::primitives::B256::from(key_bytes)).call().await
                 .map_err(|e| format!("getFileInfo failed: {}", e))?;
                 
+            let file_owner = result.owner;
             let total_chunks = result.totalChunks;
+
+            // 2. First chunk for this file - verify signature with fileKey + merkleRoot
+            let message_to_sign = format!("{}{}", payload.file_key, payload.merkle_root);
+            let recovered_address: Address =
+                run_recover_address_blocking(message_to_sign, payload.signature.clone()).await?;
             
-            // 3. Cache both address and merkle root
+            if recovered_address != file_owner {
+                log::error!(
+                    "❌ Upload Rejected: Signer is {:?}, expected File Owner {:?}",
+                    recovered_address, file_owner
+                );
+                return Err("Signer is not the file owner".to_string());
+            }
+
+            // 3. Cache both address, signature and merkle root
             app.upload_file_cache.insert(
                 payload.file_key.clone(),
                 UploadFileInfo {
                     verified_address: recovered_address,
+                    signature: payload.signature.clone(),
                     merkle_root: payload.merkle_root.clone(),
                     total_chunks,
                 },

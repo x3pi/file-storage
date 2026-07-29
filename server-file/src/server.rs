@@ -158,7 +158,8 @@ pub async fn handle_connection(
                 let start_time_wall_clock = Local::now();
                 
                 match command {
-                    Command::UploadChunk { payload } => {
+                    Command::UploadChunk { mut payload } => {
+                            payload.file_key = payload.file_key.trim_start_matches("0x").to_string();
                             let log_file_key = payload.file_key.clone();
                             let log_chunk_index = payload.chunk_index;
                             let _permit = match semaphore.acquire().await {

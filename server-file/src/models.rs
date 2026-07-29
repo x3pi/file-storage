@@ -78,6 +78,7 @@ pub type VerifiedSignatureCache = Arc<DashMap<String, Address>>;
 #[derive(Debug, Clone)]
 pub struct UploadFileInfo {
     pub verified_address: Address,
+    pub signature: String,
     pub merkle_root: String,
     pub total_chunks: u64,
 }
