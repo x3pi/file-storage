@@ -84,6 +84,7 @@ pub struct UploadFileInfo {
     pub merkle_root: String,
     pub total_chunks: u64,
     pub contract_address: Address,
+    pub created_at: std::time::Instant,
 }
 
 pub type UploadFileCache = Arc<DashMap<String, UploadFileInfo>>;

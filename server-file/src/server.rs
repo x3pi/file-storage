@@ -144,13 +144,18 @@ pub async fn handle_connection(
                     Ok(cmd) => cmd,
                     Err(e) => {
                         log::error!("[{}] ❌ Failed to parse command: {}", peer_clone, e);
-                        log::error!("[{}] Raw data: {}", peer_clone, line);
+                        let log_line = if line.len() > 200 {
+                            format!("{}... (truncated, {} bytes)", &line[..200], line.len())
+                        } else {
+                            line.clone()
+                        };
+                        log::error!("[{}] Raw data: {}", peer_clone, log_line);
                         if let Err(e) =
                             send_error_response(&mut stream_handler, "Invalid command format").await
                         {
                             log::error!("[{}] Error sending error response: {}", peer_clone, e);
                         }
-                        continue; // Chờ lệnh tiếp theo
+                        break; // Dừng stream này luôn, không đọc tiếp dữ liệu rác
                     }
                 };
                 
@@ -158,8 +163,11 @@ pub async fn handle_connection(
                 let start_time_wall_clock = Local::now();
                 
                 match command {
-                    Command::UploadChunk { mut payload } => {
-                            payload.file_key = payload.file_key.trim_start_matches("0x").to_string();
+                        Command::UploadChunk { payload } => {
+                            if payload.file_key.starts_with("0x") {
+                                let _ = send_error_response(&mut stream_handler, "Invalid format: file_key must not start with '0x'").await;
+                                break;
+                            }
                             let log_file_key = payload.file_key.clone();
                             let log_chunk_index = payload.chunk_index;
                             let _permit = match semaphore.acquire().await {
@@ -451,6 +459,10 @@ pub async fn handle_connection(
                             }
                         }
                         Command::DownloadChunkRequest { payload } => {
+                            if payload.file_key.starts_with("0x") || payload.download_key.starts_with("0x") {
+                                let _ = send_error_response(&mut stream_handler, "Invalid format: keys must not start with '0x'").await;
+                                break;
+                            }
                             let log_file_key = payload.file_key.clone();
                             let log_chunk_index = payload.chunk_index;
 
@@ -798,6 +810,9 @@ pub async fn handle_connection(
                         }
                     } // end match command
                 } // end loop
+                let _ = stream_handler.close().await;
+                // Đọc cạn luồng nhận để không quăng lỗi STOP_SENDING về client (tránh client bị 'canceled by remote')
+                while let Ok(Some(_)) = stream_handler.recv().await {}
             }); // end tokio::spawn
     } // end loop accept stream
 

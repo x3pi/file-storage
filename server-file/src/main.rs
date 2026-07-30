@@ -126,10 +126,10 @@ async fn main() {
 
     // (Download confirmation worker has been merged into TX Manager below to prevent nonce collisions)
     let app_clone = app.clone();
-    tokio::spawn(async move {
-        listener::start_chain_id_monitor(app_clone).await;
-        log::error!("💀💀💀 CRITICAL: Chain ID monitor died unexpectedly!");
-    });
+    // tokio::spawn(async move {
+    //     listener::start_chain_id_monitor(app_clone).await;
+    //     log::error!("💀💀💀 CRITICAL: Chain ID monitor died unexpectedly!");
+    // });
 
     // Spawn event listener (WebSocket)
     let app_clone = app.clone();

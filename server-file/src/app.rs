@@ -4,7 +4,6 @@ use crate::models::{
     FileCache, ChunkTracker, UploadBatchSender, UploadBatchReceiver,
 };
 use alloy::primitives::Address;
-use std::time::Instant;
 use anyhow::Result;
 use dashmap::DashMap;
 use std::path::PathBuf;

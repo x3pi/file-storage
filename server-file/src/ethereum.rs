@@ -135,6 +135,7 @@ pub async fn verify_upload_chunk(
                     signature: payload.signature.clone(),
                     merkle_root: payload.merkle_root.clone(),
                     total_chunks,
+                    created_at: std::time::Instant::now(),
                 },
             );
         }

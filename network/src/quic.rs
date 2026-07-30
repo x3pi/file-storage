@@ -84,6 +84,11 @@ impl QuicStreamHandler {
         log::trace!("✅ QuicStreamHandler send completed");
         Ok(())
     }
+
+    pub async fn close(&mut self) -> TransportResult<()> {
+        self.framed.close().await?;
+        Ok(())
+    }
 }
 
 // 🔥 THAY ĐỔI: Struct này đại diện cho KẾT NỐI (Connection)

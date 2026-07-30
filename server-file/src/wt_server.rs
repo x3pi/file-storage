@@ -182,6 +182,10 @@ async fn handle_download_chunk(
             return;
         }
     };
+    if payload.download_key.starts_with("0x") {
+        let _ = send_error_frame(&mut send, &req.id, resp_command, "Invalid format: download_key must not start with '0x'").await;
+        return;
+    }
 
     // --- Xây dựng payload để tái dụng business logic hiện có ---
     let mut dl_payload = DownloadChunkPayload {
@@ -261,7 +265,7 @@ async fn handle_upload_chunk(
     chunk_data_in: Vec<u8>,
 ) {
     let resp_command = "chunk_response";
-    let mut payload: crate::models::UploadChunkPayload = match serde_json::from_value(req.payload.clone()) {
+    let payload: crate::models::UploadChunkPayload = match serde_json::from_value(req.payload.clone()) {
         Ok(p) => p,
         Err(e) => {
             let _ = send_error_frame(&mut send, &req.id, resp_command, &format!("invalid payload: {}", e)).await;
@@ -270,7 +274,10 @@ async fn handle_upload_chunk(
     };
     
     // Đảm bảo file_key thống nhất không có '0x' ở đầu
-    payload.file_key = payload.file_key.trim_start_matches("0x").to_string();
+    if payload.file_key.starts_with("0x") {
+        let _ = send_error_frame(&mut send, &req.id, resp_command, "Invalid format: file_key must not start with '0x'").await;
+        return;
+    }
 
     if chunk_data_in.is_empty() {
         let _ = send_error_frame(&mut send, &req.id, resp_command, "chunk data is empty").await;

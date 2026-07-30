@@ -6,25 +6,48 @@ use std::sync::Arc;
 pub fn spawn_background_sweeper(app: Arc<App>) {
     tokio::spawn(async move {
         loop {
-            // Ngủ 10 giờ (36000 giây)
-            tokio::time::sleep(tokio::time::Duration::from_secs(36000)).await;
+            // Ngủ 1 giờ (3600 giây)
+            tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
             
             let now = std::time::Instant::now();
-            let mut expired_keys = Vec::new();
-
-            // Quét các session đã nằm trong RAM quá 24h (86400 giây)
+            
+            // 1. Dọn dẹp Download Session
+            let mut expired_download_keys = Vec::new();
+            // Quét các session đã nằm trong RAM quá 4h (14400 giây)
             for entry in app.download_cache.iter() {
-                if now.duration_since(entry.created_at).as_secs() > 86400 {
-                    expired_keys.push(entry.key().clone());
+                if now.duration_since(entry.created_at).as_secs() > 14400 {
+                    expired_download_keys.push(entry.key().clone());
                 }
             }
-
-            // Tiến hành dọn dẹp
-            if !expired_keys.is_empty() {
-                for key in &expired_keys {
+            if !expired_download_keys.is_empty() {
+                for key in &expired_download_keys {
                     app.download_cache.remove(key);
                 }
-                log::info!("🧹 Đã dọn dẹp xong {} session bỏ hoang quá 1 ngày khỏi RAM.", expired_keys.len());
+                log::info!("🧹 Đã dọn dẹp xong {} download session bỏ hoang quá 4 giờ khỏi RAM.", expired_download_keys.len());
+            }
+
+            // 2. Dọn dẹp Upload Session
+            let mut expired_upload_keys = Vec::new();
+            for entry in app.upload_file_cache.iter() {
+                if now.duration_since(entry.created_at).as_secs() > 14400 {
+                    expired_upload_keys.push(entry.key().clone());
+                }
+            }
+            if !expired_upload_keys.is_empty() {
+                for file_key in &expired_upload_keys {
+                    app.upload_file_cache.remove(file_key);
+                    app.chunk_tracker.remove(file_key);
+                    app.file_cache.remove(file_key);
+                    
+                    // Thử xóa các file tạm trên ổ cứng (bỏ qua lỗi nếu file không tồn tại)
+                    let file_dir = app.storage_root.join(file_key);
+                    if file_dir.exists() {
+                        if let Err(e) = std::fs::remove_dir_all(&file_dir) {
+                            log::warn!("⚠️ Lỗi khi xóa thư mục rác của upload session {}: {}", file_key, e);
+                        }
+                    }
+                }
+                log::info!("🧹 Đã dọn dẹp xong {} upload session bỏ hoang quá 4 giờ khỏi RAM và ổ cứng.", expired_upload_keys.len());
             }
         }
     });
