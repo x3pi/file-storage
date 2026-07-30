@@ -53,13 +53,17 @@ pub fn spawn_confirmation_retry_worker(app: Arc<App>) {
                 Ok(content) => {
                     let mut count = 0;
                     for line in content.lines() {
-                        let key = line.trim();
-                        if !key.is_empty() {
-                            // Dùng send().await để hút từ từ vào queue, nếu queue đang đầy thì worker sẽ chờ ở đây, điều tiết lưu lượng
-                            if let Err(e) = app.confirmation_sender.send(key.to_string()).await {
-                                log::error!("❌ Worker failed to send to confirmation queue: {:?}", e);
-                            } else {
-                                count += 1;
+                        let parts: Vec<&str> = line.trim().split(',').collect();
+                        if parts.len() == 2 {
+                            let key = parts[0].trim().to_string();
+                            let addr = parts[1].trim().to_string();
+                            if !key.is_empty() && !addr.is_empty() {
+                                // Dùng send().await để hút từ từ vào queue, nếu queue đang đầy thì worker sẽ chờ ở đây, điều tiết lưu lượng
+                                if let Err(e) = app.confirmation_sender.send((key, addr)).await {
+                                    log::error!("❌ Worker failed to send to confirmation queue: {:?}", e);
+                                } else {
+                                    count += 1;
+                                }
                             }
                         }
                     }

@@ -1,5 +1,5 @@
 use crate::app::App;
-use crate::file_contract::Files::FileStatus;
+use crate::contracts::file_contract::Files::FileStatus;
 use crate::models::DownloadSession; // 🔥 FIX: Loại bỏ DownloadSessionCache
 use alloy::primitives::B256;
 use dashmap::mapref::one::Ref;
@@ -12,6 +12,7 @@ use tokio::fs;
 
 pub async fn initialize_download_session<'a>(
     download_key: &str,
+    contract_address: alloy::primitives::Address,
     app: &'a Arc<App>,
     request_ip: IpAddr,
 ) -> Result<Ref<'a, String, DownloadSession>, String> {
@@ -72,7 +73,7 @@ pub async fn initialize_download_session<'a>(
     
     // Gọi contract để lấy thông tin (RPC CALL - LÀM CHẬM)
     let contract = app
-        .contract()
+        .contract(contract_address)
         .await
         .map_err(|e| format!("Failed to create contract instance: {}", e))?;
 
@@ -93,15 +94,26 @@ pub async fn initialize_download_session<'a>(
         return Err(format!("Download key '{}' has expired", download_key));
     }
 
-    let file_info_onchain = contract
-        .getFileInfo(session_info.fileKey)
-        .call()
-        .await
-        .map_err(|e| format!("Failed to fetch file info: {}", e))?;
+    // 4. Gọi các hàm liên quan đến file concurrently (tiết kiệm thời gian RTT)
+    let contract = app.contract(contract_address).await.map_err(|e| e.to_string())?;
+    
+    let file_info_call = contract.getFileInfo(session_info.fileKey);
+    let is_public_call = contract.isPublicFile(session_info.fileKey);
+    let whitelist_call = contract.getWhitelist(session_info.fileKey);
+
+    let (file_info_res, is_public_res, whitelist_res) = tokio::join!(
+        file_info_call.call(),
+        is_public_call.call(),
+        whitelist_call.call()
+    );
+
+    let file_info_onchain = file_info_res.map_err(|e| format!("Failed to fetch file info: {}", e))?;
+    let is_public = is_public_res.map_err(|e| format!("Failed to check if file is public: {}", e))?;
+    let whitelist_addresses = whitelist_res.map_err(|e| format!("Failed to get whitelist: {}", e))?;
         
     let rpc_total = rpc_start.elapsed().as_millis();
     if rpc_total > 500 {
-        log::warn!("⚠️ [RPC_SLOW] getDownloadSessionInfo mất {}ms, getFileInfo mất thêm {}ms. (Total: {}ms) - download_key: {}", 
+        log::warn!("⚠️ [RPC_SLOW] getDownloadSessionInfo mất {}ms, concurrently fetch info mất thêm {}ms. (Total: {}ms) - download_key: {}", 
             rpc_mid, rpc_total - rpc_mid, rpc_total, download_key);
     }
 
@@ -114,6 +126,7 @@ pub async fn initialize_download_session<'a>(
     } else if file_info_onchain.status == FileStatus::Deleted {
         return Err(format!("File  has been deleted"));
     }
+    
     // Đường dẫn file
     let file_key = hex::encode(session_info.fileKey);
     let level1 = &file_key[0..2];
@@ -128,20 +141,6 @@ pub async fn initialize_download_session<'a>(
         .await
         .map_err(|e| format!("Failed to count chunks: {}", e))?;
 
-    // Gọi isPublicFile để kiểm tra xem file có public không
-    let is_public = contract
-        .isPublicFile(session_info.fileKey)
-        .call()
-        .await
-        .map_err(|e| format!("Failed to check if file is public: {}", e))?;
-
-    // Gọi getWhitelist để lấy danh sách ví được phép tải
-    let whitelist_addresses = contract
-        .getWhitelist(session_info.fileKey)
-        .call()
-        .await
-        .map_err(|e| format!("Failed to get whitelist: {}", e))?;
-
     // Chuyển đổi Vec<Address> thành HashSet<Address> để tra cứu nhanh
     let whitelist: std::collections::HashSet<_> = whitelist_addresses.into_iter().collect();
 
@@ -153,6 +152,7 @@ pub async fn initialize_download_session<'a>(
     let session = DownloadSession {
         download_key: download_key.to_string(),
         file_key: file_key.clone(),
+        contract_address,
         remaining_chunks: chunk_count,
         file_owner: file_info_onchain.owner,
         total_chunks: chunk_count,
@@ -239,7 +239,7 @@ pub async fn list_chunks(file_path: &Path) -> Result<Vec<u64>, String> {
     Ok(chunks)
 }
 pub async fn descrease_chunk_count(download_key: &str, app: &Arc<App>) -> Result<u64, String> {
-    let (remaining, should_confirm) = {
+    let (remaining, should_confirm, contract_address) = {
         let mut entry = match app.download_cache.entry(download_key.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(o) => o,
             dashmap::mapref::entry::Entry::Vacant(_) => {
@@ -250,10 +250,11 @@ pub async fn descrease_chunk_count(download_key: &str, app: &Arc<App>) -> Result
         if session.remaining_chunks > 0 {
             session.remaining_chunks -= 1;
             let rem = session.remaining_chunks;
-            (rem, rem == 0)
+            let c_addr = session.contract_address;
+            (rem, rem == 0, c_addr)
         } else if session.retry_remaining > 0 {
             session.retry_remaining -= 1;
-            (session.remaining_chunks, false)
+            (session.remaining_chunks, false, session.contract_address)
         } else {
             return Err("No remaining chunks".to_string());
         }
@@ -261,7 +262,8 @@ pub async fn descrease_chunk_count(download_key: &str, app: &Arc<App>) -> Result
 
     if should_confirm {
         // Dùng try_send() cho bounded channel
-        if let Err(e) = app.confirmation_sender.try_send(download_key.to_string()) {
+        let contract_addr_str = contract_address.to_string();
+        if let Err(e) = app.confirmation_sender.try_send((download_key.to_string(), contract_addr_str.clone())) {
             match e {
                 tokio::sync::mpsc::error::TrySendError::Full(_) => {
                     log::warn!("⚠️ Confirmation queue full! Falling back to disk for {}", download_key);
@@ -283,7 +285,7 @@ pub async fn descrease_chunk_count(download_key: &str, app: &Arc<App>) -> Result
                             }
                         };
                         use tokio::io::AsyncWriteExt;
-                        let line = format!("{}\n", key_to_write);
+                        let line = format!("{},{}\n", key_to_write, contract_addr_str);
                         if let Err(err) = file.write_all(line.as_bytes()).await {
                             log::error!("❌ CRITICAL: Failed to write to pending_confirmations.txt: {}", err);
                         }

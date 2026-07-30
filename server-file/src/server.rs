@@ -358,11 +358,26 @@ pub async fn handle_connection(
                                     
                                     let mut status_str = "SUCCESS";
                                     if is_completed {
-                                        log::info!("[{}] 🎯 File {} fully received for this node ({} / {} total chunks). Queueing for confirm.", peer_clone, log_file_key, expected_chunks, total_chunks);
-                                        let _ = app_clone.upload_batch_sender.send(log_file_key.clone()).await;
-                                        // Clean up
-                                        app_clone.chunk_tracker.remove(&log_file_key);
-                                        status_str = "COMPLETED";
+                                        // Sử dụng remove để đảm bảo chỉ có ĐÚNG MỘT luồng vào được đây để xử lý hoàn thành
+                                        if let Some((_, _)) = app_clone.chunk_tracker.remove(&log_file_key) {
+                                            log::info!("[{}] 🎯 File {} fully received for this node ({} / {} total chunks). Queueing for confirm.", peer_clone, log_file_key, expected_chunks, total_chunks);
+                                            let contract_addr = if let Some(info) = app_clone.upload_file_cache.get(&log_file_key) {
+                                                log::info!("Extracted contract_addr from cache: {}", info.contract_address);
+                                                info.contract_address
+                                            } else {
+                                                log::error!("CACHE MISS for {}! Cannot confirm.", log_file_key);
+                                                let response = GenericResponse {
+                                                    status: "ERROR".to_string(),
+                                                    message: "Cache miss for contract address".to_string(),
+                                                };
+                                                let mut response_json: Vec<u8> = serde_json::to_vec(&response).unwrap_or_default();
+                                                response_json.push(b'\n');
+                                                let _ = stream_handler.send(bytes::Bytes::from(response_json)).await;
+                                                return;
+                                            };
+                                            let _ = app_clone.upload_batch_sender.send((log_file_key.clone(), contract_addr)).await;
+                                            status_str = "COMPLETED";
+                                        }
                                     }
 
                                     let response = GenericResponse {

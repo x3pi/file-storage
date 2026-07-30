@@ -5,10 +5,9 @@ use alloy::{
 pub struct AppConfig {
     pub rpc_url: String, // Dùng cho HTTP (eth_call)
     pub rpc_url_ws: String, // Dùng cho WebSockets (subscribe)
-    pub contract_address: Address,
+    pub registry_address: Address,
     pub private_key: String,
     pub storage_root: String,
-    pub address_sign_admin: String,
     pub session_timeout_seconds: u64,
     pub wt_addr: String, // WebTransport server address (replaces http_addr)
 }
@@ -24,10 +23,9 @@ impl AppConfig {
         Ok(Self {
             rpc_url: std::env::var("RPC_URL")?,
             rpc_url_ws: std::env::var("RPC_URL_WS").unwrap_or_else(|_| std::env::var("RPC_URL").unwrap()),
-            contract_address: std::env::var("CONTRACT_ADDRESS")?.parse()?,
+            registry_address: std::env::var("CONTRACT_ADDRESS")?.parse()?,
             private_key: std::env::var("PRIVATE_KEY")?,
             storage_root: std::env::var("STORAGE_ROOT").unwrap_or_else(|_| "./storage".to_string()),
-            address_sign_admin: std::env::var("ADDRESS_SIGN_ADMIN")?,
             session_timeout_seconds: std::env::var("SESSION_TIMEOUT_SECONDS").unwrap_or_else(|_| "900".to_string()).parse()?,
             // Đọc từ HTTP_ADDR để giữ tương thích ngược với .env hiện tại
             wt_addr: std::env::var("HTTP_ADDR").unwrap_or_else(|_| "0.0.0.0:8081".to_string()),

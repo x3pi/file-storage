@@ -94,7 +94,11 @@ pub async fn verify_upload_chunk(
             }
         } else {
             // Fetch file owner from SC
-            let contract = app.contract().await.map_err(|e| format!("Contract err: {}", e))?;
+            let c_addr = payload.contract_address.parse::<alloy::primitives::Address>()
+                .map_err(|e| format!("Invalid contract_address: {}", e))?;
+            let contract = app
+                .contract(c_addr)
+                .await.map_err(|e| format!("Contract err: {}", e))?;
             let decoded = hex::decode(payload.file_key.trim_start_matches("0x"))
                 .map_err(|e| format!("Invalid file_key hex: {}", e))?;
             let mut key_bytes = [0u8; 32];
@@ -127,7 +131,7 @@ pub async fn verify_upload_chunk(
             app.upload_file_cache.insert(
                 payload.file_key.clone(),
                 UploadFileInfo {
-                    verified_address: recovered_address,
+                    contract_address: c_addr,
                     signature: payload.signature.clone(),
                     merkle_root: payload.merkle_root.clone(),
                     total_chunks,
@@ -205,8 +209,10 @@ pub async fn verify_download_chunk(
     app: &Arc<App>,
     request_ip: IpAddr,
 ) -> Result<bool, String> {
+    let c_addr = payload.contract_address.parse::<alloy::primitives::Address>()
+        .map_err(|e| format!("Invalid contract_address: {}", e))?;
     let session_ref =
-        download_manager::initialize_download_session(&payload.download_key, app, request_ip)
+        download_manager::initialize_download_session(&payload.download_key, c_addr, app, request_ip)
             .await?;
     let session_first_ip = session_ref.first_ip;
     let session_owner = session_ref.file_owner;
@@ -326,12 +332,12 @@ pub async fn handle_download_request(
     }, Some(chunk_data))
 }
 
-pub async fn confirm_upload_batch(app: Arc<App>, file_keys: Vec<String>) -> Result<(), String> {
+pub async fn confirm_upload_batch(app: Arc<App>, contract_address: alloy::primitives::Address, file_keys: Vec<String>) -> Result<(), String> {
     if file_keys.is_empty() {
         return Ok(());
     }
 
-    let contract = app.contract_with_signer().await.map_err(|e| e.to_string())?;
+    let contract = app.contract_with_signer(contract_address).await.map_err(|e| e.to_string())?;
 
     let mut keys = Vec::new();
     for key_hex in file_keys {
@@ -347,7 +353,7 @@ pub async fn confirm_upload_batch(app: Arc<App>, file_keys: Vec<String>) -> Resu
     if keys.is_empty() {
         return Ok(());
     }
-
+    
     let pending_tx = contract.confirmServerUploadBatch(keys).send().await
         .map_err(|e| format!("Failed to send tx: {}", e))?;
 
@@ -365,18 +371,27 @@ pub async fn confirm_upload_batch(app: Arc<App>, file_keys: Vec<String>) -> Resu
 
 pub async fn handle_confirm_download(
     download_key: String,
+    contract_address: String,
     app: std::sync::Arc<crate::app::App>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let download_key_clean = download_key.trim_start_matches("0x");
     let download_key_bytes = hex::decode(download_key_clean)?;
     let download_key_b256 = alloy::primitives::B256::from_slice(&download_key_bytes);
-    let contract = app.contract_with_signer().await?;
+    let c_addr = contract_address.parse::<alloy::primitives::Address>()?;
+    let contract = app.contract_with_signer(c_addr).await?;
     let pending_tx = contract
         .confirmServerDownload(download_key_b256)
         .send()
         .await?;
 
     // Đợi transaction được mine
-    pending_tx.get_receipt().await?;
+    let receipt = pending_tx.get_receipt().await?;
+    
+    if receipt.status() {
+        log::info!("✅ confirmServerDownload success! TxHash: {}", receipt.transaction_hash);
+    } else {
+        log::error!("❌ confirmServerDownload failed! TxHash: {}", receipt.transaction_hash);
+    }
+    
     Ok(())
 }

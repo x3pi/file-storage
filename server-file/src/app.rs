@@ -3,6 +3,8 @@ use crate::models::{
     ConfirmationReceiver, ConfirmationSender, DownloadSessionCache, UploadFileCache,
     FileCache, ChunkTracker, UploadBatchSender, UploadBatchReceiver,
 };
+use alloy::primitives::Address;
+use std::time::Instant;
 use anyhow::Result;
 use dashmap::DashMap;
 use std::path::PathBuf;
@@ -12,10 +14,15 @@ use tokio::sync::Semaphore;
 use tokio::sync::{mpsc, Mutex};
 
 // Imports cho Alloy
-use alloy::{providers::ProviderBuilder, signers::local::PrivateKeySigner};
+use alloy::network::EthereumWallet;
+use alloy::providers::{ProviderBuilder, RootProvider};
+use alloy::rpc::client::RpcClient;
+use alloy::signers::local::PrivateKeySigner;
+use alloy::transports::http::Http;
+use url::Url;
 
 // Import contract bindings từ file_contract.rs
-use crate::file_contract::Files::FilesInstance;
+use crate::contracts::file_contract::Files::FilesInstance;
 
 /// App chứa tất cả các thành phần cốt lõi của ứng dụng.
 pub struct App {
@@ -33,6 +40,7 @@ pub struct App {
     pub chunk_tracker: ChunkTracker,
     pub upload_batch_sender: UploadBatchSender,
     pub upload_batch_receiver: Arc<Mutex<UploadBatchReceiver>>,
+    pub valid_contracts_cache: Arc<DashMap<Address, bool>>,
     pub http_client: alloy::transports::http::Client,
 }
 
@@ -75,39 +83,72 @@ impl App {
             chunk_tracker,
             upload_batch_sender,
             upload_batch_receiver: Arc::new(Mutex::new(upload_batch_receiver)),
+            valid_contracts_cache: Arc::new(DashMap::new()),
             http_client,
         })
     }
 
     /// Tạo contract instance cho READ operations (view functions)
-    pub async fn contract(&self) -> Result<FilesInstance<impl alloy::providers::Provider + Clone>> {
-        use alloy::providers::RootProvider;
-        use alloy::transports::http::Http;
-        use alloy::rpc::client::RpcClient;
-        use url::Url;
-
+    pub async fn contract(&self, contract_address: Address) -> Result<FilesInstance<impl alloy::providers::Provider + Clone>> {
         let url = Url::parse(&self.config.rpc_url)?;
         let http_transport = Http::with_client(self.http_client.clone(), url);
         let rpc_client = RpcClient::new(http_transport, true);
         let provider = RootProvider::new(rpc_client);
 
-        Ok(FilesInstance::new(self.config.contract_address, provider))
+        Ok(FilesInstance::new(contract_address, provider))
     }
 
     /// Tạo contract instance cho WRITE operations (transactions)
     /// Bao gồm signer để có thể gửi transactions
     pub async fn contract_with_signer(
         &self,
+        contract_address: Address,
     ) -> Result<FilesInstance<impl alloy::providers::Provider + Clone>> {
-        use alloy::network::EthereumWallet;
+        let url = Url::parse(&self.config.rpc_url)?;
+        let http_transport = Http::with_client(self.http_client.clone(), url);
+        let rpc_client = RpcClient::new(http_transport, true);
+        let root_provider = RootProvider::<alloy::network::Ethereum>::new(rpc_client);
 
         let provider = ProviderBuilder::new()
             .wallet(EthereumWallet::from(self.wallet.clone()))
-            .connect(&self.config.rpc_url)
-            .await?;
+            .connect_provider(root_provider);
 
-        // Truy cập contract_address qua config
-        Ok(FilesInstance::new(self.config.contract_address, provider))
+        Ok(FilesInstance::new(contract_address, provider))
+    }
+
+    /// Check nếu một contract address là hợp lệ bằng cách gọi lên Registry
+    pub async fn is_valid_contract(&self, contract_address: Address) -> bool {
+        if let Some(is_valid) = self.valid_contracts_cache.get(&contract_address) {
+            return *is_valid.value();
+        }
+
+        // Dùng interface từ file registry_contract.rs
+        let url = match Url::parse(&self.config.rpc_url) {
+            Ok(u) => u,
+            Err(e) => {
+                log::error!("❌ Invalid RPC URL: {}", e);
+                return false;
+            }
+        };
+        let http_transport = Http::with_client(self.http_client.clone(), url);
+        let rpc_client = RpcClient::new(http_transport, true);
+        let provider = RootProvider::<alloy::network::Ethereum>::new(rpc_client);
+
+        let registry = crate::contracts::registry_contract::Registry::new(self.config.registry_address, provider);
+        match registry.isContractValid(contract_address).call().await {
+            Ok(result) => {
+                let is_valid = result;
+                if is_valid {
+                    log::info!("insert contract: {}", contract_address);
+                    self.valid_contracts_cache.insert(contract_address, true);
+                }
+                is_valid
+            }
+            Err(e) => {
+                log::error!("❌ Error calling registry isContractValid: {}", e);
+                false
+            }
+        }
     }
 
     pub async fn write_chunk(&self, file_key: &str, chunk_index: u64, chunk_data: &[u8]) -> Result<(), std::io::Error> {

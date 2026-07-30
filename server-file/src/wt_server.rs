@@ -37,6 +37,7 @@ struct WtRequest {
 
 #[derive(Deserialize, Debug)]
 struct WtDownloadPayload {
+    pub contract_address: String,
     pub download_key: String,
     pub chunk_index: u64,
     pub signature: String,
@@ -185,6 +186,7 @@ async fn handle_download_chunk(
     // --- Xây dựng payload để tái dụng business logic hiện có ---
     let mut dl_payload = DownloadChunkPayload {
         file_key: String::new(), // Sẽ điền sau verify
+        contract_address: payload.contract_address.clone(),
         download_key: payload.download_key.clone(),
         chunk_index: payload.chunk_index,
         signature: payload.signature.clone(),
@@ -313,9 +315,18 @@ async fn handle_upload_chunk(
                         };
 
                         if is_completed {
-                            log::info!("[WT][{}] 🎯 File {} fully received for this node ({} / {} total chunks). Queueing for confirm.", peer_ip, payload.file_key, expected_chunks, total_chunks);
-                            let _ = app.upload_batch_sender.send(payload.file_key.clone()).await;
-                            app.chunk_tracker.remove(&payload.file_key);
+                            if let Some((_, _)) = app.chunk_tracker.remove(&payload.file_key) {
+                                log::info!("[WT][{}] 🎯 File {} fully received for this node ({} / {} total chunks). Queueing for confirm.", peer_ip, payload.file_key, expected_chunks, total_chunks);
+                                let contract_addr = if let Some(info) = app.upload_file_cache.get(&payload.file_key) {
+                                    log::info!("Extracted contract_addr from cache: {}", info.contract_address);
+                                    info.contract_address
+                                } else {
+                                    log::error!("CACHE MISS for {}! Cannot confirm.", payload.file_key);
+                                    let _ = send_error_frame(&mut send, &req.id, resp_command, "Cache miss for contract address").await;
+                                    return;
+                                };
+                                let _ = app.upload_batch_sender.send((payload.file_key.clone(), contract_addr)).await;
+                            }
                         }
                     }
                     // ----------------------------------------------------
@@ -341,7 +352,6 @@ async fn handle_upload_chunk(
 
 // ─── Framing Helpers ────────────────────────────────────────────────────────
 
-const MAX_REQUEST_FRAME: usize = 64 * 1024; // 64KB max cho request JSON
 
 /// Đọc frame: [4 byte BE uint32 length][2 byte BE json len][JSON][DATA]
 async fn read_frame(stream: &mut wtransport::RecvStream) -> Result<(Vec<u8>, Vec<u8>), String> {

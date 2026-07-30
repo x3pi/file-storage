@@ -2,7 +2,7 @@ mod app;
 mod config;
 mod download_manager;
 mod ethereum;
-mod file_contract;
+mod contracts;
 mod wt_server;
 mod listener;
 mod models;
@@ -150,27 +150,32 @@ async fn main() {
         loop {
             tokio::select! {
                 // 1. ƯU TIÊN UPLOAD: Xử lý ngay lập tức và gom tất cả những file đang chờ
-                Some(file_key) = upload_receiver.recv() => {
-                    let mut current_batch = vec![file_key];
+                Some((file_key, contract_addr)) = upload_receiver.recv() => {
+                    use std::collections::HashMap;
+                    let mut batches: HashMap<alloy::primitives::Address, Vec<String>> = HashMap::new();
+                    batches.entry(contract_addr).or_default().push(file_key);
                     
                     // Vét sạch (drain) tất cả các file upload khác đang nằm trong ống chờ
-                    while let Ok(other_key) = upload_receiver.try_recv() {
-                        if !current_batch.contains(&other_key) {
-                            current_batch.push(other_key);
+                    while let Ok((other_key, other_addr)) = upload_receiver.try_recv() {
+                        let batch = batches.entry(other_addr).or_default();
+                        if !batch.contains(&other_key) {
+                            batch.push(other_key);
                         }
-                        if current_batch.len() >= 50 { break; } // Giới hạn mảng tối đa 50
+                        if batch.len() >= 50 { break; } // Giới hạn mảng tối đa 50 mỗi contract
                     }
                     
-                    log::info!("🚀 [TX Manager] Priority Upload Confirm ({} files)", current_batch.len());
-                    if let Err(e) = crate::ethereum::confirm_upload_batch(app_clone.clone(), current_batch).await {
-                        log::error!("❌ [TX Manager] confirm_upload_batch error: {}", e);
+                    for (addr, current_batch) in batches {
+                        log::info!("🚀 [TX Manager] Priority Upload Confirm ({} files) for contract {}", current_batch.len(), addr);
+                        if let Err(e) = crate::ethereum::confirm_upload_batch(app_clone.clone(), addr, current_batch).await {
+                            log::error!("❌ [TX Manager] confirm_upload_batch error: {}", e);
+                        }
                     }
                 }
 
                 // 2. XỬ LÝ DOWNLOAD
-                Some(download_key) = download_receiver.recv() => {
+                Some((download_key, contract_addr)) = download_receiver.recv() => {
                     log::info!("⏳ [TX Manager] Processing Download Confirm: {}", download_key);
-                    if let Err(e) = crate::ethereum::handle_confirm_download(download_key, app_clone.clone()).await {
+                    if let Err(e) = crate::ethereum::handle_confirm_download(download_key, contract_addr, app_clone.clone()).await {
                         log::error!("❌ Error processing download confirmation: {:?}", e);
                     }
                 }

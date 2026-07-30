@@ -1,0 +1,1 @@
+remove 0x đảm bảo upload/ download k bị ảnh hưởng đến 0x đó

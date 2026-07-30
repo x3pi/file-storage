@@ -21,6 +21,7 @@ pub enum Command {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct UploadChunkPayload {
+    pub contract_address: String,
     pub file_key: String,
     pub chunk_index: u64,
     pub signature: String,
@@ -29,6 +30,7 @@ pub struct UploadChunkPayload {
 }
 #[derive(Serialize, Deserialize, Debug)]
 pub struct DownloadChunkPayload {
+    pub contract_address: String,
     pub file_key: String,
     pub download_key: String,
     pub chunk_index: u64,
@@ -54,6 +56,7 @@ pub struct DownloadSession {
     pub download_key: String,
     #[allow(dead_code)]
     pub file_key: String,
+    pub contract_address: Address,
     pub file_owner: Address,
     pub remaining_chunks: u64,
     #[allow(dead_code)]
@@ -77,20 +80,20 @@ pub type VerifiedSignatureCache = Arc<DashMap<String, Address>>;
 // Upload verification cache: stores both verified address and merkle root
 #[derive(Debug, Clone)]
 pub struct UploadFileInfo {
-    pub verified_address: Address,
     pub signature: String,
     pub merkle_root: String,
     pub total_chunks: u64,
+    pub contract_address: Address,
 }
 
 pub type UploadFileCache = Arc<DashMap<String, UploadFileInfo>>;
 pub type ChunkTracker = Arc<DashMap<String, HashSet<u64>>>;
 
-pub type ConfirmationSender = mpsc::Sender<String>;
-pub type ConfirmationReceiver = mpsc::Receiver<String>;
+pub type ConfirmationSender = mpsc::Sender<(String, String)>;
+pub type ConfirmationReceiver = mpsc::Receiver<(String, String)>;
 
-pub type UploadBatchSender = mpsc::Sender<String>;
-pub type UploadBatchReceiver = mpsc::Receiver<String>;
+pub type UploadBatchSender = mpsc::Sender<(String, Address)>;
+pub type UploadBatchReceiver = mpsc::Receiver<(String, Address)>;
 
 #[derive(Clone)]
 pub struct OpenFiles {

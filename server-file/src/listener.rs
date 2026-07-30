@@ -10,7 +10,7 @@ use std::time::Instant;
 use tokio::time::{sleep, Duration};
 
 // Import event từ file_contract
-use crate::file_contract::Files::{DownloadKeyConfirmed, FileActivated, FileDeleted};
+use crate::contracts::file_contract::Files::{DownloadKeyConfirmed, FileActivated, FileDeleted};
 use alloy::sol_types::SolEvent;
 
 pub async fn listen_download_confirmed_events(app: Arc<App>) {
@@ -24,49 +24,112 @@ pub async fn listen_download_confirmed_events(app: Arc<App>) {
 }
 
 async fn listen_download_confirmed_internal(app: Arc<App>) -> Result<(), String> {
-    // Kết nối WebSocket
-    let ws = WsConnect::new(&app.config.rpc_url_ws);
-    let provider = ProviderBuilder::new()
-        .connect_ws(ws)
-        .await
-        .map_err(|e| format!("Failed to connect WebSocket: {}", e))?;
+    let url = match app.config.rpc_url.parse::<alloy::transports::http::reqwest::Url>() {
+        Ok(u) => u,
+        Err(e) => return Err(format!("Invalid HTTP URL: {}", e)),
+    };
+    
+    // Tạo HTTP Provider để poll get_logs
+    let provider = ProviderBuilder::new().on_http(url);
 
-    let filter = Filter::new().address(app.config.contract_address);
-    let sub = provider
-        .subscribe_logs(&filter)
-        .await
-        .map_err(|e| format!("Failed to subscribe to logs: {}", e))?;
+    // Lấy block hiện tại làm mốc
+    let mut last_block = match provider.get_block_number().await {
+        Ok(b) => b,
+        Err(e) => return Err(format!("Failed to get initial block number: {}", e)),
+    };
 
-    let mut stream = sub.into_stream();
+    log::info!("🔄 [POLLING] Started polling for events from block {}", last_block);
 
-    // Lắng nghe events
-    while let Some(log) = stream.next().await {
-        // Decode event DownloadKeyConfirmed
-        if let Ok(event) = DownloadKeyConfirmed::decode_log(&log.inner.clone().into()) {
-            // Xử lý event
-            process_download_confirmed_event(event.downloadKey, &app).await;
-        } else if let Ok(event) = FileActivated::decode_log(&log.inner.clone().into()) {
-            // Xử lý event
-            process_file_activated_event(event.fileKey, &app).await;
-        } else if let Ok(event) = FileDeleted::decode_log(&log.inner.clone().into()) {
-            // Xử lý xoá file vật lý
-            process_file_deleted_event(event.fileKey, &app).await;
+    loop {
+        let current_block = provider.get_block_number().await.unwrap_or(last_block);
+
+        if current_block > last_block {
+            let filter = Filter::new()
+                .from_block(last_block + 1)
+                .to_block(current_block)
+                .events(vec![
+                    DownloadKeyConfirmed::SIGNATURE_HASH,
+                    FileActivated::SIGNATURE_HASH,
+                    FileDeleted::SIGNATURE_HASH,
+                ]);
+
+            // Tự gửi HTTP request để bypass lỗi `null` trả về từ custom chain
+            #[derive(serde::Serialize)]
+            struct RpcRequest<'a> {
+                jsonrpc: &'static str,
+                id: u64,
+                method: &'static str,
+                params: Vec<&'a Filter>,
+            }
+
+            let req = RpcRequest {
+                jsonrpc: "2.0",
+                id: 1,
+                method: "eth_getLogs",
+                params: vec![&filter],
+            };
+
+            let client = alloy::transports::http::reqwest::Client::new();
+            if let Ok(response) = client.post(&app.config.rpc_url).json(&req).send().await {
+                if let Ok(json) = response.json::<serde_json::Value>().await {
+                    if let Some(result) = json.get("result") {
+                        if result.is_null() {
+                            // Custom chain trả về null => Không có log nào
+                        } else if let Ok(logs) = serde_json::from_value::<Vec<alloy::rpc::types::eth::Log>>(result.clone()) {
+                            for log in logs {
+                                log::info!("🔍 [EVENT DEBUG] Received a log from address: {}", log.address());
+                                // Kiểm tra xem contract sinh ra event này có hợp lệ không
+                                let is_valid = app.is_valid_contract(log.address()).await;
+                                if !is_valid {
+                                    log::warn!("🚫 [EVENT DEBUG] Ignored event because contract {} is not valid", log.address());
+                                    continue; // Bỏ qua event từ contract rác/fake
+                                }
+
+                                // Decode event
+                                if let Ok(event) = DownloadKeyConfirmed::decode_log(&log.inner.clone().into()) {
+                                    log::info!("✅ [EVENT DEBUG] Decoded DownloadKeyConfirmed successfully for key: {}", hex::encode(event.downloadKey));
+                                    process_download_confirmed_event(event.downloadKey, &app).await;
+                                } else if let Ok(event) = FileActivated::decode_log(&log.inner.clone().into()) {
+                                    process_file_activated_event(event.fileKey, &app).await;
+                                } else if let Ok(event) = FileDeleted::decode_log(&log.inner.clone().into()) {
+                                    process_file_deleted_event(event.fileKey, &app).await;
+                                } else {
+                                    log::warn!("⚠️ [EVENT DEBUG] Failed to decode log! Topics: {:?}", log.inner.topics());
+                                }
+                            }
+                        } else {
+                            log::warn!("⚠️ [EVENT DEBUG] Failed to parse get_logs result: {}", result);
+                        }
+                    } else if let Some(err) = json.get("error") {
+                        log::warn!("⚠️ [EVENT DEBUG] RPC Error from get_logs: {}", err);
+                    }
+                }
+            } else {
+                log::warn!("⚠️ [EVENT DEBUG] Failed to send get_logs HTTP request for blocks {} to {}", last_block + 1, current_block);
+            }
+            
+            // Cập nhật last_block
+            last_block = current_block;
         }
-    }
 
-    Ok(())
+        // Poll mỗi 2 giây
+        sleep(Duration::from_millis(2000)).await;
+    }
 }
 
 async fn process_download_confirmed_event(download_key: B256, app: &Arc<App>) {
     let download_key_hex = hex::encode(download_key);
     // Xóa download key khỏi cache
     if let Some(mut session) = app.download_cache.get_mut(&download_key_hex) {
-        session.confirmed_at = Some(Instant::now());
+        session.confirmed_at = Some(std::time::Instant::now());
         let app_clone = app.clone();
         let key_to_delete = download_key_hex.clone();
         let timeout_seconds = app_clone.config.session_timeout_seconds;
+        
+        log::info!("🎉 [EVENT] Nhận sự kiện DownloadKeyConfirmed! Sẽ xoá cache sau {} giây: {}", timeout_seconds, key_to_delete);
+        
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(timeout_seconds)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(timeout_seconds)).await;
             if let Some((_key, _session)) = app_clone.download_cache.remove(&key_to_delete) {
                 log::info!(
                     "✅ Removed expired downloadKey from cache: {}",
