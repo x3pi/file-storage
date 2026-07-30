@@ -6,7 +6,9 @@ use alloy::signers::Signature;
 use std::net::IpAddr;
 
 use std::sync::Arc;
-
+use alloy::providers::Provider;
+use alloy::rpc::types::TransactionReceipt;
+use alloy::primitives::B256;
 // 🔥 FIX: Wrapper task bất đồng bộ cho tác vụ nặng CPU
 async fn run_recover_address_blocking(
     download_key: String,
@@ -333,6 +335,45 @@ pub async fn handle_download_request(
     }, Some(chunk_data))
 }
 
+pub async fn wait_for_transaction<P: Provider>(
+    provider: &P,
+    tx_hash: B256,
+) -> Result<TransactionReceipt, String> {
+    let timeout = std::time::Duration::from_secs(60);
+    let start = std::time::Instant::now();
+    
+    loop {
+        if start.elapsed() > timeout {
+            return Err("timeout waiting for transaction".to_string());
+        }
+
+        match provider.get_transaction_receipt(tx_hash).await {
+            Ok(Some(receipt)) => {
+                if let Some(block_num) = receipt.block_number {
+                    if block_num > 0 {
+                        if receipt.status() {
+                            return Ok(receipt);
+                        }
+                        
+                        let mut reason_str = "Unknown".to_string();
+                        if let Ok(raw) = provider.client().request::<_, serde_json::Value>("eth_getTransactionReceipt", (tx_hash,)).await {
+                            if let Some(reason) = raw.get("revertReason").and_then(|v| v.as_str()) {
+                                reason_str = reason.to_string();
+                            }
+                        }
+                        return Err(format!("transaction failed with revert reason: {}", reason_str));
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                log::debug!("system error checking receipt: {}", e);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
 pub async fn confirm_upload_batch(app: Arc<App>, contract_address: alloy::primitives::Address, file_keys: Vec<String>) -> Result<(), String> {
     if file_keys.is_empty() {
         return Ok(());
@@ -355,16 +396,31 @@ pub async fn confirm_upload_batch(app: Arc<App>, contract_address: alloy::primit
         return Ok(());
     }
     
-    let pending_tx = contract.confirmServerUploadBatch(keys).send().await
+    let provider = contract.provider();
+    let gas_price = match provider.get_gas_price().await {
+        Ok(price) => price,
+        Err(e) => {
+            log::warn!("⚠️ Lỗi khi lấy gas price tự động (SuggestGasPrice): {}. Đang sử dụng mức phí dự phòng: 10000 wei", e);
+            10_000
+        }
+    };
+    
+    let pending_tx = contract.confirmServerUploadBatch(keys)
+        .gas(3_000_000)
+        .gas_price(gas_price)
+        .send().await
         .map_err(|e| format!("Failed to send tx: {}", e))?;
 
-    let receipt = pending_tx.get_receipt().await
-        .map_err(|e| format!("Failed to get receipt: {}", e))?;
-
-    if receipt.status() {
-        log::info!("✅ confirmServerUploadBatch success! TxHash: {}", receipt.transaction_hash);
-    } else {
-        log::error!("❌ confirmServerUploadBatch failed! TxHash: {}", receipt.transaction_hash);
+    let tx_hash = *pending_tx.tx_hash();
+    
+    match wait_for_transaction(provider, tx_hash).await {
+        Ok(receipt) => {
+            log::info!("✅ confirmServerUploadBatch success! TxHash: {}", receipt.transaction_hash);
+        }
+        Err(e) => {
+            log::error!("❌ confirmServerUploadBatch failed! TxHash: {}, error: {}", tx_hash, e);
+            return Err(e);
+        }
     }
 
     Ok(())
@@ -380,18 +436,33 @@ pub async fn handle_confirm_download(
     let download_key_b256 = alloy::primitives::B256::from_slice(&download_key_bytes);
     let c_addr = contract_address.parse::<alloy::primitives::Address>()?;
     let contract = app.contract_with_signer(c_addr).await?;
+    
+    let provider = contract.provider();
+    let gas_price = match provider.get_gas_price().await {
+        Ok(price) => price,
+        Err(e) => {
+            log::warn!("⚠️ Lỗi khi lấy gas price tự động (SuggestGasPrice): {}. Đang sử dụng mức phí dự phòng: 10000 wei", e);
+            10_000
+        }
+    };
+    
     let pending_tx = contract
         .confirmServerDownload(download_key_b256)
+        .gas(3_000_000)
+        .gas_price(gas_price)
         .send()
         .await?;
 
-    // Đợi transaction được mine
-    let receipt = pending_tx.get_receipt().await?;
+    let tx_hash = *pending_tx.tx_hash();
     
-    if receipt.status() {
-        log::info!("✅ confirmServerDownload success! TxHash: {}", receipt.transaction_hash);
-    } else {
-        log::error!("❌ confirmServerDownload failed! TxHash: {}", receipt.transaction_hash);
+    match wait_for_transaction(provider, tx_hash).await {
+        Ok(receipt) => {
+            log::info!("✅ confirmServerDownload success! TxHash: {}", receipt.transaction_hash);
+        }
+        Err(e) => {
+            log::error!("❌ confirmServerDownload failed! TxHash: {}, error: {}", tx_hash, e);
+            return Err(e.into());
+        }
     }
     
     Ok(())
