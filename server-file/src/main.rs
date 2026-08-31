@@ -17,6 +17,10 @@ use std::env;
 use std::fs;
 use std::sync::Arc;
 use sysinfo::System;
+
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = env::args().collect();
@@ -102,13 +106,16 @@ async fn main() {
         );
     }
     tokio::spawn(async move {
-        let mut sys = System::new_all();
+        let mut sys = System::new();
         let pid = sysinfo::get_current_pid().expect("Failed to get PID");
 
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
         loop {
             interval.tick().await;
-            sys.refresh_all();
+            sys.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::Some(&[pid]),
+                sysinfo::ProcessRefreshKind::everything(),
+            );
             // Lấy thông tin process hiện tại
             let process = sys.process(pid);
 
@@ -123,13 +130,6 @@ async fn main() {
             }
         }
     });
-
-    // (Download confirmation worker has been merged into TX Manager below to prevent nonce collisions)
-    let app_clone = app.clone();
-    // tokio::spawn(async move {
-    //     listener::start_chain_id_monitor(app_clone).await;
-    //     log::error!("💀💀💀 CRITICAL: Chain ID monitor died unexpectedly!");
-    // });
 
     // Spawn event listener (WebSocket)
     let app_clone = app.clone();

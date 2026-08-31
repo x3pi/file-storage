@@ -40,11 +40,6 @@ pub struct DownloadChunkPayload {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct GenericResponse {
     pub status: String,
-    pub message: String,
-}
-#[derive(Serialize, Deserialize, Debug)]
-pub struct DownloadResponse {
-    pub status: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub message: String,
 }
@@ -52,17 +47,12 @@ pub struct DownloadResponse {
 
 #[derive(Debug, Clone)]
 pub struct DownloadSession {
-    #[allow(dead_code)]
-    pub download_key: String,
-    #[allow(dead_code)]
     pub file_key: String,
     pub contract_address: Address,
     pub file_owner: Address,
     pub remaining_chunks: u64,
-    #[allow(dead_code)]
-    pub total_chunks: u64,
     pub first_ip: IpAddr,
-    pub retry_remaining:u64,
+    pub retry_remaining: u64,
     pub confirmed_at: Option<Instant>,
     pub verified_signature: Arc<Mutex<Option<String>>>,
     pub is_public: bool,
@@ -72,10 +62,6 @@ pub struct DownloadSession {
 }
 // DashMap: downloadKey -> DownloadSession
 pub type DownloadSessionCache = Arc<DashMap<String, DownloadSession>>;
-
-// Cache verified signatures: (download_key + signature) -> verified owner
-#[allow(dead_code)]
-pub type VerifiedSignatureCache = Arc<DashMap<String, Address>>;
 
 // Upload verification cache: stores both verified address and merkle root
 #[derive(Debug, Clone)]

@@ -1,6 +1,6 @@
 use crate::app::App;
 use crate::download_manager;
-use crate::models::{CHUNK_SIZE, DownloadChunkPayload, DownloadResponse, UploadChunkPayload, UploadFileInfo};
+use crate::models::{CHUNK_SIZE, DownloadChunkPayload, GenericResponse, UploadChunkPayload, UploadFileInfo};
 use alloy::primitives::{keccak256, Address};
 use alloy::signers::Signature;
 use std::net::IpAddr;
@@ -282,13 +282,13 @@ pub async fn verify_download_chunk(
 pub async fn handle_download_request(
     payload: &DownloadChunkPayload,
     app: &Arc<App>,
-) -> (DownloadResponse, Option<Vec<u8>>) {
+) -> (GenericResponse, Option<Vec<u8>>) {
     // Initialize download session and check permissions (scope limits lock lifetime)
     let (has_permission, file_handle) = {
         let session = match app.download_cache.get(&payload.download_key) {
             Some(s) => s,
             None => {
-                return (DownloadResponse {
+                return (GenericResponse {
                     status: "ERROR".to_string(),
                     message: "Download session not found, please verify first.".to_string(),
                 }, None);
@@ -299,7 +299,7 @@ pub async fn handle_download_request(
 
     // Check permission
     if !has_permission {
-        return (DownloadResponse {
+        return (GenericResponse {
             status: "ERROR".to_string(),
             message: "No remaining downloads for this key".to_string(),
         }, None);
@@ -320,14 +320,14 @@ pub async fn handle_download_request(
     let chunk_data = match chunk_data_result {
         Ok(data) => data,
         Err(_) => {
-            return (DownloadResponse {
+            return (GenericResponse {
                 status: "ERROR".to_string(),
                 message: "Chunk data not found".to_string(),
             }, None);
         }
     };
 
-    (DownloadResponse {
+    (GenericResponse {
         status: "SUCCESS".to_string(),
         message: String::new(),
     }, Some(chunk_data))

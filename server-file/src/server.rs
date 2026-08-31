@@ -4,7 +4,7 @@ use crate::app::App;
 use crate::download_manager;
 use crate::ethereum::{handle_download_request, verify_download_chunk, verify_upload_chunk};
 use crate::models::{
-    Command, DownloadResponse, GenericResponse, ListChunksResponse, LogFileContent,
+    Command, GenericResponse, ListChunksResponse, LogFileContent,
     LogsContentResponse, LogsListResponse, CHUNK_SIZE,
 };
 
@@ -34,7 +34,7 @@ async fn send_error_response(
 
 async fn send_download_response(
     stream: &mut QuicStreamHandler, // Nhận stream
-    response: &DownloadResponse,
+    response: &GenericResponse,
     chunk_data: Option<Vec<u8>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut response_json = serde_json::to_vec(response)?;
@@ -591,7 +591,7 @@ pub async fn handle_connection(
                                 Ok(false) => {
                                     let error_message =
                                         "Ownership or signature verification failed".to_string();
-                                    let response = DownloadResponse {
+                                    let response = GenericResponse {
                                         status: "ERROR".to_string(),
                                         message: error_message,
                                     };
@@ -611,7 +611,7 @@ pub async fn handle_connection(
                                 }
                                 Err(er) => {
                                     // log::error!("-[{}] ❌ Verification error: {}", peer_clone, er);
-                                    let response = DownloadResponse {
+                                    let response = GenericResponse {
                                         status: "ERROR".to_string(),
                                         message: format!("Verification error: {}", er),
                                     };

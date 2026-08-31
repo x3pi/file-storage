@@ -150,12 +150,10 @@ pub async fn initialize_download_session<'a>(
         .map_err(|e| format!("Failed to open .bin file at {:?}: {}", bin_path, e))?;
 
     let session = DownloadSession {
-        download_key: download_key.to_string(),
         file_key: file_key.clone(),
         contract_address,
         remaining_chunks: chunk_count,
         file_owner: file_info_onchain.owner,
-        total_chunks: chunk_count,
         first_ip: request_ip,
         confirmed_at: None,
         retry_remaining: chunk_count * 3,

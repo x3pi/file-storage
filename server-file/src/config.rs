@@ -4,7 +4,8 @@ use alloy::{
 };
 pub struct AppConfig {
     pub rpc_url: String, // Dùng cho HTTP (eth_call)
-    pub rpc_url_ws: String, // Dùng cho WebSockets (subscribe)
+    #[allow(dead_code)]
+    pub rpc_url_ws: String, // Dùng cho WebSockets (subscribe trong tương lai)
     pub registry_address: Address,
     pub private_key: String,
     pub storage_root: String,
