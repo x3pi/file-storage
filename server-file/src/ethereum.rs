@@ -59,19 +59,22 @@ pub async fn verify_upload_chunk(
     chunk_data: &[u8],
     app: &Arc<App>,
 ) -> Result<(), String> {
+    let clean_file_key = payload.file_key.trim_start_matches("0x").to_string();
+    let clean_merkle_root = payload.merkle_root.trim_start_matches("0x").to_string();
+
     // 1. Check cache first
-    if let Some(cached_info) = app.upload_file_cache.get(&payload.file_key) {
+    if let Some(cached_info) = app.upload_file_cache.get(&clean_file_key) {
         if cached_info.signature != payload.signature {
             return Err("Signature mismatch with cached signature".to_string());
         }
-        if cached_info.merkle_root != payload.merkle_root {
+        if cached_info.merkle_root.trim_start_matches("0x") != clean_merkle_root {
             return Err(format!(
                 "Merkle root mismatch: expected {}, got {}",
                 cached_info.merkle_root, payload.merkle_root
             ));
         }
     } else {
-        let lock_key = format!("upload_{}", payload.file_key);
+        let lock_key = format!("upload_{}", clean_file_key);
         let lock_arc = {
             let entry = app
                 .init_locks
@@ -82,11 +85,11 @@ pub async fn verify_upload_chunk(
         let _lock = lock_arc.lock().await;
 
         // Double check cache
-        if let Some(cached_info) = app.upload_file_cache.get(&payload.file_key) {
+        if let Some(cached_info) = app.upload_file_cache.get(&clean_file_key) {
             if cached_info.signature != payload.signature {
                 return Err("Signature mismatch with cached signature".to_string());
             }
-            if cached_info.merkle_root != payload.merkle_root {
+            if cached_info.merkle_root.trim_start_matches("0x") != clean_merkle_root {
                 return Err(format!(
                     "Merkle root mismatch: expected {}, got {}",
                     cached_info.merkle_root, payload.merkle_root
@@ -99,7 +102,7 @@ pub async fn verify_upload_chunk(
             let contract = app
                 .contract(c_addr)
                 .await.map_err(|e| format!("Contract err: {}", e))?;
-            let decoded = hex::decode(payload.file_key.trim_start_matches("0x"))
+            let decoded = hex::decode(&clean_file_key)
                 .map_err(|e| format!("Invalid file_key hex: {}", e))?;
             let mut key_bytes = [0u8; 32];
             if decoded.len() == 32 {
@@ -114,11 +117,10 @@ pub async fn verify_upload_chunk(
             let file_owner = result.owner;
             let total_chunks = result.totalChunks;
 
-            // 2. First chunk for this file - verify signature with fileKey + merkleRoot
-            let message_to_sign = format!("{}{}", payload.file_key, payload.merkle_root);
+            // 2. First chunk for this file - verify signature strictly with clean_file_key (Owner authorization)
             let recovered_address: Address =
-                run_recover_address_blocking(message_to_sign, payload.signature.clone()).await?;
-            
+                run_recover_address_blocking(clean_file_key.clone(), payload.signature.clone()).await?;
+
             if recovered_address != file_owner {
                 log::error!(
                     "❌ Upload Rejected: Signer is {:?}, expected File Owner {:?}",
@@ -129,11 +131,11 @@ pub async fn verify_upload_chunk(
 
             // 3. Cache both address, signature and merkle root
             app.upload_file_cache.insert(
-                payload.file_key.clone(),
+                clean_file_key.clone(),
                 UploadFileInfo {
                     contract_address: c_addr,
                     signature: payload.signature.clone(),
-                    merkle_root: payload.merkle_root.clone(),
+                    merkle_root: clean_merkle_root.clone(),
                     total_chunks,
                     created_at: std::time::Instant::now(),
                 },
