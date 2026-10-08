@@ -26,6 +26,17 @@ pub fn spawn_background_sweeper(app: Arc<App>) {
                 log::info!("🧹 Đã dọn dẹp xong {} download session bỏ hoang quá 4 giờ khỏi RAM.", expired_download_keys.len());
             }
 
+            // 1.5. Dọn dẹp Invalid Download Keys (hết hạn sau INVALID_KEY_CACHE_TTL_SECS)
+            let mut expired_invalid_keys = Vec::new();
+            for entry in app.invalid_download_keys.iter() {
+                if entry.value().elapsed().as_secs() > crate::app::INVALID_KEY_CACHE_TTL_SECS {
+                    expired_invalid_keys.push(entry.key().clone());
+                }
+            }
+            for key in expired_invalid_keys {
+                app.invalid_download_keys.remove(&key);
+            }
+
             // 2. Dọn dẹp Upload Session
             let mut expired_upload_keys = Vec::new();
             for entry in app.upload_file_cache.iter() {
@@ -40,10 +51,23 @@ pub fn spawn_background_sweeper(app: Arc<App>) {
                     app.file_cache.remove(file_key);
                     
                     // Thử xóa các file tạm trên ổ cứng (bỏ qua lỗi nếu file không tồn tại)
-                    let file_dir = app.storage_root.join(file_key);
-                    if file_dir.exists() {
-                        if let Err(e) = std::fs::remove_dir_all(&file_dir) {
-                            log::warn!("⚠️ Lỗi khi xóa thư mục rác của upload session {}: {}", file_key, e);
+                    let clean_key = file_key.trim_start_matches("0x").to_lowercase();
+                    if clean_key.len() >= 4 {
+                        let level1 = &clean_key[0..2];
+                        let level2 = &clean_key[2..4];
+                        let file_dir = app.storage_root.join(level1).join(level2).join(&clean_key);
+                        if file_dir.exists() {
+                            if let Err(e) = std::fs::remove_dir_all(&file_dir) {
+                                log::warn!("⚠️ Lỗi khi xóa thư mục rác của upload session {}: {}", clean_key, e);
+                            } else {
+                                log::info!("🧹 Đã dọn dẹp thư mục rác trên đĩa: {:?}", file_dir);
+                                if let Some(level2_dir) = file_dir.parent() {
+                                    let _ = std::fs::remove_dir(level2_dir);
+                                    if let Some(level1_dir) = level2_dir.parent() {
+                                        let _ = std::fs::remove_dir(level1_dir);
+                                    }
+                                }
+                            }
                         }
                     }
                 }

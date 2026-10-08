@@ -62,8 +62,34 @@ pub async fn verify_upload_chunk(
     let clean_file_key = payload.file_key.trim_start_matches("0x").to_string();
     let clean_merkle_root = payload.merkle_root.trim_start_matches("0x").to_string();
 
-    // 1. Check cache first
-    if let Some(cached_info) = app.upload_file_cache.get(&clean_file_key) {
+    let c_addr = payload.contract_address.parse::<alloy::primitives::Address>()
+        .map_err(|e| format!("Invalid contract address: {}", e))?;
+
+    // 0. Validate contract against Registry
+    if !app.is_valid_contract(c_addr).await {
+        return Err(format!("Invalid contract: address {} is not authorized in Registry", c_addr));
+    }
+
+    // 1. Validate chunk size (≤ 1MB limit and non-empty)
+    if chunk_data.is_empty() {
+        return Err("Chunk data cannot be empty".to_string());
+    }
+    if chunk_data.len() > CHUNK_SIZE as usize {
+        return Err(format!(
+            "Chunk size exceeds 1MB limit: got {} bytes, maximum allowed is {}",
+            chunk_data.len(),
+            CHUNK_SIZE
+        ));
+    }
+
+    // 2. Check cache or fetch file metadata from Smart Contract
+    let total_chunks = if let Some(cached_info) = app.upload_file_cache.get(&clean_file_key) {
+        if cached_info.contract_address != c_addr {
+            return Err(format!(
+                "Contract address mismatch with cached upload session: expected {}, got {}",
+                cached_info.contract_address, c_addr
+            ));
+        }
         if cached_info.signature != payload.signature {
             return Err("Signature mismatch with cached signature".to_string());
         }
@@ -73,19 +99,19 @@ pub async fn verify_upload_chunk(
                 cached_info.merkle_root, payload.merkle_root
             ));
         }
+        cached_info.total_chunks
     } else {
         let lock_key = format!("upload_{}", clean_file_key);
-        let lock_arc = {
-            let entry = app
-                .init_locks
-                .entry(lock_key.clone())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
-            Arc::clone(entry.value())
-        };
+        let (lock_arc, _lock_guard) = app.acquire_init_lock(lock_key.clone());
         let _lock = lock_arc.lock().await;
 
-        // Double check cache
-        if let Some(cached_info) = app.upload_file_cache.get(&clean_file_key) {
+        let total = if let Some(cached_info) = app.upload_file_cache.get(&clean_file_key) {
+            if cached_info.contract_address != c_addr {
+                return Err(format!(
+                    "Contract address mismatch with cached upload session: expected {}, got {}",
+                    cached_info.contract_address, c_addr
+                ));
+            }
             if cached_info.signature != payload.signature {
                 return Err("Signature mismatch with cached signature".to_string());
             }
@@ -95,10 +121,9 @@ pub async fn verify_upload_chunk(
                     cached_info.merkle_root, payload.merkle_root
                 ));
             }
+            cached_info.total_chunks
         } else {
             // Fetch file owner from SC
-            let c_addr = payload.contract_address.parse::<alloy::primitives::Address>()
-                .map_err(|e| format!("Invalid contract_address: {}", e))?;
             let contract = app
                 .contract(c_addr)
                 .await.map_err(|e| format!("Contract err: {}", e))?;
@@ -112,10 +137,37 @@ pub async fn verify_upload_chunk(
             }
             
             let result = contract.getFileInfo(alloy::primitives::B256::from(key_bytes)).call().await
-                .map_err(|e| format!("getFileInfo failed: {}", e))?;
+                .map_err(|e| format!("getFileInfo failed on contract {}: {}", c_addr, e))?;
                 
             let file_owner = result.owner;
             let total_chunks = result.totalChunks;
+
+            // Merkle root on-chain verification
+            let onchain_merkle_root = hex::encode(result.merkleRoot);
+            if clean_merkle_root != onchain_merkle_root {
+                return Err(format!(
+                    "Merkle root mismatch with on-chain: expected {}, got {}",
+                    onchain_merkle_root, clean_merkle_root
+                ));
+            }
+
+            // Status and expiry checks
+            let current_time_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| format!("System time error: {}", e))?
+                .as_secs();
+
+            if result.expireTime > 0 && result.expireTime <= current_time_secs {
+                return Err("File has expired on-chain".to_string());
+            }
+
+            if result.status == crate::contracts::file_contract::Files::FileStatus::Deleted {
+                return Err("File has been deleted on-chain".to_string());
+            }
+
+            if result.status != crate::contracts::file_contract::Files::FileStatus::Processing {
+                return Err(format!("File status is not Processing: {:?}", result.status));
+            }
 
             // 2. First chunk for this file - verify signature strictly with clean_file_key (Owner authorization)
             let recovered_address: Address =
@@ -140,8 +192,33 @@ pub async fn verify_upload_chunk(
                     created_at: std::time::Instant::now(),
                 },
             );
-        }
+
+            total_chunks
+        };
         app.init_locks.remove(&lock_key);
+        total
+    };
+
+    // 3. Verify chunk index boundary
+    if payload.chunk_index >= total_chunks {
+        return Err(format!(
+            "Invalid chunk_index {}: exceeds total_chunks {}",
+            payload.chunk_index, total_chunks
+        ));
+    }
+
+    // 4. Verify Merkle proof depth to prevent second-preimage attack
+    let expected_depth = if total_chunks <= 1 {
+        0
+    } else {
+        total_chunks.next_power_of_two().trailing_zeros() as usize
+    };
+
+    if payload.merkle_proof_hashes.len() != expected_depth {
+        return Err(format!(
+            "Invalid Merkle proof depth: expected {} siblings for total_chunks {}, got {}",
+            expected_depth, total_chunks, payload.merkle_proof_hashes.len()
+        ));
     }
     
     // 4. Verify Merkle Proof (ALWAYS - even for cached files)
@@ -307,7 +384,15 @@ pub async fn handle_download_request(
         }, None);
     }
 
-    let offset = (payload.chunk_index as u64) * CHUNK_SIZE;
+    let offset = match (payload.chunk_index as u64).checked_mul(CHUNK_SIZE) {
+        Some(o) => o,
+        None => {
+            return (DownloadResponse {
+                status: "ERROR".to_string(),
+                message: "Invalid chunk index: offset overflow".to_string(),
+            }, None);
+        }
+    };
 
     let chunk_data_result: Result<Vec<u8>, std::io::Error> = tokio::task::spawn_blocking(move || {
         use std::os::unix::fs::FileExt;
@@ -338,6 +423,10 @@ pub async fn handle_download_request(
 pub async fn confirm_upload_batch(app: Arc<App>, contract_address: alloy::primitives::Address, file_keys: Vec<String>) -> Result<(), String> {
     if file_keys.is_empty() {
         return Ok(());
+    }
+
+    if !app.is_valid_contract(contract_address).await {
+        return Err(format!("Invalid contract: address {} is not authorized in Registry", contract_address));
     }
 
     let contract = app.contract_with_signer(contract_address).await.map_err(|e| e.to_string())?;
@@ -381,6 +470,9 @@ pub async fn handle_confirm_download(
     let download_key_bytes = hex::decode(download_key_clean)?;
     let download_key_b256 = alloy::primitives::B256::from_slice(&download_key_bytes);
     let c_addr = contract_address.parse::<alloy::primitives::Address>()?;
+    if !app.is_valid_contract(c_addr).await {
+        return Err(format!("Invalid contract: address {} is not authorized in Registry", c_addr).into());
+    }
     let contract = app.contract_with_signer(c_addr).await?;
     let pending_tx = contract
         .confirmServerDownload(download_key_b256)

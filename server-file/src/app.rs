@@ -23,6 +23,9 @@ use url::Url;
 // Import contract bindings từ file_contract.rs
 use crate::contracts::file_contract::Files::FilesInstance;
 
+// Thời gian lưu cache cho các download_key không hợp lệ (Negative Caching)
+pub const INVALID_KEY_CACHE_TTL_SECS: u64 = 120;
+
 /// App chứa tất cả các thành phần cốt lõi của ứng dụng.
 pub struct App {
     pub config: AppConfig,
@@ -40,10 +43,37 @@ pub struct App {
     pub upload_batch_sender: UploadBatchSender,
     pub upload_batch_receiver: Arc<Mutex<UploadBatchReceiver>>,
     pub valid_contracts_cache: Arc<DashMap<Address, bool>>,
+    pub invalid_download_keys: Arc<DashMap<String, std::time::Instant>>,
     pub http_client: alloy::transports::http::Client,
 }
 
+pub struct InitLockGuard {
+    locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
+    key: String,
+}
+
+impl Drop for InitLockGuard {
+    fn drop(&mut self) {
+        self.locks.remove(&self.key);
+    }
+}
+
 impl App {
+    pub fn acquire_init_lock(&self, key: String) -> (Arc<Mutex<()>>, InitLockGuard) {
+        let lock_arc = {
+            let entry = self
+                .init_locks
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())));
+            Arc::clone(entry.value())
+        };
+        let guard = InitLockGuard {
+            locks: self.init_locks.clone(),
+            key,
+        };
+        (lock_arc, guard)
+    }
+
     pub async fn setup(log_dir: PathBuf) -> Result<Self> {
         let config = AppConfig::from_env()?;
         let storage_root = PathBuf::from(&config.storage_root);
@@ -58,7 +88,7 @@ impl App {
         // [LOAD TEST] Bỏ giới hạn luồng để kiểm thử tải tối đa.
         // Dùng Semaphore::MAX_PERMITS để không giới hạn số luồng đồng thời.
         // let semaphore_limit = tokio::sync::Semaphore::MAX_PERMITS;
-        let semaphore_limit = 3000;
+        let semaphore_limit = 10000;
         let task_semaphore = Arc::new(Semaphore::new(semaphore_limit));
         
         // Khởi tạo HTTP Client 1 lần duy nhất để dùng chung Connection Pool (tránh lỗi TCP Handshake 700ms)
@@ -83,6 +113,7 @@ impl App {
             upload_batch_sender,
             upload_batch_receiver: Arc::new(Mutex::new(upload_batch_receiver)),
             valid_contracts_cache: Arc::new(DashMap::new()),
+            invalid_download_keys: Arc::new(DashMap::new()),
             http_client,
         })
     }
@@ -137,9 +168,9 @@ impl App {
         match registry.isContractValid(contract_address).call().await {
             Ok(result) => {
                 let is_valid = result;
+                self.valid_contracts_cache.insert(contract_address, is_valid);
                 if is_valid {
                     log::info!("insert contract: {}", contract_address);
-                    self.valid_contracts_cache.insert(contract_address, true);
                 }
                 is_valid
             }
@@ -151,12 +182,18 @@ impl App {
     }
 
     pub async fn write_chunk(&self, file_key: &str, chunk_index: u64, chunk_data: &[u8]) -> Result<(), std::io::Error> {
-        let file_key_owned = file_key.to_string();
+        let file_key_owned = file_key.trim_start_matches("0x").to_lowercase();
         let chunk_data_owned = chunk_data.to_vec();
         let file_cache = self.file_cache.clone();
         let storage_root = self.storage_root.clone();
 
         tokio::task::spawn_blocking(move || {
+            if file_key_owned.len() < 4 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Invalid file key length",
+                ));
+            }
             let level1 = &file_key_owned[0..2];
             let level2 = &file_key_owned[2..4];
             let file_dir: PathBuf = storage_root.join(level1).join(level2).join(&file_key_owned);
@@ -172,27 +209,36 @@ impl App {
             let open_files = if let Some(files) = file_cache.get(&file_key_owned) {
                 files.value().clone()
             } else {
-                file_cache.entry(file_key_owned.clone()).or_insert_with(|| {
-                    let bin_file = OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .open(&bin_path).unwrap();
-                    let meta_file = OpenOptions::new()
-                        .append(true)
-                        .create(true)
-                        .open(&meta_path).unwrap();
-                    crate::models::OpenFiles {
-                        bin_file: std::sync::Arc::new(bin_file),
-                        meta_file: std::sync::Arc::new(std::sync::Mutex::new(meta_file)),
-                    }
-                }).value().clone()
+                let bin_file = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .open(&bin_path)?;
+                let meta_file = OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(&meta_path)?;
+                let new_open_files = crate::models::OpenFiles {
+                    bin_file: std::sync::Arc::new(bin_file),
+                    meta_file: std::sync::Arc::new(std::sync::Mutex::new(meta_file)),
+                };
+                file_cache.insert(file_key_owned.clone(), new_open_files.clone());
+                new_open_files
             };
 
-            let chunk_size = 1024 * 1024; // 1MB
-            let offset = chunk_index * chunk_size;
+            let chunk_size = crate::models::CHUNK_SIZE; // 1MB
+            if chunk_data_owned.len() > chunk_size as usize {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Chunk size exceeds 1MB limit",
+                ));
+            }
+            let offset = chunk_index
+                .checked_mul(chunk_size)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Offset calculation overflowed"))?;
             open_files.bin_file.write_all_at(&chunk_data_owned, offset)?;
 
-            let mut meta_file_guard = open_files.meta_file.lock().unwrap();
+            let mut meta_file_guard = open_files.meta_file.lock()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Mutex poison error: {}", e)))?;
             meta_file_guard.write_all(format!("{}\n", chunk_index).as_bytes())?;
 
             Ok(())

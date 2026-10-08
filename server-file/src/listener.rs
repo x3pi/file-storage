@@ -1,5 +1,5 @@
 use crate::app::App;
-use alloy::primitives::B256;
+use alloy::primitives::{Address, B256};
 use alloy::rpc::types::eth::Filter;
 use alloy::transports::ws::WsConnect;
 use alloy::providers::{Provider, ProviderBuilder};
@@ -82,7 +82,7 @@ async fn listen_download_confirmed_internal(app: Arc<App>) -> Result<(), String>
                                         } else if let Ok(event) = FileActivated::decode_log(&log.inner.clone().into()) {
                                             process_file_activated_event(event.fileKey, &app).await;
                                         } else if let Ok(event) = FileDeleted::decode_log(&log.inner.clone().into()) {
-                                            process_file_deleted_event(event.fileKey, &app).await;
+                                            process_file_deleted_event(event.fileKey, log.address(), &app).await;
                                         } else {
                                             log::warn!("⚠️ [EVENT DEBUG] Failed to decode log! Topics: {:?}", log.inner.topics());
                                         }
@@ -166,7 +166,7 @@ async fn process_download_confirmed_event(download_key: B256, app: &Arc<App>) {
     }
 }
 async fn process_file_activated_event(file_key: B256, app: &Arc<App>) {
-    let file_key_hex = hex::encode(file_key);
+    let file_key_hex = hex::encode(file_key).to_lowercase();
     if let Some(_removed) = app.upload_file_cache.remove(&file_key_hex) {
         log::info!(
             "✅ Removed fileKey from upload cache (address + merkle_root): {}",
@@ -178,11 +178,12 @@ async fn process_file_activated_event(file_key: B256, app: &Arc<App>) {
     }
 }
 
-async fn process_file_deleted_event(file_key: B256, app: &Arc<App>) {
-    let file_key_hex = hex::encode(file_key);
+async fn process_file_deleted_event(file_key: B256, contract_address: Address, app: &Arc<App>) {
+    let file_key_hex = hex::encode(file_key).to_lowercase();
     log::info!(
-        "🗑️ Received FileDeleted event for fileKey: {}",
-        file_key_hex
+        "🗑️ Received FileDeleted event for fileKey: {} from contract: {:?}",
+        file_key_hex,
+        contract_address
     );
 
     // Tính toán đường dẫn thư mục giống như lúc lưu
@@ -194,7 +195,50 @@ async fn process_file_deleted_event(file_key: B256, app: &Arc<App>) {
         .join(level2)
         .join(&file_key_hex);
 
-    // Xóa thư mục chứa file
+    // 1. Kiểm tra contract.txt xem file này có do chính contract_address phát sự kiện lưu không
+    let contract_file = file_dir.join("contract.txt");
+    if contract_file.exists() {
+        if let Ok(saved_addr) = tokio::fs::read_to_string(&contract_file).await {
+            let saved_clean = saved_addr.trim().trim_start_matches("0x").to_lowercase();
+            let current_clean = hex::encode(contract_address.as_slice()).to_lowercase();
+            if saved_clean != current_clean {
+                log::warn!(
+                    "❌ Rejecting FileDeleted: fileKey {} belongs to contract 0x{}, but delete event was emitted by contract 0x{}",
+                    file_key_hex,
+                    saved_clean,
+                    current_clean
+                );
+                return;
+            }
+        }
+    }
+
+    // 2. Xác thực trạng thái on-chain trên chính contract phát sự kiện
+    if let Ok(contract) = app.contract(contract_address).await {
+        let key_bytes: [u8; 32] = file_key.into();
+        match contract.getFileInfo(alloy::primitives::B256::from(key_bytes)).call().await {
+            Ok(info) => {
+                if info.status != crate::contracts::file_contract::Files::FileStatus::Deleted {
+                    log::warn!(
+                        "❌ Rejecting FileDeleted: on-chain status is not Deleted ({:?}) for fileKey {} on contract {:?}",
+                        info.status,
+                        file_key_hex,
+                        contract_address
+                    );
+                    return;
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "⚠️ Could not verify getFileInfo for FileDeleted on contract {:?}: {}",
+                    contract_address,
+                    e
+                );
+            }
+        }
+    }
+
+    // 3. Xóa thư mục chứa file
     match tokio::fs::remove_dir_all(&file_dir).await {
         Ok(_) => {
             log::info!(

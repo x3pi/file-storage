@@ -16,6 +16,21 @@ pub async fn initialize_download_session<'a>(
     app: &'a Arc<App>,
     request_ip: IpAddr,
 ) -> Result<Ref<'a, String, DownloadSession>, String> {
+    // 0. Validate contract against Registry
+    if !app.is_valid_contract(contract_address).await {
+        return Err(format!("Invalid contract: address {} is not authorized in Registry", contract_address));
+    }
+
+    // --- Negative Caching Check: Nếu download_key đã biết là hỏng/không tồn tại (< INVALID_KEY_CACHE_TTL_SECS) ---
+    if let Some(entry) = app.invalid_download_keys.get(download_key) {
+        if entry.value().elapsed().as_secs() < crate::app::INVALID_KEY_CACHE_TTL_SECS {
+            return Err(format!("Download key '{}' is invalid or expired (cached)", download_key));
+        } else {
+            drop(entry);
+            app.invalid_download_keys.remove(download_key);
+        }
+    }
+
     let timeout_duration = Duration::from_secs(app.config.session_timeout_seconds);
 
     // --- Logic xử lý Timeout (On-Access Expiration) ---
@@ -37,20 +52,19 @@ pub async fn initialize_download_session<'a>(
         app.download_cache.remove(download_key);
     }
     if let Some(session_ref) = app.download_cache.get(download_key) {
+        if session_ref.contract_address != contract_address {
+            return Err("Contract address mismatch with cached download session".to_string());
+        }
         return Ok(session_ref);
     }
-    // Khóa Mutex (luồng khác sẽ đợi ở đây)
-    let lock_arc = {
-        let entry = app
-            .init_locks
-            .entry(download_key.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
-        Arc::clone(entry.value())
-    };
-    // Khóa Mutex (luồng khác sẽ đợi ở đây)
+    // Khóa Mutex an toàn với RAII Guard (tự động xóa khỏi init_locks khi thoát scope)
+    let (lock_arc, _lock_guard) = app.acquire_init_lock(download_key.to_string());
     let _lock = lock_arc.lock().await;
     // DOUBLE CHECK: Sau khi có lock, kiểm tra lại cache lần nữa
     if let Some(session_ref) = app.download_cache.get(download_key) {
+        if session_ref.contract_address != contract_address {
+            return Err("Contract address mismatch with cached download session".to_string());
+        }
         return Ok(session_ref);
     }
 
@@ -86,11 +100,13 @@ pub async fn initialize_download_session<'a>(
     let rpc_mid = rpc_start.elapsed().as_millis();
 
     if session_info.fileKey == B256::ZERO {
+        app.invalid_download_keys.insert(download_key.to_string(), std::time::Instant::now());
         return Err(format!(
             "Download key '{}' not found on-chain",
             download_key
         ));
     } else if session_info.isConfirmed == true {
+        app.invalid_download_keys.insert(download_key.to_string(), std::time::Instant::now());
         return Err(format!("Download key '{}' has expired", download_key));
     }
 
@@ -122,9 +138,11 @@ pub async fn initialize_download_session<'a>(
         .map_err(|e| format!("System time error: {}", e))?
         .as_secs();
     if file_info_onchain.expireTime <= current_time_secs {
+        app.invalid_download_keys.insert(download_key.to_string(), std::time::Instant::now());
         return Err(format!("Download key has expired"));
     } else if file_info_onchain.status == FileStatus::Deleted {
-        return Err(format!("File  has been deleted"));
+        app.invalid_download_keys.insert(download_key.to_string(), std::time::Instant::now());
+        return Err(format!("File has been deleted"));
     }
     
     // Đường dẫn file
@@ -167,9 +185,7 @@ pub async fn initialize_download_session<'a>(
     };
     // ✅ Insert vào cache
     app.download_cache.insert(download_key.to_string(), session);
-    
-    // 🧹 DỌN DẸP: Xóa lock khỏi bộ nhớ sau khi khởi tạo xong để tránh rò rỉ RAM (Memory Leak)
-    app.init_locks.remove(download_key);
+    app.invalid_download_keys.remove(download_key);
 
     // Trả về session từ cache
     app.download_cache

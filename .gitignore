@@ -3,11 +3,16 @@ server-file/log_*
 server-file/storage_7081
 server-file/storage_7082
 
+# Environment files
+**/.env*
+!**/.env.example
+!**/.env.server1
+!**/.env.server2
 
-
-server-file/certificate.pem
-server-file/private.key
-server-file/fullchain.crt
-server-file/real_private.key
+# Certificates and keys
+**/*.pem*
+**/*.key*
+**/*.crt*
+**/*.local
 server-file/cert.conf
 server-file/file-storage.code-workspace

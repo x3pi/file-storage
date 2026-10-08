@@ -78,13 +78,19 @@ async fn send_logs_list_response(
     stream.send(Bytes::from(response_json)).await?;
     Ok(())
 }
-fn get_file_key_path(storage_root: &Path, file_key: &str) -> PathBuf {
-    let level1 = &file_key[0..2];
-    let level2 = &file_key[2..4];
-    storage_root
-        .join(level1) // Cấp 1
-        .join(level2) // Cấp 2
-        .join(file_key)
+fn get_file_key_path(storage_root: &Path, file_key: &str) -> Option<PathBuf> {
+    let clean = file_key.trim_start_matches("0x").to_lowercase();
+    if clean.len() != 64 || !clean.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let level1 = &clean[0..2];
+    let level2 = &clean[2..4];
+    Some(
+        storage_root
+            .join(level1)
+            .join(level2)
+            .join(&clean)
+    )
 }
 pub async fn handle_connection(
     mut connection: Box<dyn Connection>,
@@ -168,7 +174,7 @@ pub async fn handle_connection(
                                 let _ = send_error_response(&mut stream_handler, "Invalid format: file_key must not start with '0x'").await;
                                 break;
                             }
-                            let log_file_key = payload.file_key.clone();
+                            let log_file_key = payload.file_key.trim_start_matches("0x").to_lowercase();
                             let log_chunk_index = payload.chunk_index;
                             let _permit = match semaphore.acquire().await {
                                 Ok(permit) => permit,
@@ -206,6 +212,24 @@ pub async fn handle_connection(
                                     return;
                                 }
                             };
+
+                            if chunk_data.is_empty() || chunk_data.len() > CHUNK_SIZE as usize {
+                                log::error!(
+                                    "[{}] ❌ Chunk size invalid (len: {} bytes, max: {}) for chunk {} -k {}",
+                                    peer_clone,
+                                    chunk_data.len(),
+                                    CHUNK_SIZE,
+                                    log_chunk_index,
+                                    log_file_key
+                                );
+                                let _ = send_error_response(
+                                    &mut stream_handler,
+                                    "Chunk size exceeds 1MB limit or is empty",
+                                )
+                                .await;
+                                return;
+                            }
+
                             
                             // ✅ DUPLICATE CHUNK EARLY CHECK
                             let is_duplicate = {
@@ -260,18 +284,31 @@ pub async fn handle_connection(
                                 }
                             }
                             
-                            let file_key = payload.file_key.clone();
+                            let file_key = payload.file_key.trim_start_matches("0x").to_lowercase();
+                            let contract_address_clean = payload.contract_address.trim().to_lowercase();
                             let chunk_index = payload.chunk_index;
                             let file_cache = app_clone.file_cache.clone();
                             let storage_root = app_clone.storage_root.clone();
                             let store_result: Result<PathBuf, std::io::Error> =
                                 tokio::task::spawn_blocking(move || {
+                                    if file_key.len() < 4 {
+                                        return Err(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidInput,
+                                            "Invalid file key length",
+                                        ));
+                                    }
                                     let level1 = &file_key[0..2];
                                     let level2 = &file_key[2..4];
                                     let file_dir: PathBuf =
                                         storage_root.join(level1).join(level2).join(&file_key);
                                     std::fs::create_dir_all(&file_dir)?;
                                     
+                                    // Ghi thông tin contract sở hữu file để phục vụ xác thực khi xóa
+                                    let contract_path = file_dir.join("contract.txt");
+                                    if !contract_path.exists() {
+                                        let _ = std::fs::write(&contract_path, &contract_address_clean);
+                                    }
+
                                     // CÁCH MỚI: Ghi vào [file_key].bin
                                     let bin_path = file_dir.join(format!("{}.bin", file_key));
                                     let meta_path = file_dir.join(format!("{}.meta", file_key));
@@ -283,27 +320,35 @@ pub async fn handle_connection(
                                     let open_files = if let Some(files) = file_cache.get(&file_key) {
                                         files.value().clone()
                                     } else {
-                                        file_cache.entry(file_key.clone()).or_insert_with(|| {
-                                            let bin_file = OpenOptions::new()
-                                                .write(true)
-                                                .create(true)
-                                                .open(&bin_path).unwrap();
-                                            let meta_file = OpenOptions::new()
-                                                .append(true)
-                                                .create(true)
-                                                .open(&meta_path).unwrap();
-                                            crate::models::OpenFiles {
-                                                bin_file: std::sync::Arc::new(bin_file),
-                                                meta_file: std::sync::Arc::new(std::sync::Mutex::new(meta_file)),
-                                            }
-                                        }).value().clone()
+                                        let bin_file = OpenOptions::new()
+                                            .write(true)
+                                            .create(true)
+                                            .open(&bin_path)?;
+                                        let meta_file = OpenOptions::new()
+                                            .append(true)
+                                            .create(true)
+                                            .open(&meta_path)?;
+                                        let new_of = crate::models::OpenFiles {
+                                            bin_file: std::sync::Arc::new(bin_file),
+                                            meta_file: std::sync::Arc::new(std::sync::Mutex::new(meta_file)),
+                                        };
+                                        file_cache.insert(file_key.clone(), new_of.clone());
+                                        new_of
                                     };
                                         
-                                    let offset = (chunk_index as u64) * CHUNK_SIZE;
+                                    let offset = (chunk_index as u64)
+                                        .checked_mul(CHUNK_SIZE)
+                                        .ok_or_else(|| {
+                                            std::io::Error::new(
+                                                std::io::ErrorKind::InvalidInput,
+                                                "Chunk index offset overflow",
+                                            )
+                                        })?;
                                     open_files.bin_file.write_all_at(&chunk_data, offset)?;
                                     
                                     // Ghi index vào file meta
-                                    let mut meta_file_guard = open_files.meta_file.lock().unwrap();
+                                    let mut meta_file_guard = open_files.meta_file.lock()
+                                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Mutex poison error: {}", e)))?;
                                     meta_file_guard.write_all(format!("{}\n", chunk_index).as_bytes())?;
                                     
                                     Ok(bin_path)
@@ -628,10 +673,27 @@ pub async fn handle_connection(
                             }
                         }
                         Command::ListChunksRequest { payload } => {
-                            // --- TOÀN BỘ LOGIC ListChunksRequest CŨ CỦA BẠN VÀO ĐÂY ---
-                            // (Sử dụng app_clone và peer_clone)
-                            let file_path =
-                                get_file_key_path(&app_clone.storage_root, &payload.file_key);
+                            let file_path = match get_file_key_path(&app_clone.storage_root, &payload.file_key) {
+                                Some(p) => p,
+                                None => {
+                                    let response = ListChunksResponse {
+                                        status: "ERROR".to_string(),
+                                        message: "Invalid file_key: must be a 64-character hex string".to_string(),
+                                        chunk_indices: vec![],
+                                    };
+                                    let _ = send_list_chunks_response(&mut stream_handler, &response).await;
+                                    continue;
+                                }
+                            };
+                            if !file_path.exists() {
+                                let response = ListChunksResponse {
+                                    status: "ERROR".to_string(),
+                                    message: "File not found".to_string(),
+                                    chunk_indices: vec![],
+                                };
+                                let _ = send_list_chunks_response(&mut stream_handler, &response).await;
+                                continue;
+                            }
                             match download_manager::list_chunks(&file_path).await {
                                 Ok(indices) => {
                                     let response = ListChunksResponse {
@@ -652,16 +714,12 @@ pub async fn handle_connection(
                                 }
                                 Err(e) => {
                                     log::error!("[{}] Failed to list chunks: {}", peer_clone, e);
-                                    if let Err(e) =
-                                        send_error_response(&mut stream_handler, &format!("{}", e))
-                                            .await
-                                    {
-                                        log::error!(
-                                            "[{}] Error sending error response: {}",
-                                            peer_clone,
-                                            e
-                                        );
-                                    }
+                                    let response = ListChunksResponse {
+                                        status: "ERROR".to_string(),
+                                        message: format!("Failed to list chunks: {}", e),
+                                        chunk_indices: vec![],
+                                    };
+                                    let _ = send_list_chunks_response(&mut stream_handler, &response).await;
                                 }
                             }
                         }
@@ -747,45 +805,78 @@ pub async fn handle_connection(
                             log::debug!("[{}] Handling GetLogContent (no semaphore)", peer_clone);
 
                             let logs_dir = app_clone.log_dir.clone();
-                            let file_to_read_path = logs_dir.join(&payload.file_name);
-
                             let message: String;
                             let mut response_status = "SUCCESS".to_string();
                             let mut final_log_content: Option<LogFileContent> = None;
 
-                            if !file_to_read_path.starts_with(&logs_dir)
-                                || !file_to_read_path.is_file()
-                            {
-                                // Ngăn chặn tấn công (directory traversal) và kiểm tra file tồn tại
+                            // 1. Strict validation: Only allow plain alphanumeric filenames with .log extension
+                            // Forbid any path separators, .., or hidden files
+                            let is_safe_name = !payload.file_name.is_empty()
+                                && !payload.file_name.contains('/')
+                                && !payload.file_name.contains('\\')
+                                && !payload.file_name.contains("..")
+                                && !payload.file_name.starts_with('.')
+                                && payload.file_name.ends_with(".log")
+                                && payload.file_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-');
+
+                            if !is_safe_name {
                                 message = format!(
                                     "Error: File '{}' not found or invalid.",
                                     payload.file_name
                                 );
                                 response_status = "ERROR".to_string();
                             } else {
-                                // File hợp lệ -> Đọc nội dung
-                                match fs::read_to_string(&file_to_read_path).await {
-                                    Ok(content) => {
-                                        final_log_content = Some(LogFileContent {
-                                            file_name: payload.file_name.clone(),
-                                            content,
-                                        });
-                                        message = format!(
-                                            "Retrieved content for file: {}",
-                                            payload.file_name
-                                        );
+                                // 2. Canonicalize directory and file path to guarantee it stays strictly inside logs_dir
+                                match std::fs::canonicalize(&logs_dir) {
+                                    Ok(canonical_logs_dir) => {
+                                        let file_to_read = canonical_logs_dir.join(&payload.file_name);
+                                        match std::fs::canonicalize(&file_to_read) {
+                                            Ok(canonical_file_path) => {
+                                                if canonical_file_path.starts_with(&canonical_logs_dir) && canonical_file_path.is_file() {
+                                                    match fs::read_to_string(&canonical_file_path).await {
+                                                        Ok(content) => {
+                                                            final_log_content = Some(LogFileContent {
+                                                                file_name: payload.file_name.clone(),
+                                                                content,
+                                                            });
+                                                            message = format!(
+                                                                "Retrieved content for file: {}",
+                                                                payload.file_name
+                                                            );
+                                                        }
+                                                        Err(e) => {
+                                                            log::warn!(
+                                                                "[{}] Failed to read log file {:?}: {}",
+                                                                peer_clone,
+                                                                canonical_file_path,
+                                                                e
+                                                            );
+                                                            message = format!(
+                                                                "Found file '{}', but failed to read its content: {}",
+                                                                payload.file_name, e
+                                                            );
+                                                            response_status = "ERROR".to_string();
+                                                        }
+                                                    }
+                                                } else {
+                                                    message = format!(
+                                                        "Error: File '{}' not found or invalid.",
+                                                        payload.file_name
+                                                    );
+                                                    response_status = "ERROR".to_string();
+                                                }
+                                            }
+                                            Err(_) => {
+                                                message = format!(
+                                                    "Error: File '{}' not found or invalid.",
+                                                    payload.file_name
+                                                );
+                                                response_status = "ERROR".to_string();
+                                            }
+                                        }
                                     }
-                                    Err(e) => {
-                                        log::warn!(
-                                            "[{}] Failed to read log file {:?}: {}",
-                                            peer_clone,
-                                            file_to_read_path,
-                                            e
-                                        );
-                                        message = format!(
-                                            "Found file '{}', but failed to read its content: {}",
-                                            payload.file_name, e
-                                        );
+                                    Err(_) => {
+                                        message = "Error: Logs directory not accessible.".to_string();
                                         response_status = "ERROR".to_string();
                                     }
                                 }

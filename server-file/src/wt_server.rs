@@ -222,7 +222,16 @@ async fn handle_download_chunk(
     }
 
     // --- Lấy chunk data (tái dụng logic hiện có) ---
+    let _permit = match app.task_semaphore.acquire().await {
+        Ok(p) => p,
+        Err(e) => {
+            log::error!("[WT][{}] Semaphore closed: {}", peer_ip, e);
+            let _ = send_error_frame(&mut send, &req.id, resp_command, "Server is shutting down").await;
+            return;
+        }
+    };
     let (response, chunk_data_opt) = handle_download_request(&dl_payload, &app).await;
+    drop(_permit);
     if response.status != "SUCCESS" {
         let _ = send_error_frame(&mut send, &req.id, resp_command, &response.message).await;
         return;
@@ -284,9 +293,11 @@ async fn handle_upload_chunk(
         return;
     }
 
+    let clean_file_key = payload.file_key.trim_start_matches("0x").to_lowercase();
+
     // ✅ DUPLICATE CHUNK EARLY CHECK
     let is_duplicate = {
-        if let Some(set) = app.chunk_tracker.get(&payload.file_key) {
+        if let Some(set) = app.chunk_tracker.get(&clean_file_key) {
             set.contains(&payload.chunk_index)
         } else {
             false
@@ -300,12 +311,23 @@ async fn handle_upload_chunk(
 
     match crate::ethereum::verify_upload_chunk(&payload, &chunk_data_in, &app).await {
         Ok(_) => {
-            match app.write_chunk(&payload.file_key, payload.chunk_index, &chunk_data_in).await {
+            let _permit = match app.task_semaphore.acquire().await {
+                Ok(p) => p,
+                Err(e) => {
+                    log::error!("[WT][{}] Semaphore closed: {}", peer_ip, e);
+                    let _ = send_error_frame(&mut send, &req.id, resp_command, "Server is shutting down").await;
+                    return;
+                }
+            };
+            let write_result = app.write_chunk(&clean_file_key, payload.chunk_index, &chunk_data_in).await;
+            drop(_permit);
+
+            match write_result {
                 Ok(_) => {
                     let _ = send_chunk_frame(&mut send, &req.id, resp_command, payload.chunk_index, &[]).await;
                     
                     // --- THÊM LOGIC TRACKING CHUNKS GIỐNG NHƯ RAW QUIC ---
-                    if let Some(cache_entry) = app.upload_file_cache.get(&payload.file_key) {
+                    if let Some(cache_entry) = app.upload_file_cache.get(&clean_file_key) {
                         let total_chunks = cache_entry.total_chunks;
                         let expected_chunks = if payload.chunk_index % 2 == 0 {
                             (total_chunks + 1) / 2
@@ -315,24 +337,24 @@ async fn handle_upload_chunk(
 
                         let is_completed = {
                             let mut set = app.chunk_tracker
-                                .entry(payload.file_key.clone())
+                                .entry(clean_file_key.clone())
                                 .or_insert_with(std::collections::HashSet::new);
                             set.insert(payload.chunk_index);
                             set.len() as u64 == expected_chunks
                         };
 
                         if is_completed {
-                            if let Some((_, _)) = app.chunk_tracker.remove(&payload.file_key) {
-                                log::info!("[WT][{}] 🎯 File {} fully received for this node ({} / {} total chunks). Queueing for confirm.", peer_ip, payload.file_key, expected_chunks, total_chunks);
-                                let contract_addr = if let Some(info) = app.upload_file_cache.get(&payload.file_key) {
+                            if let Some((_, _)) = app.chunk_tracker.remove(&clean_file_key) {
+                                log::info!("[WT][{}] 🎯 File {} fully received for this node ({} / {} total chunks). Queueing for confirm.", peer_ip, clean_file_key, expected_chunks, total_chunks);
+                                let contract_addr = if let Some(info) = app.upload_file_cache.get(&clean_file_key) {
                                     log::info!("Extracted contract_addr from cache: {}", info.contract_address);
                                     info.contract_address
                                 } else {
-                                    log::error!("CACHE MISS for {}! Cannot confirm.", payload.file_key);
+                                    log::error!("CACHE MISS for {}! Cannot confirm.", clean_file_key);
                                     let _ = send_error_frame(&mut send, &req.id, resp_command, "Cache miss for contract address").await;
                                     return;
                                 };
-                                let _ = app.upload_batch_sender.send((payload.file_key.clone(), contract_addr)).await;
+                                let _ = app.upload_batch_sender.send((clean_file_key.clone(), contract_addr)).await;
                             }
                         }
                     }
@@ -369,8 +391,9 @@ async fn read_frame(stream: &mut wtransport::RecvStream) -> Result<(Vec<u8>, Vec
         .map_err(|e| format!("read length: {}", e))?;
 
     let length = u32::from_be_bytes(len_buf) as usize;
-    if length < 2 || length > 10 * 1024 * 1024 { // 10MB max
-        return Err(format!("invalid frame length: {}", length));
+    const MAX_FRAME_LEN: usize = (crate::models::CHUNK_SIZE as usize) + 65536; // 1MB chunk + 64KB JSON (~1.11MB)
+    if length < 2 || length > MAX_FRAME_LEN {
+        return Err(format!("invalid frame length: {} (max allowed: {})", length, MAX_FRAME_LEN));
     }
 
     let mut json_len_buf = [0u8; 2];
