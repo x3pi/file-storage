@@ -192,10 +192,9 @@ pub async fn verify_upload_chunk(
                 ));
             }
 
-            // 2. First chunk for this file - verify signature with clean_file_key + clean_merkle_root
-            let message_to_sign = format!("{}{}", clean_file_key, clean_merkle_root);
+            // 2. First chunk for this file - verify signature with canonical_file_key (Owner authorization)
             let recovered_address: Address =
-                run_recover_address_blocking(message_to_sign, payload.signature.clone()).await?;
+                run_recover_address_blocking(canonical_file_key.clone(), payload.signature.clone()).await?;
             
             if recovered_address != file_owner {
                 log::error!(

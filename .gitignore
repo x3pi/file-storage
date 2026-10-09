@@ -10,3 +10,5 @@ server-file/fullchain.crt
 server-file/real_private.key
 server-file/cert.conf
 server-file/file-storage.code-workspace
+server-file/private.key.local
+server-file/certificate.pem.local
