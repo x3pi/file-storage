@@ -325,14 +325,8 @@ async fn handle_upload_chunk(
                     };
 
                     if total_chunks > 0 {
-                        // SVR-4: Xử lý Edge Case chẵn/lẻ khi file chỉ có 1 chunk (total_chunks = 1)
-                        let expected_chunks = if total_chunks == 1 {
-                            if payload.chunk_index == 0 { 1 } else { 0 }
-                        } else if payload.chunk_index % 2 == 0 {
-                            (total_chunks + 1) / 2
-                        } else {
-                            total_chunks / 2
-                        };
+                        // SVR-4: Xử lý Edge Case chẵn/lẻ bằng hàm dùng chung trong utils
+                        let expected_chunks = crate::utils::expected_chunks(total_chunks, payload.chunk_index);
 
                         if expected_chunks == 0 {
                             log::warn!("[WT][{}] ⚠️ Unexpected chunk {} for total_chunks {}", peer_ip, payload.chunk_index, total_chunks);

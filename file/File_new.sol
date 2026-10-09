@@ -58,6 +58,8 @@ contract Files is Initializable, UUPSUpgradeable {
         uint256 currentConfirmations
     );
     event DownloadKeyConfirmed(bytes32 downloadKey, bytes32 fileKey);
+    event PauseStatusChanged(bool isPaused);
+    event SystemFlagChanged(bytes32 indexed flag, bool value);
     // --- STORAGE ---
     string[] public rustServerAddresses;
 
@@ -89,6 +91,10 @@ contract Files is Initializable, UUPSUpgradeable {
     mapping(bytes32 => uint256) public fileVotes;
     uint256 internal _requiredVotes;
 
+    // --- System Status & Generic Feature Flags ---
+    bool public isPaused;
+    mapping(bytes32 => bool) public systemFlags;
+
     // --- MODIFIERS ---
     modifier onlyValidator() {
         require(validators[msg.sender], "Caller is not a validator");
@@ -108,6 +114,16 @@ contract Files is Initializable, UUPSUpgradeable {
 
     modifier onlyStorage() {
         require(storageServers[msg.sender], "Caller is not a storage server");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!isPaused, "Service paused");
+        _;
+    }
+
+    modifier requireFlag(bytes32 flag) {
+        require(!systemFlags[flag], "Action blocked by flag");
         _;
     }
 
@@ -143,6 +159,18 @@ contract Files is Initializable, UUPSUpgradeable {
         returns (string[] memory)
     {
         return rustServerAddresses;
+    }
+
+    // --- System Status & Flag Management ---
+
+    function setPaused(bool _paused) external virtual onlyOwner {
+        isPaused = _paused;
+        emit PauseStatusChanged(_paused);
+    }
+
+    function setSystemFlag(bytes32 _flag, bool _value) external virtual onlyOwner {
+        systemFlags[_flag] = _value;
+        emit SystemFlagChanged(_flag, _value);
     }
 
     // --- Owner Management ---
@@ -267,7 +295,7 @@ contract Files is Initializable, UUPSUpgradeable {
 
     function pushFileInfo(
         Info memory info
-    ) public payable virtual returns (bytes32 fileKey) {
+    ) public payable virtual whenNotPaused returns (bytes32 fileKey) {
         require(info.totalChunks > 0, "totalChunks must be > 0");
         require(info.contentLen > 0, "contentLen must be > 0");
         require(
@@ -361,7 +389,7 @@ contract Files is Initializable, UUPSUpgradeable {
     function payForDownload(
         bytes32 fileKey,
         uint256 downloadTimes
-    ) external payable virtual {
+    ) external payable virtual whenNotPaused {
         require(downloadTimes > 0, "Times > 0");
         Info storage file = mKeyToFileInfo[fileKey];
         require(file.status == FileStatus.Active, "Not active");

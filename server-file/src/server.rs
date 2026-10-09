@@ -372,15 +372,8 @@ pub async fn handle_connection(
                                         continue;
                                     }
 
-                                    // Tính toán nhanh số chunk (Chỉ tốn ~2 nano-giây, cực kỳ nhẹ)
-                                    // SVR-4: Xử lý Edge Case chẵn/lẻ khi file chỉ có 1 chunk (total_chunks = 1)
-                                    let expected_chunks = if total_chunks == 1 {
-                                        if log_chunk_index == 0 { 1 } else { 0 }
-                                    } else if log_chunk_index % 2 == 0 {
-                                        (total_chunks + 1) / 2
-                                    } else {
-                                        total_chunks / 2
-                                    };
+                                    // SVR-4: Xử lý Edge Case chẵn/lẻ bằng hàm dùng chung trong utils
+                                    let expected_chunks = crate::utils::expected_chunks(total_chunks, log_chunk_index);
 
                                     if expected_chunks == 0 {
                                         log::warn!("[{}] ⚠️ Unexpected chunk {} for total_chunks {} (expected 0 chunks for this parity)", peer_clone, log_chunk_index, total_chunks);

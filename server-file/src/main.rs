@@ -9,6 +9,7 @@ mod models;
 
 mod server;
 mod sweeper;
+pub mod utils;
 
 #[cfg(test)]
 mod tests;
@@ -317,8 +318,8 @@ async fn main() {
 
                                     if !to_retry.is_empty() {
                                         let max_attempt = to_retry.iter().map(|(_, c)| *c).max().unwrap_or(1);
-                                        // Exponential backoff: 15s * 2^(attempt - 1), tối đa 120s
-                                        let delay_secs = (15u64 * (1u64 << (max_attempt - 1).min(3))).min(120);
+                                        // Exponential backoff từ utils module
+                                        let delay_secs = crate::utils::retry_delay_secs(max_attempt);
                                         log::warn!(
                                             "⚠️ [TX Manager] confirm_upload_batch gặp lỗi tạm thời: {}. Thử lại {} file(s) sau {}s (lần {}/{})",
                                             err_str,
@@ -386,7 +387,7 @@ async fn main() {
                                 let count = download_retry_counts.entry(download_key.clone()).or_insert(0);
                                 *count += 1;
                                 if *count <= MAX_TX_RETRIES {
-                                    let delay_secs = (15u64 * (1u64 << (*count - 1).min(3))).min(120);
+                                    let delay_secs = crate::utils::retry_delay_secs(*count);
                                     log::warn!(
                                         "⚠️ [TX Manager] Download confirmation gặp lỗi tạm thời: {}. Thử lại sau {}s (lần {}/{})",
                                         err_str,

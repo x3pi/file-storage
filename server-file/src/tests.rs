@@ -316,17 +316,14 @@ async fn test_atomic_write_and_pending_cleanup() {
 
 #[test]
 fn test_tx_manager_exponential_backoff_calculation() {
-    // Công thức: delay = (15 * 2^(attempt - 1)).min(120)
-    let calc_delay = |attempt: u32| -> u64 {
-        (15u64 * (1u64 << (attempt - 1).min(3))).min(120)
-    };
+    use crate::utils::retry_delay_secs;
 
-    assert_eq!(calc_delay(1), 15);  // Lần 1: 15s
-    assert_eq!(calc_delay(2), 30);  // Lần 2: 30s
-    assert_eq!(calc_delay(3), 60);  // Lần 3: 60s
-    assert_eq!(calc_delay(4), 120); // Lần 4: 120s
-    assert_eq!(calc_delay(5), 120); // Lần 5: cap ở 120s
-    assert_eq!(calc_delay(6), 120);
+    assert_eq!(retry_delay_secs(1), 15);  // Lần 1: 15s
+    assert_eq!(retry_delay_secs(2), 30);  // Lần 2: 30s
+    assert_eq!(retry_delay_secs(3), 60);  // Lần 3: 60s
+    assert_eq!(retry_delay_secs(4), 120); // Lần 4: 120s
+    assert_eq!(retry_delay_secs(5), 120); // Lần 5: cap ở 120s
+    assert_eq!(retry_delay_secs(6), 120);
 
     // Kiểm tra hằng số MAX_TX_RETRIES = 5
     assert_eq!(super::MAX_TX_RETRIES, 5);
@@ -338,54 +335,44 @@ fn test_tx_manager_exponential_backoff_calculation() {
 
 #[test]
 fn test_expected_chunks_parity_logic() {
-    let calc_expected = |total_chunks: u64, chunk_index: u64| -> u64 {
-        if total_chunks == 1 {
-            if chunk_index == 0 { 1 } else { 0 }
-        } else if chunk_index % 2 == 0 {
-            (total_chunks + 1) / 2
-        } else {
-            total_chunks / 2
-        }
-    };
+    use crate::utils::expected_chunks;
 
     // Edge case: File chỉ có 1 chunk
-    assert_eq!(calc_expected(1, 0), 1);
-    assert_eq!(calc_expected(1, 1), 0); // Chunk lẻ không tồn tại với file 1 chunk
+    assert_eq!(expected_chunks(1, 0), 1);
+    assert_eq!(expected_chunks(1, 1), 0); // Chunk lẻ không tồn tại với file 1 chunk
 
     // File 2 chunks: chunk 0 -> node 1 (1 chunk), chunk 1 -> node 2 (1 chunk)
-    assert_eq!(calc_expected(2, 0), 1);
-    assert_eq!(calc_expected(2, 1), 1);
+    assert_eq!(expected_chunks(2, 0), 1);
+    assert_eq!(expected_chunks(2, 1), 1);
 
     // File 3 chunks: chunk 0 (chẵn) -> 2 chunks (0, 2), chunk 1 (lẻ) -> 1 chunk (1)
-    assert_eq!(calc_expected(3, 0), 2);
-    assert_eq!(calc_expected(3, 1), 1);
-    assert_eq!(calc_expected(3, 0) + calc_expected(3, 1), 3);
+    assert_eq!(expected_chunks(3, 0), 2);
+    assert_eq!(expected_chunks(3, 1), 1);
+    assert_eq!(expected_chunks(3, 0) + expected_chunks(3, 1), 3);
 
     // File 10 chunks: chẵn 5, lẻ 5
-    assert_eq!(calc_expected(10, 0), 5);
-    assert_eq!(calc_expected(10, 1), 5);
+    assert_eq!(expected_chunks(10, 0), 5);
+    assert_eq!(expected_chunks(10, 1), 5);
 
     // File 11 chunks: chẵn 6, lẻ 5
-    assert_eq!(calc_expected(11, 0), 6);
-    assert_eq!(calc_expected(11, 1), 5);
-    assert_eq!(calc_expected(11, 0) + calc_expected(11, 1), 11);
+    assert_eq!(expected_chunks(11, 0), 6);
+    assert_eq!(expected_chunks(11, 1), 5);
+    assert_eq!(expected_chunks(11, 0) + expected_chunks(11, 1), 11);
 }
 
 #[test]
 fn test_merkle_depth_calculation() {
-    let calc_depth = |total_chunks: u64| -> usize {
-        (total_chunks as f64).log2().ceil() as usize
-    };
+    use crate::utils::merkle_tree_depth;
 
-    assert_eq!(calc_depth(1), 0);
-    assert_eq!(calc_depth(2), 1);
-    assert_eq!(calc_depth(3), 2);
-    assert_eq!(calc_depth(4), 2);
-    assert_eq!(calc_depth(5), 3);
-    assert_eq!(calc_depth(8), 3);
-    assert_eq!(calc_depth(9), 4);
-    assert_eq!(calc_depth(16), 4);
-    assert_eq!(calc_depth(1024), 10);
+    assert_eq!(merkle_tree_depth(1), 0);
+    assert_eq!(merkle_tree_depth(2), 1);
+    assert_eq!(merkle_tree_depth(3), 2);
+    assert_eq!(merkle_tree_depth(4), 2);
+    assert_eq!(merkle_tree_depth(5), 3);
+    assert_eq!(merkle_tree_depth(8), 3);
+    assert_eq!(merkle_tree_depth(9), 4);
+    assert_eq!(merkle_tree_depth(16), 4);
+    assert_eq!(merkle_tree_depth(1024), 10);
 }
 
 // =========================================================================
