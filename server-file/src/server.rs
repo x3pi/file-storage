@@ -5,7 +5,7 @@ use crate::download_manager;
 use crate::ethereum::{handle_download_request, verify_download_chunk, verify_upload_chunk};
 use crate::models::{
     Command, GenericResponse, LogFileContent,
-    LogsContentResponse, LogsListResponse, CHUNK_SIZE,
+    LogsContentResponse, LogsListResponse,
 };
 
 use chrono::Local;
@@ -225,10 +225,13 @@ pub async fn handle_connection(
                                 }
                             };
                             
-                            // ✅ DUPLICATE CHUNK EARLY CHECK (dùng get_or_init_chunk_tracker để đọc từ .meta nếu vừa restart)
+                            // ✅ DUPLICATE CHUNK EARLY CHECK (chỉ đọc cache nếu đã có, không tạo entry trước khi verify)
                             let is_duplicate = {
-                                let set = app_clone.get_or_init_chunk_tracker(&payload.file_key);
-                                set.contains(&payload.chunk_index)
+                                if let Some(set) = app_clone.chunk_tracker.get(&payload.file_key) {
+                                    set.contains(&payload.chunk_index)
+                                } else {
+                                    false
+                                }
                             };
 
                             if is_duplicate {
@@ -294,67 +297,7 @@ pub async fn handle_connection(
                                 }
                             }
                             
-                            let file_key = payload.file_key.clone();
-                            let chunk_index = payload.chunk_index;
-                            let file_cache = app_clone.file_cache.clone();
-                            let storage_root = app_clone.storage_root.clone();
-                            let store_result: Result<PathBuf, std::io::Error> =
-                                tokio::task::spawn_blocking(move || {
-                                    let level1 = &file_key[0..2];
-                                    let level2 = &file_key[2..4];
-                                    let file_dir: PathBuf =
-                                        storage_root.join(level1).join(level2).join(&file_key);
-                                    std::fs::create_dir_all(&file_dir)?;
-                                    
-                                    // CÁCH MỚI: Ghi vào [file_key].bin
-                                    let bin_path = file_dir.join(format!("{}.bin", file_key));
-                                    let meta_path = file_dir.join(format!("{}.meta", file_key));
-                                    
-                                    use std::fs::OpenOptions;
-                                    use std::io::Write;
-                                    use std::os::unix::fs::FileExt;
-                                    
-                                    let open_files = if let Some(files) = file_cache.get(&file_key) {
-                                        files.value().clone()
-                                    } else {
-                                        file_cache.entry(file_key.clone()).or_insert_with(|| {
-                                            let bin_file = OpenOptions::new()
-                                                .write(true)
-                                                .create(true)
-                                                .open(&bin_path).unwrap();
-                                            let meta_file = OpenOptions::new()
-                                                .append(true)
-                                                .create(true)
-                                                .open(&meta_path).unwrap();
-                                            crate::models::OpenFiles {
-                                                bin_file: std::sync::Arc::new(bin_file),
-                                                meta_file: std::sync::Arc::new(std::sync::Mutex::new(meta_file)),
-                                            }
-                                        }).value().clone()
-                                    };
-                                        
-                                    let offset = (chunk_index as u64) * CHUNK_SIZE;
-                                    open_files.bin_file.write_all_at(&chunk_data, offset)?;
-                                    
-                                    // Ghi index vào file meta
-                                    let mut meta_file_guard = open_files.meta_file.lock().unwrap();
-                                    meta_file_guard.write_all(format!("{}\n", chunk_index).as_bytes())?;
-                                    
-                                    Ok(bin_path)
-                                })
-                                .await
-                                .map_err(|e| {
-                                    log::error!(
-                                        "[{}] ❌ Spawn_blocking task panicked: {}",
-                                        peer_clone,
-                                        e
-                                    );
-                                    std::io::Error::new(
-                                        std::io::ErrorKind::Other,
-                                        format!("Task join error: {}", e),
-                                    )
-                                })
-                                .and_then(|inner_result| inner_result);
+                            let store_result = app_clone.write_chunk(&payload.file_key, payload.chunk_index, &chunk_data).await;
 
                             // Nhả semaphore permit NGAY SAU KHI ghi disk xong
                             // Tránh việc Client mạng chậm hoặc chết đột ngột làm cạn kiệt Semaphore.
@@ -363,7 +306,7 @@ pub async fn handle_connection(
                             let processing_done_time = Instant::now();
                             let processing_done_wall_clock = Local::now();
                             match store_result {
-                                Ok(_chunk_path) => {
+                                Ok(()) => {
                                     // TRACK CHUNK: Ghi nhận ngay khi lưu ổ cứng thành công
                                     let (total_chunks, contract_addr) = if let Some(info) = app_clone.upload_file_cache.get(&log_file_key) {
                                         (info.total_chunks, info.contract_address)

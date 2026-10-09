@@ -272,25 +272,27 @@ impl App {
     }
 
     pub fn get_or_init_chunk_tracker(&self, file_key: &str) -> dashmap::mapref::one::RefMut<'_, String, std::collections::HashSet<u64>> {
-        if !self.chunk_tracker.contains_key(file_key) {
-            let mut existing = std::collections::HashSet::new();
-            if file_key.len() == 64 && file_key.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
-                let level1 = &file_key[0..2];
-                let level2 = &file_key[2..4];
-                let file_dir: PathBuf = self.storage_root.join(level1).join(level2).join(file_key);
-                let meta_path = file_dir.join(format!("{}.meta", file_key));
-                if meta_path.is_file() {
-                    if let Ok(content) = std::fs::read_to_string(&meta_path) {
-                        for line in content.lines() {
-                            if let Ok(idx) = line.trim().parse::<u64>() {
-                                existing.insert(idx);
-                            }
+        if let Some(entry) = self.chunk_tracker.get_mut(file_key) {
+            return entry;
+        }
+
+        let mut existing = std::collections::HashSet::new();
+        if file_key.len() == 64 && file_key.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
+            let level1 = &file_key[0..2];
+            let level2 = &file_key[2..4];
+            let file_dir: PathBuf = self.storage_root.join(level1).join(level2).join(file_key);
+            let meta_path = file_dir.join(format!("{}.meta", file_key));
+            if meta_path.is_file() {
+                if let Ok(content) = std::fs::read_to_string(&meta_path) {
+                    for line in content.lines() {
+                        if let Ok(idx) = line.trim().parse::<u64>() {
+                            existing.insert(idx);
                         }
                     }
                 }
             }
-            self.chunk_tracker.insert(file_key.to_string(), existing);
         }
-        self.chunk_tracker.entry(file_key.to_string()).or_insert_with(std::collections::HashSet::new)
+
+        self.chunk_tracker.entry(file_key.to_string()).or_insert(existing)
     }
 }
