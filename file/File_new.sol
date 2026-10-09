@@ -121,7 +121,6 @@ contract Files is Initializable, UUPSUpgradeable {
         // Logic khởi tạo
         owners[msg.sender] = true;
         ownerList.push(msg.sender);
-        pricePerChunk = 0.0001 ether;
     }
 
     function _authorizeUpgrade(
