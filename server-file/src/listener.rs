@@ -27,6 +27,8 @@ async fn listen_download_confirmed_internal(app: Arc<App>) -> Result<(), String>
 
     log::info!("🔄 [POLLING] Started polling for events from block {}", last_block);
 
+    let mut consecutive_parse_errors = 0;
+
     loop {
         let current_block = get_block_number(&app).await.unwrap_or(last_block);
         if current_block > last_block {
@@ -69,15 +71,27 @@ async fn listen_download_confirmed_internal(app: Arc<App>) -> Result<(), String>
                         if result.is_null() {
                             // Custom chain trả về null => Không có log nào
                             poll_succeeded = true;
+                            consecutive_parse_errors = 0;
                         } else {
                             match serde_json::from_value::<Vec<alloy::rpc::types::eth::Log>>(result.clone()) {
                                 Ok(logs) => {
+                                    consecutive_parse_errors = 0;
                                     poll_succeeded = true;
                                     for log in logs {
                                         log::info!("🔍 [EVENT DEBUG] Received a log from address: {}", log.address());
-                                        let is_valid = app.is_valid_contract(log.address()).await;
-                                        if !is_valid {
-                                            continue; // Bỏ qua event từ contract rác/fake
+                                        match app.check_contract_validity(log.address()).await {
+                                            Ok(true) => {
+                                                // Contract hợp lệ -> Xử lý tiếp
+                                            }
+                                            Ok(false) => {
+                                                continue; // Bỏ qua event từ contract rác/fake
+                                            }
+                                            Err(e) => {
+                                                // RPC lỗi kết nối -> KHÔNG coi là poll thành công, dừng để thử lại block này!
+                                                log::warn!("⚠️ [EVENT RETRY] RPC error checking contract validity for {}: {}. Will retry block range.", log.address(), e);
+                                                poll_succeeded = false;
+                                                break;
+                                            }
                                         }
 
                                         let contract_addr = log.address();
@@ -95,7 +109,13 @@ async fn listen_download_confirmed_internal(app: Arc<App>) -> Result<(), String>
                                     }
                                 }
                                 Err(e) => {
-                                    log::warn!("⚠️ [EVENT DEBUG] Failed to parse get_logs result: {:?}, raw JSON: {}", e, result);
+                                    consecutive_parse_errors += 1;
+                                    log::warn!("⚠️ [EVENT DEBUG] Failed to parse get_logs result (attempt {}): {:?}, raw JSON: {}", consecutive_parse_errors, e, result);
+                                    if consecutive_parse_errors >= 5 {
+                                        log::error!("💀💀💀 CRITICAL: Consecutive parse errors ({}) for blocks {} to {}. Skipping block range to prevent listener lockup.", consecutive_parse_errors, last_block + 1, to_block);
+                                        poll_succeeded = true;
+                                        consecutive_parse_errors = 0;
+                                    }
                                 }
                             }
                         }

@@ -118,7 +118,11 @@ impl App {
     }
 
     /// Check nếu một contract address là hợp lệ bằng cách gọi lên Registry với TTL cache
-    pub async fn is_valid_contract(&self, contract_address: Address) -> bool {
+    /// Trả về Result<bool, String> để phân biệt rõ ràng:
+    /// - Ok(true): contract hợp lệ
+    /// - Ok(false): contract không hợp lệ (contract rác thật)
+    /// - Err(e): lỗi RPC/mạng (không kết luận được)
+    pub async fn check_contract_validity(&self, contract_address: Address) -> Result<bool, String> {
         if let Some(entry) = self.valid_contracts_cache.get(&contract_address) {
             let (is_valid, timestamp) = *entry.value();
             // Contract hợp lệ cache lâu (4 giờ) để tránh gọi RPC lặp lại
@@ -129,18 +133,13 @@ impl App {
                 std::time::Duration::from_secs(60)
             };
             if timestamp.elapsed() < ttl {
-                return is_valid;
+                return Ok(is_valid);
             }
         }
 
         // Dùng interface từ file registry_contract.rs
-        let url = match Url::parse(&self.config.rpc_url) {
-            Ok(u) => u,
-            Err(e) => {
-                log::error!("❌ Invalid RPC URL: {}", e);
-                return false;
-            }
-        };
+        let url = Url::parse(&self.config.rpc_url)
+            .map_err(|e| format!("Invalid RPC URL: {}", e))?;
         let http_transport = Http::with_client(self.http_client.clone(), url);
         let rpc_client = RpcClient::new(http_transport, true);
         let provider = RootProvider::<alloy::network::Ethereum>::new(rpc_client);
@@ -151,13 +150,18 @@ impl App {
                 let is_valid = result;
                 log::info!("Contract {} is_valid: {}", contract_address, is_valid);
                 self.valid_contracts_cache.insert(contract_address, (is_valid, std::time::Instant::now()));
-                is_valid
+                Ok(is_valid)
             }
             Err(e) => {
                 log::error!("❌ Error calling registry isContractValid: {}", e);
-                false
+                Err(e.to_string())
             }
         }
+    }
+
+    /// Check nếu một contract address là hợp lệ (helper tương thích ngược)
+    pub async fn is_valid_contract(&self, contract_address: Address) -> bool {
+        self.check_contract_validity(contract_address).await.unwrap_or(false)
     }
 
     /// Đồng bộ danh sách contract hợp lệ từ Registry định kỳ

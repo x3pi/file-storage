@@ -61,8 +61,8 @@ pub fn spawn_background_sweeper(app: Arc<App>) {
                 log::info!("🧹 Đã dọn dẹp xong {} download session bỏ hoang quá {}s khỏi RAM.", expired_download_keys.len(), dl_timeout_secs);
             }
 
-            // 2. Dọn dẹp Upload Session bỏ hoang (sau tối thiểu 1 giờ)
-            let upload_timeout_secs = std::cmp::max(app.config.session_timeout_seconds * 2, 3600);
+            // 4. Dọn dẹp Upload Session bỏ hoang (dùng chung 30 phút theo cấu hình)
+            let upload_timeout_secs = app.config.session_timeout_seconds;
             let mut expired_upload_entries = Vec::new();
             for entry in app.upload_file_cache.iter() {
                 if now.duration_since(entry.created_at).as_secs() > upload_timeout_secs {
