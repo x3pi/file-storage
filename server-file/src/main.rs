@@ -155,46 +155,52 @@ async fn main() {
         let pending_dl_path = app_clone.storage_root.join("pending_confirmations.txt");
 
         // --- 1. STARTUP RECOVERY (Khôi phục các upload/download chưa hoàn thành từ đĩa) ---
-        if pending_upload_path.exists() {
-            if let Ok(content) = tokio::fs::read_to_string(&pending_upload_path).await {
-                let mut count = 0;
-                for line in content.lines() {
-                    let parts: Vec<&str> = line.trim().split(',').collect();
-                    if parts.len() == 2 {
-                        let key = parts[0].trim().to_string();
-                        if let Ok(addr) = parts[1].trim().parse::<alloy::primitives::Address>() {
-                            if !key.is_empty() {
-                                let _ = app_clone.upload_batch_sender.send((key, addr)).await;
+        // Chạy trong task riêng biệt (tokio::spawn) để KHÔNG block task chính, tránh deadlock khi pending > 1000 items!
+        let app_recovery = app_clone.clone();
+        let pending_upload_recovery = pending_upload_path.clone();
+        let pending_dl_recovery = pending_dl_path.clone();
+        tokio::spawn(async move {
+            if pending_upload_recovery.exists() {
+                if let Ok(content) = tokio::fs::read_to_string(&pending_upload_recovery).await {
+                    let mut count = 0;
+                    for line in content.lines() {
+                        let parts: Vec<&str> = line.trim().split(',').collect();
+                        if parts.len() == 2 {
+                            let key = parts[0].trim().to_string();
+                            if let Ok(addr) = parts[1].trim().parse::<alloy::primitives::Address>() {
+                                if !key.is_empty() {
+                                    let _ = app_recovery.upload_batch_sender.send((key, addr)).await;
+                                    count += 1;
+                                }
+                            }
+                        }
+                    }
+                    if count > 0 {
+                        log::info!("♻️ [TX Manager Recovery] Khôi phục {} uploads chưa confirm từ đĩa vào hàng đợi.", count);
+                    }
+                }
+            }
+
+            if pending_dl_recovery.exists() {
+                if let Ok(content) = tokio::fs::read_to_string(&pending_dl_recovery).await {
+                    let mut count = 0;
+                    for line in content.lines() {
+                        let parts: Vec<&str> = line.trim().split(',').collect();
+                        if parts.len() == 2 {
+                            let key = parts[0].trim().to_string();
+                            let addr = parts[1].trim().to_string();
+                            if !key.is_empty() && !addr.is_empty() {
+                                let _ = app_recovery.confirmation_sender.send((key, addr)).await;
                                 count += 1;
                             }
                         }
                     }
-                }
-                if count > 0 {
-                    log::info!("♻️ [TX Manager Recovery] Khôi phục {} uploads chưa confirm từ đĩa vào hàng đợi.", count);
-                }
-            }
-        }
-
-        if pending_dl_path.exists() {
-            if let Ok(content) = tokio::fs::read_to_string(&pending_dl_path).await {
-                let mut count = 0;
-                for line in content.lines() {
-                    let parts: Vec<&str> = line.trim().split(',').collect();
-                    if parts.len() == 2 {
-                        let key = parts[0].trim().to_string();
-                        let addr = parts[1].trim().to_string();
-                        if !key.is_empty() && !addr.is_empty() {
-                            let _ = app_clone.confirmation_sender.send((key, addr)).await;
-                            count += 1;
-                        }
+                    if count > 0 {
+                        log::info!("♻️ [TX Manager Recovery] Khôi phục {} download confirms chưa hoàn thành từ đĩa.", count);
                     }
                 }
-                if count > 0 {
-                    log::info!("♻️ [TX Manager Recovery] Khôi phục {} download confirms chưa hoàn thành từ đĩa.", count);
-                }
             }
-        }
+        });
 
         loop {
             tokio::select! {
@@ -247,45 +253,26 @@ async fn main() {
                         match crate::ethereum::confirm_upload_batch(app_clone.clone(), addr, current_batch.clone()).await {
                             Ok(()) => {
                                 // CHỈ XOÁ KHỎI ĐĨA KHI TX THÀNH CÔNG TRÊN CHAIN
-                                if let Ok(content) = tokio::fs::read_to_string(&pending_upload_path).await {
-                                    let addr_str = addr.to_string();
-                                    let remaining_lines: Vec<&str> = content
-                                        .lines()
-                                        .filter(|line| {
-                                            let parts: Vec<&str> = line.trim().split(',').collect();
-                                            if parts.len() == 2 {
-                                                let key = parts[0].trim().trim_start_matches("0x");
-                                                let contract = parts[1].trim();
-                                                let in_batch = current_batch.iter().any(|b| b.trim_start_matches("0x").eq_ignore_ascii_case(key));
-                                                !(in_batch && contract.eq_ignore_ascii_case(&addr_str))
-                                            } else if !parts.is_empty() {
-                                                let key = parts[0].trim().trim_start_matches("0x");
-                                                let in_batch = current_batch.iter().any(|b| b.trim_start_matches("0x").eq_ignore_ascii_case(key));
-                                                !in_batch
-                                            } else {
-                                                false
-                                            }
-                                        })
-                                        .collect();
-                                    let new_content = if remaining_lines.is_empty() {
-                                        String::new()
-                                    } else {
-                                        format!("{}\n", remaining_lines.join("\n"))
-                                    };
-                                    let _ = tokio::fs::write(&pending_upload_path, new_content).await;
-                                }
+                                remove_pending_uploads(&pending_upload_path, &current_batch, &addr.to_string()).await;
                             }
                             Err(e) => {
-                                log::error!("❌ [TX Manager] confirm_upload_batch error: {}. Giữ nguyên trên đĩa và thử lại sau 10s.", e);
-                                // Transaction lỗi: Giữ nguyên trên đĩa, nạp lại vào queue sau 10 giây
-                                let sender = app_clone.upload_batch_sender.clone();
-                                let retry_batch = current_batch.clone();
-                                tokio::spawn(async move {
-                                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-                                    for k in retry_batch {
-                                        let _ = sender.send((k, addr)).await;
-                                    }
-                                });
+                                let err_str = e.to_string();
+                                let is_timeout = err_str.to_lowercase().contains("timeout");
+                                if is_timeout {
+                                    log::warn!("⚠️ [TX Manager] confirm_upload_batch timeout: {}. Giữ nguyên trên đĩa và thử lại sau 15s.", err_str);
+                                    let sender = app_clone.upload_batch_sender.clone();
+                                    let retry_batch = current_batch.clone();
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+                                        for k in retry_batch {
+                                            let _ = sender.send((k, addr)).await;
+                                        }
+                                    });
+                                } else {
+                                    // Lỗi dứt khoát (Revert, invalid params, caller not storage,...): Xóa khỏi pending vì retry cũng vô ích
+                                    log::error!("❌ [TX Manager] confirm_upload_batch lỗi không thể phục hồi: {}. Xóa khỏi pending.", err_str);
+                                    remove_pending_uploads(&pending_upload_path, &current_batch, &addr.to_string()).await;
+                                }
                             }
                         }
                     }
@@ -317,32 +304,25 @@ async fn main() {
                     match crate::ethereum::handle_confirm_download(download_key.clone(), contract_addr.clone(), app_clone.clone()).await {
                         Ok(()) => {
                             // Thành công: Xoá khỏi pending_confirmations.txt
-                            if let Ok(content) = tokio::fs::read_to_string(&pending_dl_path).await {
-                                let clean_dl_key = download_key.trim_start_matches("0x");
-                                let remaining_lines: Vec<&str> = content
-                                    .lines()
-                                    .filter(|line| {
-                                        let key_part = line.trim().split(',').next().unwrap_or("").trim_start_matches("0x");
-                                        !key_part.eq_ignore_ascii_case(clean_dl_key)
-                                    })
-                                    .collect();
-                                let new_content = if remaining_lines.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!("{}\n", remaining_lines.join("\n"))
-                                };
-                                let _ = tokio::fs::write(&pending_dl_path, new_content).await;
-                            }
+                            remove_pending_download(&pending_dl_path, &download_key).await;
                         }
                         Err(e) => {
-                            log::error!("❌ [TX Manager] Error processing download confirmation: {:?}. Giữ trên đĩa và thử lại sau 15s.", e);
-                            let sender = app_clone.confirmation_sender.clone();
-                            let dl_key = download_key.clone();
-                            let c_addr = contract_addr.clone();
-                            tokio::spawn(async move {
-                                tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
-                                let _ = sender.send((dl_key, c_addr)).await;
-                            });
+                            let err_str = e.to_string();
+                            let is_timeout = err_str.to_lowercase().contains("timeout");
+                            if is_timeout {
+                                log::warn!("⚠️ [TX Manager] Download confirmation timeout: {}. Giữ trên đĩa và thử lại sau 15s.", err_str);
+                                let sender = app_clone.confirmation_sender.clone();
+                                let dl_key = download_key.clone();
+                                let c_addr = contract_addr.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+                                    let _ = sender.send((dl_key, c_addr)).await;
+                                });
+                            } else {
+                                // Lỗi dứt khoát (Revert, Already confirmed, Invalid key,...): Xóa khỏi pending vì retry cũng vô ích
+                                log::error!("❌ [TX Manager] Download confirmation lỗi không thể phục hồi: {}. Xóa khỏi pending.", err_str);
+                                remove_pending_download(&pending_dl_path, &download_key).await;
+                            }
                         }
                     }
                 }
@@ -473,5 +453,60 @@ async fn main() {
                 }
             }
         }
+    }
+}
+
+async fn write_atomic(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    let tmp_path = path.with_extension("tmp");
+    tokio::fs::write(&tmp_path, content).await?;
+    tokio::fs::rename(&tmp_path, path).await?;
+    Ok(())
+}
+
+async fn remove_pending_uploads(path: &std::path::Path, current_batch: &[String], addr_str: &str) {
+    if let Ok(content) = tokio::fs::read_to_string(path).await {
+        let remaining_lines: Vec<&str> = content
+            .lines()
+            .filter(|line| {
+                let parts: Vec<&str> = line.trim().split(',').collect();
+                if parts.len() == 2 {
+                    let key = parts[0].trim().trim_start_matches("0x");
+                    let contract = parts[1].trim();
+                    let in_batch = current_batch.iter().any(|b| b.trim_start_matches("0x").eq_ignore_ascii_case(key));
+                    !(in_batch && contract.eq_ignore_ascii_case(addr_str))
+                } else if !parts.is_empty() {
+                    let key = parts[0].trim().trim_start_matches("0x");
+                    let in_batch = current_batch.iter().any(|b| b.trim_start_matches("0x").eq_ignore_ascii_case(key));
+                    !in_batch
+                } else {
+                    false
+                }
+            })
+            .collect();
+        let new_content = if remaining_lines.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", remaining_lines.join("\n"))
+        };
+        let _ = write_atomic(path, &new_content).await;
+    }
+}
+
+async fn remove_pending_download(path: &std::path::Path, download_key: &str) {
+    if let Ok(content) = tokio::fs::read_to_string(path).await {
+        let clean_dl_key = download_key.trim_start_matches("0x");
+        let remaining_lines: Vec<&str> = content
+            .lines()
+            .filter(|line| {
+                let key_part = line.trim().split(',').next().unwrap_or("").trim_start_matches("0x");
+                !key_part.eq_ignore_ascii_case(clean_dl_key)
+            })
+            .collect();
+        let new_content = if remaining_lines.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", remaining_lines.join("\n"))
+        };
+        let _ = write_atomic(path, &new_content).await;
     }
 }

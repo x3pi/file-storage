@@ -39,17 +39,18 @@ pub fn spawn_background_sweeper(app: Arc<App>) {
                 log::info!("🧹 Đã dọn dẹp {} download session hoàn tất (đã đóng file handle).", confirmed_download_keys.len());
             }
 
-            // 3. Dọn dẹp Download/Upload Session bỏ hoang (mỗi 1 giờ quét 1 lần)
-            if now.duration_since(last_session_sweep).as_secs() < 3600 {
+            // 3. Dọn dẹp Download/Upload Session bỏ hoang (mỗi 5 phút quét 1 lần)
+            let sweep_interval = std::cmp::min(app.config.session_timeout_seconds, 300);
+            if now.duration_since(last_session_sweep).as_secs() < sweep_interval {
                 continue;
             }
             last_session_sweep = now;
             
-            // Dọn dẹp Download Session
+            // Dọn dẹp Download Session theo đúng cấu hình session_timeout_seconds
             let mut expired_download_keys = Vec::new();
-            // Quét các session đã nằm trong RAM quá 4h (14400 giây)
+            let dl_timeout_secs = app.config.session_timeout_seconds;
             for entry in app.download_cache.iter() {
-                if now.duration_since(entry.created_at).as_secs() > 14400 {
+                if now.duration_since(entry.created_at).as_secs() > dl_timeout_secs {
                     expired_download_keys.push(entry.key().clone());
                 }
             }
@@ -57,13 +58,14 @@ pub fn spawn_background_sweeper(app: Arc<App>) {
                 for key in &expired_download_keys {
                     app.download_cache.remove(key);
                 }
-                log::info!("🧹 Đã dọn dẹp xong {} download session bỏ hoang quá 4 giờ khỏi RAM.", expired_download_keys.len());
+                log::info!("🧹 Đã dọn dẹp xong {} download session bỏ hoang quá {}s khỏi RAM.", expired_download_keys.len(), dl_timeout_secs);
             }
 
-            // 2. Dọn dẹp Upload Session
+            // 2. Dọn dẹp Upload Session bỏ hoang (sau tối thiểu 1 giờ)
+            let upload_timeout_secs = std::cmp::max(app.config.session_timeout_seconds * 2, 3600);
             let mut expired_upload_entries = Vec::new();
             for entry in app.upload_file_cache.iter() {
-                if now.duration_since(entry.created_at).as_secs() > 14400 {
+                if now.duration_since(entry.created_at).as_secs() > upload_timeout_secs {
                     expired_upload_entries.push((entry.key().clone(), entry.contract_address));
                 }
             }
@@ -120,7 +122,7 @@ pub fn spawn_background_sweeper(app: Arc<App>) {
                         }
                     }
                 }
-                log::info!("🧹 Đã dọn dẹp xong {} upload session bỏ hoang quá 4 giờ khỏi RAM.", expired_upload_entries.len());
+                log::info!("🧹 Đã dọn dẹp xong {} upload session bỏ hoang quá {}s khỏi RAM.", expired_upload_entries.len(), upload_timeout_secs);
             }
         }
     });
