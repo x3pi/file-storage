@@ -171,11 +171,20 @@ async fn main() {
                             Ok(()) => {
                                 let pending_file_path = app_clone.storage_root.join("pending_uploads.txt");
                                 if let Ok(content) = tokio::fs::read_to_string(&pending_file_path).await {
+                                    let addr_str = addr.to_string();
                                     let remaining_lines: Vec<&str> = content
                                         .lines()
                                         .filter(|line| {
                                             let parts: Vec<&str> = line.trim().split(',').collect();
-                                            !parts.is_empty() && !current_batch.contains(&parts[0].to_string())
+                                            if parts.len() == 2 {
+                                                let key = parts[0].trim();
+                                                let contract = parts[1].trim();
+                                                !(current_batch.contains(&key.to_string()) && contract.eq_ignore_ascii_case(&addr_str))
+                                            } else if !parts.is_empty() {
+                                                !current_batch.contains(&parts[0].trim().to_string())
+                                            } else {
+                                                false
+                                            }
                                         })
                                         .collect();
                                     let new_content = if remaining_lines.is_empty() {

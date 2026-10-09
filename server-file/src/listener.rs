@@ -1,5 +1,5 @@
 use crate::app::App;
-use alloy::primitives::B256;
+use alloy::primitives::{Address, B256};
 use alloy::rpc::types::eth::Filter;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
@@ -80,13 +80,15 @@ async fn listen_download_confirmed_internal(app: Arc<App>) -> Result<(), String>
                                             continue; // Bỏ qua event từ contract rác/fake
                                         }
 
+                                        let contract_addr = log.address();
+
                                         // Decode event
                                         if let Ok(event) = DownloadKeyConfirmed::decode_log(&log.inner.clone().into()) {
-                                            process_download_confirmed_event(event.downloadKey, &app).await;
+                                            process_download_confirmed_event(event.downloadKey, contract_addr, &app).await;
                                         } else if let Ok(event) = FileActivated::decode_log(&log.inner.clone().into()) {
-                                            process_file_activated_event(event.fileKey, &app).await;
+                                            process_file_activated_event(event.fileKey, contract_addr, &app).await;
                                         } else if let Ok(event) = FileDeleted::decode_log(&log.inner.clone().into()) {
-                                            process_file_deleted_event(event.fileKey, &app).await;
+                                            process_file_deleted_event(event.fileKey, contract_addr, &app).await;
                                         } else {
                                             log::warn!("⚠️ [EVENT DEBUG] Failed to decode log! Topics: {:?}", log.inner.topics());
                                         }
@@ -156,42 +158,85 @@ async fn get_block_number(app: &Arc<App>) -> Result<u64, String> {
     u64::from_str_radix(hex_str, 16).map_err(|e| format!("Parse error: {}", e))
 }
 
-async fn process_download_confirmed_event(download_key: B256, app: &Arc<App>) {
+async fn process_download_confirmed_event(download_key: B256, contract_addr: Address, app: &Arc<App>) {
     let download_key_hex = hex::encode(download_key);
-    // Xóa download key khỏi cache
+    // Đánh dấu thời điểm xác nhận thành công theo đúng contract_address
     if let Some(mut session) = app.download_cache.get_mut(&download_key_hex) {
+        if session.contract_address != contract_addr {
+            log::warn!(
+                "⚠️ [Cross-Contract Protection] DownloadKey {} belongs to contract {}, ignoring event from {}",
+                download_key_hex, session.contract_address, contract_addr
+            );
+            return;
+        }
         session.confirmed_at = Some(std::time::Instant::now());
-        let app_clone = app.clone();
-        let key_to_delete = download_key_hex.clone();
-        tokio::spawn(async move {
-            if let Some((_key, _session)) = app_clone.download_cache.remove(&key_to_delete) {
-                log::info!(
-                    "✅ Removed expired downloadKey from cache: {}",
-                    key_to_delete
-                );
-            }
-        });
-    }
-}
-async fn process_file_activated_event(file_key: B256, app: &Arc<App>) {
-    let file_key_hex = hex::encode(file_key);
-    if let Some(_removed) = app.upload_file_cache.remove(&file_key_hex) {
         log::info!(
-            "✅ Removed fileKey from upload cache (address + merkle_root): {}",
-            file_key_hex
+            "✅ Download key {} confirmed on contract {}. Marked confirmed_at.",
+            download_key_hex, contract_addr
         );
-    }
-    if let Some((_, _)) = app.file_cache.remove(&file_key_hex) {
-        log::info!("✅ Closed and removed file handle from file_cache: {}", file_key_hex);
     }
 }
 
-async fn process_file_deleted_event(file_key: B256, app: &Arc<App>) {
+async fn process_file_activated_event(file_key: B256, contract_addr: Address, app: &Arc<App>) {
+    let file_key_hex = hex::encode(file_key);
+    let mut is_matched = false;
+    if let Some(entry) = app.upload_file_cache.get(&file_key_hex) {
+        if entry.contract_address == contract_addr {
+            is_matched = true;
+        } else {
+            log::warn!(
+                "⚠️ [Cross-Contract Protection] FileKey {} belongs to contract {}, ignoring FileActivated from {}",
+                file_key_hex, entry.contract_address, contract_addr
+            );
+        }
+    } else {
+        is_matched = true;
+    }
+
+    if is_matched {
+        if let Some(_removed) = app.upload_file_cache.remove(&file_key_hex) {
+            log::info!(
+                "✅ Removed fileKey {} from upload cache for contract: {}",
+                file_key_hex, contract_addr
+            );
+        }
+        if let Some((_, _)) = app.file_cache.remove(&file_key_hex) {
+            log::info!("✅ Closed and removed file handle from file_cache: {}", file_key_hex);
+        }
+    }
+}
+
+async fn process_file_deleted_event(file_key: B256, contract_addr: Address, app: &Arc<App>) {
     let file_key_hex = hex::encode(file_key);
     log::info!(
-        "🗑️ Received FileDeleted event for fileKey: {}",
-        file_key_hex
+        "🗑️ Received FileDeleted event for fileKey: {} from contract: {}",
+        file_key_hex, contract_addr
     );
+
+    // Cross-Contract Protection: kiểm tra xem fileKey có thuộc về contract này hay không
+    if let Some(entry) = app.upload_file_cache.get(&file_key_hex) {
+        if entry.contract_address != contract_addr {
+            log::warn!(
+                "⚠️ [Cross-Contract Protection] FileKey {} belongs to contract {}, ignoring FileDeleted from {}",
+                file_key_hex, entry.contract_address, contract_addr
+            );
+            return;
+        }
+    } else {
+        // Nếu không có trong upload cache, xác thực trực tiếp trên contract emit event
+        if let Ok(contract) = app.contract(contract_addr).await {
+            if let Ok(info) = contract.getFileInfo(file_key).call().await {
+                use crate::contracts::file_contract::Files::FileStatus;
+                if info.status != FileStatus::Deleted {
+                    log::warn!(
+                        "⚠️ [Cross-Contract Protection] FileKey {} on contract {} is not Deleted (status: {:?}), ignoring FileDeleted event",
+                        file_key_hex, contract_addr, info.status
+                    );
+                    return;
+                }
+            }
+        }
+    }
 
     // Tính toán đường dẫn thư mục giống như lúc lưu
     let level1 = &file_key_hex[0..2];
