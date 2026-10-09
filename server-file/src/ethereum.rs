@@ -61,6 +61,12 @@ pub async fn verify_upload_chunk(
 ) -> Result<(), String> {
     // 1. Check cache first
     if let Some(cached_info) = app.upload_file_cache.get(&payload.file_key) {
+        if payload.chunk_index >= cached_info.total_chunks {
+            return Err(format!(
+                "Chunk index {} exceeds total_chunks {}",
+                payload.chunk_index, cached_info.total_chunks
+            ));
+        }
         if cached_info.signature != payload.signature {
             return Err("Signature mismatch with cached signature".to_string());
         }
@@ -81,8 +87,28 @@ pub async fn verify_upload_chunk(
         };
         let _lock = lock_arc.lock().await;
 
+        struct LockGuard<'b> {
+            locks: &'b dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+            key: &'b str,
+        }
+        impl<'b> Drop for LockGuard<'b> {
+            fn drop(&mut self) {
+                self.locks.remove(self.key);
+            }
+        }
+        let _cleanup_guard = LockGuard {
+            locks: &app.init_locks,
+            key: &lock_key,
+        };
+
         // Double check cache
         if let Some(cached_info) = app.upload_file_cache.get(&payload.file_key) {
+            if payload.chunk_index >= cached_info.total_chunks {
+                return Err(format!(
+                    "Chunk index {} exceeds total_chunks {}",
+                    payload.chunk_index, cached_info.total_chunks
+                ));
+            }
             if cached_info.signature != payload.signature {
                 return Err("Signature mismatch with cached signature".to_string());
             }
@@ -96,6 +122,11 @@ pub async fn verify_upload_chunk(
             // Fetch file owner from SC
             let c_addr = payload.contract_address.parse::<alloy::primitives::Address>()
                 .map_err(|e| format!("Invalid contract_address: {}", e))?;
+
+            if !app.is_valid_contract(c_addr).await {
+                return Err(format!("Contract {} is not registered or invalid", c_addr));
+            }
+
             let contract = app
                 .contract(c_addr)
                 .await.map_err(|e| format!("Contract err: {}", e))?;
@@ -113,6 +144,13 @@ pub async fn verify_upload_chunk(
                 
             let file_owner = result.owner;
             let total_chunks = result.totalChunks;
+
+            if payload.chunk_index >= total_chunks {
+                return Err(format!(
+                    "Chunk index {} exceeds total_chunks {}",
+                    payload.chunk_index, total_chunks
+                ));
+            }
 
             // 2. First chunk for this file - verify signature with fileKey + merkleRoot
             let message_to_sign = format!("{}{}", payload.file_key, payload.merkle_root);
@@ -139,7 +177,6 @@ pub async fn verify_upload_chunk(
                 },
             );
         }
-        app.init_locks.remove(&lock_key);
     }
     
     // 4. Verify Merkle Proof (ALWAYS - even for cached files)
@@ -215,67 +252,93 @@ pub async fn verify_download_chunk(
     let session_ref =
         download_manager::initialize_download_session(&payload.download_key, c_addr, app, request_ip)
             .await?;
-    let session_first_ip = session_ref.first_ip;
+    let session_first_ip_arc = session_ref.first_ip.clone();
     let session_owner = session_ref.file_owner;
+    let session_user = session_ref.session_user;
+    let total_chunks = session_ref.total_chunks;
     let signature_cache = session_ref.verified_signature.clone();
     let is_public = session_ref.is_public;
     let whitelist = session_ref.whitelist.clone();
     drop(session_ref);
 
-    if session_first_ip != request_ip {
-        return Err("IP address mismatch".to_string());
+    // 1. Kiểm tra giới hạn chunk_index so với total_chunks
+    if payload.chunk_index >= total_chunks {
+        return Err(format!(
+            "Invalid chunk_index {}: exceeds total_chunks {}",
+            payload.chunk_index, total_chunks
+        ));
     }
-    
-    // Nếu file là public, cho phép tải ngay
+
+    // 2. Xác thực chữ ký
+    let mut signature_valid = false;
     if is_public {
-        log::info!("File is public, allowing download without signature verification");
-        return Ok(true);
-    }
-    
-    // 1. Lấy cache chữ ký của session
-    let cache_guard = signature_cache.lock().await;
-    if let Some(cached_sig) = cache_guard.as_ref() {
-        // Cache hit - verify với owner đã cache
-        if *cached_sig == payload.signature {
-            return Ok(true);
-        } else {
-            log::warn!(
-                "Signature mismatch for {}: expected (cached) {}, got {}",
-                payload.download_key,
-                cached_sig,
-                payload.signature
-            );
-            return Err("Invalid signature (mismatch with cached)".to_string());
+        log::debug!("File is public download for key: {}", payload.download_key);
+        signature_valid = true;
+    } else {
+        // Fast path: Kiểm tra cache chữ ký
+        let cache_guard = signature_cache.lock().await;
+        if let Some(cached_sig) = cache_guard.as_ref() {
+            if *cached_sig == payload.signature {
+                signature_valid = true;
+            }
+        }
+        drop(cache_guard);
+
+        if !signature_valid {
+            match run_recover_address_blocking(payload.download_key.clone(), payload.signature.clone()).await {
+                Ok(recovered_address) => {
+                    if recovered_address == session_owner || recovered_address == session_user || whitelist.contains(&recovered_address) {
+                        log::info!(
+                            "✅ Download authorized: Signer address {:?} verified for download key {}",
+                            recovered_address, payload.download_key
+                        );
+                        let mut cache_guard = signature_cache.lock().await;
+                        *cache_guard = Some(payload.signature.clone());
+                        signature_valid = true;
+                    } else {
+                        log::warn!(
+                            "❌ Signature mismatch / unauthorized for download key: {}. Recovered signer: {:?}, Expected owner: {:?} or session user: {:?}",
+                            payload.download_key,
+                            recovered_address,
+                            session_owner,
+                            session_user
+                        );
+                        return Err(format!(
+                            "Signer {:?} not authorized for download. Expected owner {:?} or user {:?}",
+                            recovered_address, session_owner, session_user
+                        ));
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "❌ Signature recovery failed for download key: {}. Error: '{}'. Expected signer: owner {:?} or session user: {:?}",
+                        payload.download_key,
+                        e,
+                        session_owner,
+                        session_user
+                    );
+                    return Err(format!("Signature recovery failed: {}", e));
+                }
+            }
         }
     }
-    // 3. (CACHE MISS) - 'cache_guard' vẫn đang giữ lock, và cache đang là None
-    // Chúng ta phải thả lock để chạy hàm blocking
-    drop(cache_guard);
-    let recovered_address =
-        run_recover_address_blocking(payload.download_key.clone(), payload.signature.clone())
-            .await?;
 
-    // Verify owner hoặc kiểm tra whitelist
-    if recovered_address != session_owner {
-        // Nếu không phải owner, kiểm tra xem có trong whitelist không
-        if whitelist.contains(&recovered_address) {
-            log::info!(
-                "✅ Download allowed: Address {:?} is in whitelist for file",
-                recovered_address
-            );
-        } else {
-            log::error!(
-                "❌ Not match file owner: {}, recovered address: {}, and not in whitelist",
-                session_owner, recovered_address
-            );
-            return Err("Signer address does not match file owner and is not in whitelist".to_string());
+    if !signature_valid {
+        return Err("Signature verification failed".to_string());
+    }
+
+    // 3. CHỈ KHOÁ/CHECK IP SAU KHI ĐÃ VERIFY CHỮ KÝ THÀNH CÔNG!
+    // Sử dụng OnceLock: lock-free, atomic, không mutex, không lo deadlock!
+    if !is_public {
+        let cached_ip = session_first_ip_arc.get_or_init(|| request_ip);
+        if *cached_ip != request_ip {
+            return Err(format!(
+                "IP address mismatch: session bound to {}, request from {}",
+                cached_ip, request_ip
+            ));
         }
     }
 
-    let mut cache_guard = signature_cache.lock().await;
-    if cache_guard.is_none() {
-        *cache_guard = Some(payload.signature.clone());
-    }
     Ok(true)
 }
 
@@ -312,6 +375,9 @@ pub async fn handle_download_request(
 
         let mut buf = vec![0u8; CHUNK_SIZE as usize];
         let n = file_handle.read_at(&mut buf, offset)?;
+        if n == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Chunk out of bounds or empty"));
+        }
         buf.truncate(n);
         
         Ok(buf)
@@ -358,16 +424,20 @@ pub async fn confirm_upload_batch(app: Arc<App>, contract_address: alloy::primit
     let pending_tx = contract.confirmServerUploadBatch(keys).send().await
         .map_err(|e| format!("Failed to send tx: {}", e))?;
 
-    let receipt = pending_tx.get_receipt().await
-        .map_err(|e| format!("Failed to get receipt: {}", e))?;
+    let receipt = tokio::time::timeout(
+        tokio::time::Duration::from_secs(60),
+        pending_tx.get_receipt()
+    ).await
+    .map_err(|_| "Timeout waiting for confirmServerUploadBatch receipt (60s)".to_string())?
+    .map_err(|e| format!("Failed to get receipt: {}", e))?;
 
     if receipt.status() {
         log::info!("✅ confirmServerUploadBatch success! TxHash: {}", receipt.transaction_hash);
+        Ok(())
     } else {
-        log::error!("❌ confirmServerUploadBatch failed! TxHash: {}", receipt.transaction_hash);
+        log::error!("❌ confirmServerUploadBatch reverted on-chain! TxHash: {}", receipt.transaction_hash);
+        Err(format!("confirmServerUploadBatch reverted on-chain! TxHash: {}", receipt.transaction_hash))
     }
-
-    Ok(())
 }
 
 pub async fn handle_confirm_download(
@@ -385,14 +455,17 @@ pub async fn handle_confirm_download(
         .send()
         .await?;
 
-    // Đợi transaction được mine
-    let receipt = pending_tx.get_receipt().await?;
+    let receipt = tokio::time::timeout(
+        tokio::time::Duration::from_secs(60),
+        pending_tx.get_receipt()
+    ).await
+    .map_err(|_| "Timeout waiting for confirmServerDownload receipt (60s)")??;
     
     if receipt.status() {
         log::info!("✅ confirmServerDownload success! TxHash: {}", receipt.transaction_hash);
+        Ok(())
     } else {
-        log::error!("❌ confirmServerDownload failed! TxHash: {}", receipt.transaction_hash);
+        log::error!("❌ confirmServerDownload reverted on-chain! TxHash: {}", receipt.transaction_hash);
+        Err(format!("confirmServerDownload reverted on-chain! TxHash: {}", receipt.transaction_hash).into())
     }
-    
-    Ok(())
 }

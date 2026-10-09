@@ -14,13 +14,26 @@ pub async fn initialize_download_session<'a>(
     download_key: &str,
     contract_address: alloy::primitives::Address,
     app: &'a Arc<App>,
-    request_ip: IpAddr,
+    _request_ip: IpAddr,
 ) -> Result<Ref<'a, String, DownloadSession>, String> {
+    let download_key_clean = download_key.trim_start_matches("0x").trim_start_matches("0X").to_lowercase();
     let timeout_duration = Duration::from_secs(app.config.session_timeout_seconds);
+
+    // 0. Kiểm tra contract hợp lệ
+    if !app.is_valid_contract(contract_address).await {
+        return Err(format!("Contract {} is not registered or invalid", contract_address));
+    }
+
+    // 1. Kiểm tra Negative Cache (chặn spam RPC bằng download key rác)
+    if let Some(entry) = app.invalid_download_keys.get(&download_key_clean) {
+        if entry.value().elapsed() < Duration::from_secs(30) {
+            return Err(format!("Download key '{}' is invalid (cached)", download_key_clean));
+        }
+    }
 
     // --- Logic xử lý Timeout (On-Access Expiration) ---
     let mut remove_key = false;
-    if let Some(session_ref) = app.download_cache.get(download_key) {
+    if let Some(session_ref) = app.download_cache.get(&download_key_clean) {
         if let Some(confirmed_at) = session_ref.confirmed_at {
             if confirmed_at.elapsed() > timeout_duration {
                 remove_key = true;
@@ -32,39 +45,59 @@ pub async fn initialize_download_session<'a>(
         log::info!(
             "Removing expired download key ({}s timeout): {}",
             app.config.session_timeout_seconds,
-            download_key
+            download_key_clean
         );
-        app.download_cache.remove(download_key);
+        app.download_cache.remove(&download_key_clean);
     }
-    if let Some(session_ref) = app.download_cache.get(download_key) {
+    if let Some(session_ref) = app.download_cache.get(&download_key_clean) {
         return Ok(session_ref);
     }
+
     // Khóa Mutex (luồng khác sẽ đợi ở đây)
     let lock_arc = {
         let entry = app
             .init_locks
-            .entry(download_key.to_string())
+            .entry(download_key_clean.clone())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
         Arc::clone(entry.value())
     };
-    // Khóa Mutex (luồng khác sẽ đợi ở đây)
     let _lock = lock_arc.lock().await;
+
+    // RAII guard đảm bảo xoá entry trong init_locks khi thoát khỏi hàm (cả thành công lẫn lỗi)
+    struct LockGuard<'b> {
+        locks: &'b dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+        key: &'b str,
+    }
+    impl<'b> Drop for LockGuard<'b> {
+        fn drop(&mut self) {
+            self.locks.remove(self.key);
+        }
+    }
+    let _cleanup_guard = LockGuard {
+        locks: &app.init_locks,
+        key: &download_key_clean,
+    };
+
     // DOUBLE CHECK: Sau khi có lock, kiểm tra lại cache lần nữa
-    if let Some(session_ref) = app.download_cache.get(download_key) {
+    if let Some(session_ref) = app.download_cache.get(&download_key_clean) {
         return Ok(session_ref);
     }
 
     // ----------- SLOW PATH (CHỈ MỘT LUỒNG CHẠY Ở ĐÂY) -----------
-    let download_key_clean = download_key.trim_start_matches("0x");
-    let download_key_bytes =
-        hex::decode(download_key_clean).map_err(|e| format!("Invalid download key hex: {}", e))?;
-
-    if download_key_bytes.len() != 32 {
-        return Err(format!(
-            "Invalid download key length: expected 32 bytes, got {} bytes",
-            download_key_bytes.len()
-        ));
-    }
+    let download_key_bytes = match hex::decode(&download_key_clean) {
+        Ok(b) if b.len() == 32 => b,
+        Ok(b) => {
+            app.invalid_download_keys.insert(download_key_clean.clone(), std::time::Instant::now());
+            return Err(format!(
+                "Invalid download key length: expected 32 bytes, got {} bytes",
+                b.len()
+            ));
+        }
+        Err(e) => {
+            app.invalid_download_keys.insert(download_key_clean.clone(), std::time::Instant::now());
+            return Err(format!("Invalid download key hex: {}", e));
+        }
+    };
 
     let download_key_b256 = B256::from_slice(&download_key_bytes);
     
@@ -86,12 +119,13 @@ pub async fn initialize_download_session<'a>(
     let rpc_mid = rpc_start.elapsed().as_millis();
 
     if session_info.fileKey == B256::ZERO {
+        app.invalid_download_keys.insert(download_key_clean.clone(), std::time::Instant::now());
         return Err(format!(
             "Download key '{}' not found on-chain",
-            download_key
+            download_key_clean
         ));
     } else if session_info.isConfirmed == true {
-        return Err(format!("Download key '{}' has expired", download_key));
+        return Err(format!("Download key '{}' has expired", download_key_clean));
     }
 
     // 4. Gọi các hàm liên quan đến file concurrently (tiết kiệm thời gian RTT)
@@ -114,7 +148,7 @@ pub async fn initialize_download_session<'a>(
     let rpc_total = rpc_start.elapsed().as_millis();
     if rpc_total > 500 {
         log::warn!("⚠️ [RPC_SLOW] getDownloadSessionInfo mất {}ms, concurrently fetch info mất thêm {}ms. (Total: {}ms) - download_key: {}", 
-            rpc_mid, rpc_total - rpc_mid, rpc_total, download_key);
+            rpc_mid, rpc_total - rpc_mid, rpc_total, download_key_clean);
     }
 
     let current_time_secs = SystemTime::now()
@@ -124,7 +158,7 @@ pub async fn initialize_download_session<'a>(
     if file_info_onchain.expireTime <= current_time_secs {
         return Err(format!("Download key has expired"));
     } else if file_info_onchain.status == FileStatus::Deleted {
-        return Err(format!("File  has been deleted"));
+        return Err(format!("File has been deleted"));
     }
     
     // Đường dẫn file
@@ -153,8 +187,10 @@ pub async fn initialize_download_session<'a>(
         file_key: file_key.clone(),
         contract_address,
         remaining_chunks: chunk_count,
+        total_chunks: file_info_onchain.totalChunks,
         file_owner: file_info_onchain.owner,
-        first_ip: request_ip,
+        session_user: session_info.user,
+        first_ip: Arc::new(std::sync::OnceLock::new()),
         confirmed_at: None,
         retry_remaining: chunk_count * 3,
         verified_signature: Arc::new(Mutex::new(None)),
@@ -164,14 +200,11 @@ pub async fn initialize_download_session<'a>(
         file_handle: Arc::new(bin_file),
     };
     // ✅ Insert vào cache
-    app.download_cache.insert(download_key.to_string(), session);
-    
-    // 🧹 DỌN DẸP: Xóa lock khỏi bộ nhớ sau khi khởi tạo xong để tránh rò rỉ RAM (Memory Leak)
-    app.init_locks.remove(download_key);
+    app.download_cache.insert(download_key_clean.clone(), session);
 
     // Trả về session từ cache
     app.download_cache
-        .get(download_key)
+        .get(&download_key_clean)
         .ok_or_else(|| "Failed to retrieve inserted session".to_string())
 
     // Lock sẽ tự động được giải phóng (_lock bị drop) khi hàm kết thúc
@@ -237,8 +270,9 @@ pub async fn list_chunks(file_path: &Path) -> Result<Vec<u64>, String> {
     Ok(chunks)
 }
 pub async fn descrease_chunk_count(download_key: &str, app: &Arc<App>) -> Result<u64, String> {
+    let download_key_clean = download_key.trim_start_matches("0x").trim_start_matches("0X").to_lowercase();
     let (remaining, should_confirm, contract_address) = {
-        let mut entry = match app.download_cache.entry(download_key.to_string()) {
+        let mut entry = match app.download_cache.entry(download_key_clean.clone()) {
             dashmap::mapref::entry::Entry::Occupied(o) => o,
             dashmap::mapref::entry::Entry::Vacant(_) => {
                 return Err("Download session not found".to_string())
@@ -261,14 +295,14 @@ pub async fn descrease_chunk_count(download_key: &str, app: &Arc<App>) -> Result
     if should_confirm {
         // Dùng try_send() cho bounded channel
         let contract_addr_str = contract_address.to_string();
-        if let Err(e) = app.confirmation_sender.try_send((download_key.to_string(), contract_addr_str.clone())) {
+        if let Err(e) = app.confirmation_sender.try_send((download_key_clean.clone(), contract_addr_str.clone())) {
             match e {
                 tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                    log::warn!("⚠️ Confirmation queue full! Falling back to disk for {}", download_key);
+                    log::warn!("⚠️ Confirmation queue full! Falling back to disk for {}", download_key_clean);
                     // Ghi ra file pending trên đĩa cứng
                     let pending_file_path = app.storage_root.join("pending_confirmations.txt");
                     // Dùng tokio::task::spawn để không block luồng hiện tại
-                    let key_to_write = download_key.to_string();
+                    let key_to_write = download_key_clean.clone();
                     tokio::spawn(async move {
                         let mut file = match tokio::fs::OpenOptions::new()
                             .create(true)

@@ -2,9 +2,8 @@ server-file/target
 server-file/log_*
 server-file/storage_7081
 server-file/storage_7082
-
-
-
+server-file/.env*
+!server-file/.env.example
 server-file/certificate.pem
 server-file/private.key
 server-file/fullchain.crt

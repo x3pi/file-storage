@@ -175,17 +175,14 @@ async fn handle_download_chunk(
     _chunk_data_in: Vec<u8>,
 ) {
     let resp_command = "chunk_response";
-    let payload: WtDownloadPayload = match serde_json::from_value(req.payload.clone()) {
+    let mut payload: WtDownloadPayload = match serde_json::from_value(req.payload.clone()) {
         Ok(p) => p,
         Err(e) => {
             let _ = send_error_frame(&mut send, &req.id, resp_command, &format!("invalid payload: {}", e)).await;
             return;
         }
     };
-    if payload.download_key.starts_with("0x") {
-        let _ = send_error_frame(&mut send, &req.id, resp_command, "Invalid format: download_key must not start with '0x'").await;
-        return;
-    }
+    payload.download_key = payload.download_key.trim_start_matches("0x").trim_start_matches("0X").to_lowercase();
 
     // --- Xây dựng payload để tái dụng business logic hiện có ---
     let mut dl_payload = DownloadChunkPayload {
@@ -265,7 +262,7 @@ async fn handle_upload_chunk(
     chunk_data_in: Vec<u8>,
 ) {
     let resp_command = "chunk_response";
-    let payload: crate::models::UploadChunkPayload = match serde_json::from_value(req.payload.clone()) {
+    let mut payload: crate::models::UploadChunkPayload = match serde_json::from_value(req.payload.clone()) {
         Ok(p) => p,
         Err(e) => {
             let _ = send_error_frame(&mut send, &req.id, resp_command, &format!("invalid payload: {}", e)).await;
@@ -273,11 +270,8 @@ async fn handle_upload_chunk(
         }
     };
     
-    // Đảm bảo file_key thống nhất không có '0x' ở đầu
-    if payload.file_key.starts_with("0x") {
-        let _ = send_error_frame(&mut send, &req.id, resp_command, "Invalid format: file_key must not start with '0x'").await;
-        return;
-    }
+    // Đảm bảo file_key thống nhất viết thường và không có '0x' ở đầu
+    payload.file_key = payload.file_key.trim_start_matches("0x").trim_start_matches("0X").to_lowercase();
 
     if chunk_data_in.is_empty() {
         let _ = send_error_frame(&mut send, &req.id, resp_command, "chunk data is empty").await;
@@ -305,18 +299,29 @@ async fn handle_upload_chunk(
                     let _ = send_chunk_frame(&mut send, &req.id, resp_command, payload.chunk_index, &[]).await;
                     
                     // --- THÊM LOGIC TRACKING CHUNKS GIỐNG NHƯ RAW QUIC ---
-                    if let Some(cache_entry) = app.upload_file_cache.get(&payload.file_key) {
-                        let total_chunks = cache_entry.total_chunks;
-                        let expected_chunks = if payload.chunk_index % 2 == 0 {
+                    let (total_chunks, contract_addr) = if let Some(cache_entry) = app.upload_file_cache.get(&payload.file_key) {
+                        (cache_entry.total_chunks, cache_entry.contract_address)
+                    } else {
+                        (0, alloy::primitives::Address::ZERO)
+                    };
+
+                    if total_chunks > 0 {
+                        // SVR-4: Xử lý Edge Case chẵn/lẻ khi file chỉ có 1 chunk (total_chunks = 1)
+                        let expected_chunks = if total_chunks == 1 {
+                            if payload.chunk_index == 0 { 1 } else { 0 }
+                        } else if payload.chunk_index % 2 == 0 {
                             (total_chunks + 1) / 2
                         } else {
                             total_chunks / 2
                         };
 
+                        if expected_chunks == 0 {
+                            log::warn!("[WT][{}] ⚠️ Unexpected chunk {} for total_chunks {}", peer_ip, payload.chunk_index, total_chunks);
+                            return;
+                        }
+
                         let is_completed = {
-                            let mut set = app.chunk_tracker
-                                .entry(payload.file_key.clone())
-                                .or_insert_with(std::collections::HashSet::new);
+                            let mut set = app.get_or_init_chunk_tracker(&payload.file_key);
                             set.insert(payload.chunk_index);
                             set.len() as u64 == expected_chunks
                         };
@@ -324,14 +329,14 @@ async fn handle_upload_chunk(
                         if is_completed {
                             if let Some((_, _)) = app.chunk_tracker.remove(&payload.file_key) {
                                 log::info!("[WT][{}] 🎯 File {} fully received for this node ({} / {} total chunks). Queueing for confirm.", peer_ip, payload.file_key, expected_chunks, total_chunks);
-                                let contract_addr = if let Some(info) = app.upload_file_cache.get(&payload.file_key) {
-                                    log::info!("Extracted contract_addr from cache: {}", info.contract_address);
-                                    info.contract_address
-                                } else {
-                                    log::error!("CACHE MISS for {}! Cannot confirm.", payload.file_key);
-                                    let _ = send_error_frame(&mut send, &req.id, resp_command, "Cache miss for contract address").await;
-                                    return;
-                                };
+                                log::info!("Extracted contract_addr from cache: {}", contract_addr);
+                                // Ghi file pending_uploads.txt để phòng khi crash/restart
+                                let pending_file_path = app.storage_root.join("pending_uploads.txt");
+                                let line = format!("{},{}\n", payload.file_key, contract_addr);
+                                use tokio::io::AsyncWriteExt;
+                                if let Ok(mut file) = tokio::fs::OpenOptions::new().create(true).append(true).open(&pending_file_path).await {
+                                    let _ = file.write_all(line.as_bytes()).await;
+                                }
                                 let _ = app.upload_batch_sender.send((payload.file_key.clone(), contract_addr)).await;
                             }
                         }
@@ -362,21 +367,22 @@ async fn handle_upload_chunk(
 
 /// Đọc frame: [4 byte BE uint32 length][2 byte BE json len][JSON][DATA]
 async fn read_frame(stream: &mut wtransport::RecvStream) -> Result<(Vec<u8>, Vec<u8>), String> {
+    use tokio::time::{timeout, Duration};
     let mut len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut len_buf)
+    timeout(Duration::from_secs(15), stream.read_exact(&mut len_buf))
         .await
+        .map_err(|_| "read length timeout (15s)".to_string())?
         .map_err(|e| format!("read length: {}", e))?;
 
     let length = u32::from_be_bytes(len_buf) as usize;
-    if length < 2 || length > 10 * 1024 * 1024 { // 10MB max
+    if length < 2 || length > 2 * 1024 * 1024 { // 2MB max
         return Err(format!("invalid frame length: {}", length));
     }
 
     let mut json_len_buf = [0u8; 2];
-    stream
-        .read_exact(&mut json_len_buf)
+    timeout(Duration::from_secs(15), stream.read_exact(&mut json_len_buf))
         .await
+        .map_err(|_| "read json length timeout (15s)".to_string())?
         .map_err(|e| format!("read json length: {}", e))?;
     
     let json_len = u16::from_be_bytes(json_len_buf) as usize;
@@ -385,17 +391,17 @@ async fn read_frame(stream: &mut wtransport::RecvStream) -> Result<(Vec<u8>, Vec
     }
 
     let mut json_bytes = vec![0u8; json_len];
-    stream
-        .read_exact(&mut json_bytes)
+    timeout(Duration::from_secs(15), stream.read_exact(&mut json_bytes))
         .await
+        .map_err(|_| "read json payload timeout (15s)".to_string())?
         .map_err(|e| format!("read json payload: {}", e))?;
 
     let data_len = length - 2 - json_len;
     let mut data_bytes = vec![0u8; data_len];
     if data_len > 0 {
-        stream
-            .read_exact(&mut data_bytes)
+        timeout(Duration::from_secs(15), stream.read_exact(&mut data_bytes))
             .await
+            .map_err(|_| "read data payload timeout (15s)".to_string())?
             .map_err(|e| format!("read data payload: {}", e))?;
     }
     

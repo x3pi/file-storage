@@ -30,13 +30,16 @@ async fn listen_download_confirmed_internal(app: Arc<App>) -> Result<(), String>
     loop {
         let current_block = get_block_number(&app).await.unwrap_or(last_block);
         if current_block > last_block {
+            // Giới hạn tối đa 500 block mỗi lần quét để tránh vượt quá limit của RPC khi vừa khởi động lại
+            let to_block = current_block.min(last_block + 500);
+
             // ⚠️ FIX: Đợi 2500ms để custom chain kịp ghi block hash và index log vào DB.
             // Tránh lỗi race condition: getBlockNumber trả về block mới nhưng getLogs lại trả về null.
             tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
 
             let filter = Filter::new()
                 .from_block(last_block + 1)
-                .to_block(current_block)
+                .to_block(to_block)
                 .event_signature(vec![
                     DownloadKeyConfirmed::SIGNATURE_HASH,
                     FileActivated::SIGNATURE_HASH,
@@ -59,14 +62,17 @@ async fn listen_download_confirmed_internal(app: Arc<App>) -> Result<(), String>
                 params: vec![&filter],
             };
             
+            let mut poll_succeeded = false;
             if let Ok(response) = app.http_client.post(&app.config.rpc_url).json(&req).send().await {
                 if let Ok(json) = response.json::<serde_json::Value>().await {
                     if let Some(result) = json.get("result") {
                         if result.is_null() {
                             // Custom chain trả về null => Không có log nào
+                            poll_succeeded = true;
                         } else {
                             match serde_json::from_value::<Vec<alloy::rpc::types::eth::Log>>(result.clone()) {
                                 Ok(logs) => {
+                                    poll_succeeded = true;
                                     for log in logs {
                                         log::info!("🔍 [EVENT DEBUG] Received a log from address: {}", log.address());
                                         let is_valid = app.is_valid_contract(log.address()).await;
@@ -96,11 +102,15 @@ async fn listen_download_confirmed_internal(app: Arc<App>) -> Result<(), String>
                     }
                 }
             } else {
-                log::warn!("⚠️ [EVENT DEBUG] Failed to send get_logs HTTP request for blocks {} to {}", last_block + 1, current_block);
+                log::warn!("⚠️ [EVENT DEBUG] Failed to send get_logs HTTP request for blocks {} to {}", last_block + 1, to_block);
             }
             
-            // Cập nhật last_block
-            last_block = current_block;
+            // Cập nhật last_block CHỈ KHI lấy log thành công
+            if poll_succeeded {
+                last_block = to_block;
+            } else {
+                log::warn!("⚠️ [EVENT RETRY] get_logs failed for blocks {} to {}. Will retry next poll.", last_block + 1, to_block);
+            }
         }
 
         // Poll mỗi 2 giây

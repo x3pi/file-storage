@@ -34,19 +34,9 @@ async fn main() {
     let port = server_addr.split(':').last().unwrap_or("unknown");
     let log_dir_path = format!("log_{}", port); // Định nghĩa đường dẫn thư mục log
 
-    if fs::metadata(&log_dir_path).is_ok() {
-        if let Err(e) = fs::remove_dir_all(&log_dir_path) {
-            // Dùng eprintln! vì logger chưa được khởi tạo
-            eprintln!(
-                "⚠️ Warning: Could not remove old log directory '{}': {}. Tiếp tục...",
-                log_dir_path, e
-            );
-        } else {
-            eprintln!(
-                "♻️ Successfully removed old log directory: {}",
-                log_dir_path
-            );
-        }
+    // Đảm bảo thư mục log tồn tại mà không xoá lịch sử log cũ
+    if let Err(e) = fs::create_dir_all(&log_dir_path) {
+        eprintln!("⚠️ Warning: Could not create log directory '{}': {}", log_dir_path, e);
     }
 
     let _logger = Logger::try_with_env_or_str("info, alloy_transport_ws=off, alloy_rpc_client=off") // Ẩn log của alloy để tránh spam khi mất kết nối
@@ -138,6 +128,17 @@ async fn main() {
         log::error!("💀💀💀 CRITICAL: Event listener died unexpectedly!");
     });
 
+    // Spawn registry sync worker (mỗi 10 phút)
+    let app_clone = app.clone();
+    tokio::spawn(async move {
+        app_clone.sync_registry_contracts().await;
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(600));
+        loop {
+            interval.tick().await;
+            app_clone.sync_registry_contracts().await;
+        }
+    });
+
     // ==========================================
     // TRANSACTION MANAGER (SINGLE WORKER)
     // ==========================================
@@ -166,8 +167,28 @@ async fn main() {
                     
                     for (addr, current_batch) in batches {
                         log::info!("🚀 [TX Manager] Priority Upload Confirm ({} files) for contract {}", current_batch.len(), addr);
-                        if let Err(e) = crate::ethereum::confirm_upload_batch(app_clone.clone(), addr, current_batch).await {
-                            log::error!("❌ [TX Manager] confirm_upload_batch error: {}", e);
+                        match crate::ethereum::confirm_upload_batch(app_clone.clone(), addr, current_batch.clone()).await {
+                            Ok(()) => {
+                                let pending_file_path = app_clone.storage_root.join("pending_uploads.txt");
+                                if let Ok(content) = tokio::fs::read_to_string(&pending_file_path).await {
+                                    let remaining_lines: Vec<&str> = content
+                                        .lines()
+                                        .filter(|line| {
+                                            let parts: Vec<&str> = line.trim().split(',').collect();
+                                            !parts.is_empty() && !current_batch.contains(&parts[0].to_string())
+                                        })
+                                        .collect();
+                                    let new_content = if remaining_lines.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!("{}\n", remaining_lines.join("\n"))
+                                    };
+                                    let _ = tokio::fs::write(&pending_file_path, new_content).await;
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("❌ [TX Manager] confirm_upload_batch error: {}", e);
+                            }
                         }
                     }
                 }
@@ -276,6 +297,7 @@ async fn main() {
 
     crate::sweeper::spawn_background_sweeper(app.clone());
     crate::sweeper::spawn_confirmation_retry_worker(app.clone());
+    crate::sweeper::spawn_upload_retry_worker(app.clone());
 
     let app_for_wt = app.clone();
     tokio::spawn(async move {

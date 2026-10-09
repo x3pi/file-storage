@@ -39,7 +39,8 @@ pub struct App {
     pub chunk_tracker: ChunkTracker,
     pub upload_batch_sender: UploadBatchSender,
     pub upload_batch_receiver: Arc<Mutex<UploadBatchReceiver>>,
-    pub valid_contracts_cache: Arc<DashMap<Address, bool>>,
+    pub valid_contracts_cache: Arc<DashMap<Address, (bool, std::time::Instant)>>,
+    pub invalid_download_keys: Arc<DashMap<String, std::time::Instant>>,
     pub http_client: alloy::transports::http::Client,
 }
 
@@ -83,6 +84,7 @@ impl App {
             upload_batch_sender,
             upload_batch_receiver: Arc::new(Mutex::new(upload_batch_receiver)),
             valid_contracts_cache: Arc::new(DashMap::new()),
+            invalid_download_keys: Arc::new(DashMap::new()),
             http_client,
         })
     }
@@ -115,10 +117,20 @@ impl App {
         Ok(FilesInstance::new(contract_address, provider))
     }
 
-    /// Check nếu một contract address là hợp lệ bằng cách gọi lên Registry
+    /// Check nếu một contract address là hợp lệ bằng cách gọi lên Registry với TTL cache
     pub async fn is_valid_contract(&self, contract_address: Address) -> bool {
-        if let Some(is_valid) = self.valid_contracts_cache.get(&contract_address) {
-            return *is_valid.value();
+        if let Some(entry) = self.valid_contracts_cache.get(&contract_address) {
+            let (is_valid, timestamp) = *entry.value();
+            // Contract hợp lệ cache lâu (4 giờ) để tránh gọi RPC lặp lại
+            // Địa chỉ rác cache ngắn (60 giây) để chặn spam DoS
+            let ttl = if is_valid {
+                std::time::Duration::from_secs(4 * 3600)
+            } else {
+                std::time::Duration::from_secs(60)
+            };
+            if timestamp.elapsed() < ttl {
+                return is_valid;
+            }
         }
 
         // Dùng interface từ file registry_contract.rs
@@ -137,15 +149,56 @@ impl App {
         match registry.isContractValid(contract_address).call().await {
             Ok(result) => {
                 let is_valid = result;
-                if is_valid {
-                    log::info!("insert contract: {}", contract_address);
-                    self.valid_contracts_cache.insert(contract_address, true);
-                }
+                log::info!("Contract {} is_valid: {}", contract_address, is_valid);
+                self.valid_contracts_cache.insert(contract_address, (is_valid, std::time::Instant::now()));
                 is_valid
             }
             Err(e) => {
                 log::error!("❌ Error calling registry isContractValid: {}", e);
                 false
+            }
+        }
+    }
+
+    /// Đồng bộ danh sách contract hợp lệ từ Registry định kỳ
+    pub async fn sync_registry_contracts(&self) {
+        let url = match Url::parse(&self.config.rpc_url) {
+            Ok(u) => u,
+            Err(e) => {
+                log::error!("❌ [Registry Sync] Invalid RPC URL: {}", e);
+                return;
+            }
+        };
+        let http_transport = Http::with_client(self.http_client.clone(), url);
+        let rpc_client = RpcClient::new(http_transport, true);
+        let provider = RootProvider::<alloy::network::Ethereum>::new(rpc_client);
+
+        let registry = crate::contracts::registry_contract::Registry::new(self.config.registry_address, provider);
+        match registry.getRegisteredContracts(alloy::primitives::U256::ZERO, alloy::primitives::U256::from(500)).call().await {
+            Ok(contracts) => {
+                let now = std::time::Instant::now();
+                use std::collections::HashSet;
+                let active_set: HashSet<Address> = contracts.iter().copied().collect();
+
+                // 1. Cập nhật các contract active vào cache với TTL mới
+                for addr in &contracts {
+                    self.valid_contracts_cache.insert(*addr, (true, now));
+                }
+
+                // 2. Dọn sạch các contract đã bị deregister khỏi Registry
+                self.valid_contracts_cache.retain(|addr, (is_valid, _)| {
+                    if *is_valid && !active_set.contains(addr) {
+                        log::warn!("🚫 Contract {} was deregistered on Registry. Removing from cache.", addr);
+                        false
+                    } else {
+                        true
+                    }
+                });
+
+                log::info!("🔄 [Registry Sync] Synced {} active contracts from registry successfully", contracts.len());
+            }
+            Err(e) => {
+                log::warn!("⚠️ [Registry Sync] Failed to fetch registered contracts: {}", e);
             }
         }
     }
@@ -200,5 +253,27 @@ impl App {
         .await
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Task join error: {}", e)))
         .and_then(|inner_result| inner_result)
+    }
+
+    pub fn get_or_init_chunk_tracker(&self, file_key: &str) -> dashmap::mapref::one::RefMut<'_, String, std::collections::HashSet<u64>> {
+        self.chunk_tracker.entry(file_key.to_string()).or_insert_with(|| {
+            let mut existing = std::collections::HashSet::new();
+            if file_key.len() >= 4 {
+                let level1 = &file_key[0..2];
+                let level2 = &file_key[2..4];
+                let file_dir: PathBuf = self.storage_root.join(level1).join(level2).join(file_key);
+                let meta_path = file_dir.join(format!("{}.meta", file_key));
+                if meta_path.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&meta_path) {
+                        for line in content.lines() {
+                            if let Ok(idx) = line.trim().parse::<u64>() {
+                                existing.insert(idx);
+                            }
+                        }
+                    }
+                }
+            }
+            existing
+        })
     }
 }
