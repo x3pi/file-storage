@@ -23,9 +23,6 @@ use url::Url;
 // Import contract bindings từ file_contract.rs
 use crate::contracts::file_contract::Files::FilesInstance;
 
-// Thời gian lưu cache cho các download_key không hợp lệ (Negative Caching)
-pub const INVALID_KEY_CACHE_TTL_SECS: u64 = 120;
-
 /// App chứa tất cả các thành phần cốt lõi của ứng dụng.
 pub struct App {
     pub config: AppConfig,
@@ -42,38 +39,12 @@ pub struct App {
     pub chunk_tracker: ChunkTracker,
     pub upload_batch_sender: UploadBatchSender,
     pub upload_batch_receiver: Arc<Mutex<UploadBatchReceiver>>,
-    pub valid_contracts_cache: Arc<DashMap<Address, bool>>,
+    pub valid_contracts_cache: Arc<DashMap<Address, (bool, std::time::Instant)>>,
     pub invalid_download_keys: Arc<DashMap<String, std::time::Instant>>,
     pub http_client: alloy::transports::http::Client,
 }
 
-pub struct InitLockGuard {
-    locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
-    key: String,
-}
-
-impl Drop for InitLockGuard {
-    fn drop(&mut self) {
-        self.locks.remove(&self.key);
-    }
-}
-
 impl App {
-    pub fn acquire_init_lock(&self, key: String) -> (Arc<Mutex<()>>, InitLockGuard) {
-        let lock_arc = {
-            let entry = self
-                .init_locks
-                .entry(key.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(())));
-            Arc::clone(entry.value())
-        };
-        let guard = InitLockGuard {
-            locks: self.init_locks.clone(),
-            key,
-        };
-        (lock_arc, guard)
-    }
-
     pub async fn setup(log_dir: PathBuf) -> Result<Self> {
         let config = AppConfig::from_env()?;
         let storage_root = PathBuf::from(&config.storage_root);
@@ -88,7 +59,7 @@ impl App {
         // [LOAD TEST] Bỏ giới hạn luồng để kiểm thử tải tối đa.
         // Dùng Semaphore::MAX_PERMITS để không giới hạn số luồng đồng thời.
         // let semaphore_limit = tokio::sync::Semaphore::MAX_PERMITS;
-        let semaphore_limit = 10000;
+        let semaphore_limit = 3000;
         let task_semaphore = Arc::new(Semaphore::new(semaphore_limit));
         
         // Khởi tạo HTTP Client 1 lần duy nhất để dùng chung Connection Pool (tránh lỗi TCP Handshake 700ms)
@@ -146,10 +117,20 @@ impl App {
         Ok(FilesInstance::new(contract_address, provider))
     }
 
-    /// Check nếu một contract address là hợp lệ bằng cách gọi lên Registry
+    /// Check nếu một contract address là hợp lệ bằng cách gọi lên Registry với TTL cache
     pub async fn is_valid_contract(&self, contract_address: Address) -> bool {
-        if let Some(is_valid) = self.valid_contracts_cache.get(&contract_address) {
-            return *is_valid.value();
+        if let Some(entry) = self.valid_contracts_cache.get(&contract_address) {
+            let (is_valid, timestamp) = *entry.value();
+            // Contract hợp lệ cache lâu (4 giờ) để tránh gọi RPC lặp lại
+            // Địa chỉ rác cache ngắn (60 giây) để chặn spam DoS
+            let ttl = if is_valid {
+                std::time::Duration::from_secs(4 * 3600)
+            } else {
+                std::time::Duration::from_secs(60)
+            };
+            if timestamp.elapsed() < ttl {
+                return is_valid;
+            }
         }
 
         // Dùng interface từ file registry_contract.rs
@@ -168,10 +149,8 @@ impl App {
         match registry.isContractValid(contract_address).call().await {
             Ok(result) => {
                 let is_valid = result;
-                self.valid_contracts_cache.insert(contract_address, is_valid);
-                if is_valid {
-                    log::info!("insert contract: {}", contract_address);
-                }
+                log::info!("Contract {} is_valid: {}", contract_address, is_valid);
+                self.valid_contracts_cache.insert(contract_address, (is_valid, std::time::Instant::now()));
                 is_valid
             }
             Err(e) => {
@@ -181,19 +160,56 @@ impl App {
         }
     }
 
+    /// Đồng bộ danh sách contract hợp lệ từ Registry định kỳ
+    pub async fn sync_registry_contracts(&self) {
+        let url = match Url::parse(&self.config.rpc_url) {
+            Ok(u) => u,
+            Err(e) => {
+                log::error!("❌ [Registry Sync] Invalid RPC URL: {}", e);
+                return;
+            }
+        };
+        let http_transport = Http::with_client(self.http_client.clone(), url);
+        let rpc_client = RpcClient::new(http_transport, true);
+        let provider = RootProvider::<alloy::network::Ethereum>::new(rpc_client);
+
+        let registry = crate::contracts::registry_contract::Registry::new(self.config.registry_address, provider);
+        match registry.getRegisteredContracts(alloy::primitives::U256::ZERO, alloy::primitives::U256::from(500)).call().await {
+            Ok(contracts) => {
+                let now = std::time::Instant::now();
+                use std::collections::HashSet;
+                let active_set: HashSet<Address> = contracts.iter().copied().collect();
+
+                // 1. Cập nhật các contract active vào cache với TTL mới
+                for addr in &contracts {
+                    self.valid_contracts_cache.insert(*addr, (true, now));
+                }
+
+                // 2. Dọn sạch các contract đã bị deregister khỏi Registry
+                self.valid_contracts_cache.retain(|addr, (is_valid, _)| {
+                    if *is_valid && !active_set.contains(addr) {
+                        log::warn!("🚫 Contract {} was deregistered on Registry. Removing from cache.", addr);
+                        false
+                    } else {
+                        true
+                    }
+                });
+
+                log::info!("🔄 [Registry Sync] Synced {} active contracts from registry successfully", contracts.len());
+            }
+            Err(e) => {
+                log::warn!("⚠️ [Registry Sync] Failed to fetch registered contracts: {}", e);
+            }
+        }
+    }
+
     pub async fn write_chunk(&self, file_key: &str, chunk_index: u64, chunk_data: &[u8]) -> Result<(), std::io::Error> {
-        let file_key_owned = file_key.trim_start_matches("0x").to_lowercase();
+        let file_key_owned = file_key.to_string();
         let chunk_data_owned = chunk_data.to_vec();
         let file_cache = self.file_cache.clone();
         let storage_root = self.storage_root.clone();
 
         tokio::task::spawn_blocking(move || {
-            if file_key_owned.len() < 4 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Invalid file key length",
-                ));
-            }
             let level1 = &file_key_owned[0..2];
             let level2 = &file_key_owned[2..4];
             let file_dir: PathBuf = storage_root.join(level1).join(level2).join(&file_key_owned);
@@ -209,36 +225,27 @@ impl App {
             let open_files = if let Some(files) = file_cache.get(&file_key_owned) {
                 files.value().clone()
             } else {
-                let bin_file = OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .open(&bin_path)?;
-                let meta_file = OpenOptions::new()
-                    .append(true)
-                    .create(true)
-                    .open(&meta_path)?;
-                let new_open_files = crate::models::OpenFiles {
-                    bin_file: std::sync::Arc::new(bin_file),
-                    meta_file: std::sync::Arc::new(std::sync::Mutex::new(meta_file)),
-                };
-                file_cache.insert(file_key_owned.clone(), new_open_files.clone());
-                new_open_files
+                file_cache.entry(file_key_owned.clone()).or_insert_with(|| {
+                    let bin_file = OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .open(&bin_path).unwrap();
+                    let meta_file = OpenOptions::new()
+                        .append(true)
+                        .create(true)
+                        .open(&meta_path).unwrap();
+                    crate::models::OpenFiles {
+                        bin_file: std::sync::Arc::new(bin_file),
+                        meta_file: std::sync::Arc::new(std::sync::Mutex::new(meta_file)),
+                    }
+                }).value().clone()
             };
 
-            let chunk_size = crate::models::CHUNK_SIZE; // 1MB
-            if chunk_data_owned.len() > chunk_size as usize {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Chunk size exceeds 1MB limit",
-                ));
-            }
-            let offset = chunk_index
-                .checked_mul(chunk_size)
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Offset calculation overflowed"))?;
+            let chunk_size = 1024 * 1024; // 1MB
+            let offset = chunk_index * chunk_size;
             open_files.bin_file.write_all_at(&chunk_data_owned, offset)?;
 
-            let mut meta_file_guard = open_files.meta_file.lock()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Mutex poison error: {}", e)))?;
+            let mut meta_file_guard = open_files.meta_file.lock().unwrap();
             meta_file_guard.write_all(format!("{}\n", chunk_index).as_bytes())?;
 
             Ok(())
@@ -246,5 +253,27 @@ impl App {
         .await
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Task join error: {}", e)))
         .and_then(|inner_result| inner_result)
+    }
+
+    pub fn get_or_init_chunk_tracker(&self, file_key: &str) -> dashmap::mapref::one::RefMut<'_, String, std::collections::HashSet<u64>> {
+        self.chunk_tracker.entry(file_key.to_string()).or_insert_with(|| {
+            let mut existing = std::collections::HashSet::new();
+            if file_key.len() >= 4 {
+                let level1 = &file_key[0..2];
+                let level2 = &file_key[2..4];
+                let file_dir: PathBuf = self.storage_root.join(level1).join(level2).join(file_key);
+                let meta_path = file_dir.join(format!("{}.meta", file_key));
+                if meta_path.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&meta_path) {
+                        for line in content.lines() {
+                            if let Ok(idx) = line.trim().parse::<u64>() {
+                                existing.insert(idx);
+                            }
+                        }
+                    }
+                }
+            }
+            existing
+        })
     }
 }

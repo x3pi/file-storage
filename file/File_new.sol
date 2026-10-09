@@ -26,18 +26,6 @@ struct Info {
     FileStatus status;
 }
 
-struct FileProgress {
-    bytes32 lastChunkHash;
-    uint64 processedChunks;
-    uint256 processedLength;
-}
-
-struct FileInfo {
-    Info info;
-    FileProgress progress;
-    mapping(uint256 => bytes) chunks;
-}
-
 struct DownloadSession {
     bytes32 fileKey;
     address user;
@@ -73,8 +61,7 @@ contract Files is Initializable, UUPSUpgradeable {
     // --- STORAGE ---
     string[] public rustServerAddresses;
 
-    mapping(bytes32 => FileInfo) public mKeyToFileInfo;
-    mapping(string => bytes32) public mNameToFileKey;
+    mapping(bytes32 => Info) public mKeyToFileInfo;
     mapping(bytes32 => DownloadSession) public mDownloadKeyToSession;
 
     // --- File Permissions (Whitelist & Public status) ---
@@ -282,6 +269,8 @@ contract Files is Initializable, UUPSUpgradeable {
     function pushFileInfo(
         Info memory info
     ) public payable virtual returns (bytes32 fileKey) {
+        require(info.totalChunks > 0, "totalChunks must be > 0");
+        require(info.contentLen > 0, "contentLen must be > 0");
         require(
             info.expireTime > block.timestamp + 1 days,
             "Expire time error"
@@ -305,13 +294,12 @@ contract Files is Initializable, UUPSUpgradeable {
             )
         );
 
-        mNameToFileKey[info.name] = fileKey;
         require(
-            mKeyToFileInfo[fileKey].info.merkleRoot == bytes32(0),
+            mKeyToFileInfo[fileKey].merkleRoot == bytes32(0),
             "File exists"
         );
 
-        mKeyToFileInfo[fileKey].info = Info({
+        mKeyToFileInfo[fileKey] = Info({
             owner: msg.sender,
             merkleRoot: info.merkleRoot,
             contentLen: info.contentLen,
@@ -322,12 +310,6 @@ contract Files is Initializable, UUPSUpgradeable {
             status: FileStatus.Processing,
             contentDisposition: info.contentDisposition,
             contentID: info.contentID
-        });
-
-        mKeyToFileInfo[fileKey].progress = FileProgress({
-            lastChunkHash: bytes32(0),
-            processedChunks: 0,
-            processedLength: 0
         });
 
         emit FileAdded(fileKey, info.name, info.contentLen);
@@ -341,37 +323,12 @@ contract Files is Initializable, UUPSUpgradeable {
         return fileKey;
     }
 
-    function getFileKeyFromName(
-        string[] memory names
-    ) external view virtual returns (bytes32[] memory) {
-        bytes32[] memory filekeys = new bytes32[](names.length);
-        for (uint256 i; i < names.length; i++) {
-            filekeys[i] = mNameToFileKey[names[i]];
-        }
-        return filekeys;
-    }
-
-    function uploadChunk(
-        bytes32 fileKey,
-        bytes memory chunkData,
-        uint256 chunkIndex,
-        bytes32[] memory merkleProof
-    ) public virtual {
-        // Logic upload chunk (bạn chưa viết logic ở code gốc, nhưng cứ để virtual)
-    }
-
     function deleteFile(bytes32 fileKey) external virtual {
-        FileInfo storage file = mKeyToFileInfo[fileKey];
-        require(file.info.owner == msg.sender, "Caller is not the owner");
-        require(file.info.status != FileStatus.Deleted, "File already deleted");
+        Info storage file = mKeyToFileInfo[fileKey];
+        require(file.owner == msg.sender, "Caller is not the owner");
+        require(file.status != FileStatus.Deleted, "File already deleted");
 
-        delete mNameToFileKey[file.info.name];
-        file.info.status = FileStatus.Deleted;
-
-        for (uint256 i = 0; i < file.info.totalChunks; i++) {
-            delete file.chunks[i];
-        }
-        delete file.progress;
+        file.status = FileStatus.Deleted;
         emit FileDeleted(fileKey);
     }
 
@@ -379,17 +336,17 @@ contract Files is Initializable, UUPSUpgradeable {
         bytes32 fileKey,
         uint64 _newExpireTime
     ) external virtual {
-        FileInfo storage file = mKeyToFileInfo[fileKey];
-        require(file.info.owner == msg.sender, "Caller is not the owner");
-        require(file.info.status != FileStatus.Deleted, "Deleted");
+        Info storage file = mKeyToFileInfo[fileKey];
+        require(file.owner == msg.sender, "Caller is not the owner");
+        require(file.status != FileStatus.Deleted, "Deleted");
         require(_newExpireTime > block.timestamp + 1 days, "Time error");
-        file.info.expireTime = _newExpireTime;
+        file.expireTime = _newExpireTime;
     }
 
     function getFileInfo(
         bytes32 fileKey
     ) external view virtual returns (Info memory) {
-        return mKeyToFileInfo[fileKey].info;
+        return mKeyToFileInfo[fileKey];
     }
 
     function getFilesInfo(
@@ -397,31 +354,8 @@ contract Files is Initializable, UUPSUpgradeable {
     ) external view virtual returns (Info[] memory infos) {
         infos = new Info[](fileKeys.length);
         for (uint256 i = 0; i < fileKeys.length; i++) {
-            infos[i] = mKeyToFileInfo[fileKeys[i]].info;
+            infos[i] = mKeyToFileInfo[fileKeys[i]];
         }
-    }
-
-    function getFileProgress(
-        bytes32 fileKey
-    ) external view virtual returns (FileProgress memory) {
-        FileInfo storage file = mKeyToFileInfo[fileKey];
-        require(file.info.status == FileStatus.Processing, "Not exists");
-        return mKeyToFileInfo[fileKey].progress;
-    }
-
-    function downloadFile(
-        bytes32 fileKey,
-        uint256 start,
-        uint256 limit
-    ) public virtual {
-        // Logic download
-    }
-
-    function confirmFileActive(bytes32 fileKey) external virtual {
-        FileInfo storage file = mKeyToFileInfo[fileKey];
-        require(file.info.status == FileStatus.Processing, "Not processing");
-        file.info.status = FileStatus.Active;
-        emit FileActivated(file.info.owner, fileKey);
     }
 
     // HÀM QUAN TRỌNG: Logic thanh toán rất hay thay đổi
@@ -430,11 +364,11 @@ contract Files is Initializable, UUPSUpgradeable {
         uint256 downloadTimes
     ) external payable virtual {
         require(downloadTimes > 0, "Times > 0");
-        FileInfo storage file = mKeyToFileInfo[fileKey];
-        require(file.info.status == FileStatus.Active, "Not active");
-        require(block.timestamp <= file.info.expireTime, "Expired");
+        Info storage file = mKeyToFileInfo[fileKey];
+        require(file.status == FileStatus.Active, "Not active");
+        require(block.timestamp <= file.expireTime, "Expired");
 
-        uint256 downloadFee = calculatePrice(file.info.totalChunks) *
+        uint256 downloadFee = calculatePrice(file.totalChunks) *
             downloadTimes;
         require(msg.value >= downloadFee, "Insufficient payment");
 
@@ -467,7 +401,9 @@ contract Files is Initializable, UUPSUpgradeable {
             );
         }
         session.confirmations.push(msg.sender);
-        if (session.confirmations.length >= storageServerList.length) {
+        Info storage file = mKeyToFileInfo[session.fileKey];
+        uint256 requiredConfirmations = file.totalChunks > 1 ? storageServerList.length : 1;
+        if (session.confirmations.length >= requiredConfirmations) {
             session.isConfirmed = true;
             emit DownloadKeyConfirmed(downloadKey, session.fileKey);
         }
@@ -495,7 +431,7 @@ contract Files is Initializable, UUPSUpgradeable {
 
     function setPublicStatus(bytes32 fileKey, bool status) public virtual {
         require(
-            mKeyToFileInfo[fileKey].info.owner == msg.sender,
+            mKeyToFileInfo[fileKey].owner == msg.sender,
             "Not file owner"
         );
         isPublicFile[fileKey] = status;
@@ -506,7 +442,7 @@ contract Files is Initializable, UUPSUpgradeable {
         address[] calldata users
     ) public virtual {
         require(
-            mKeyToFileInfo[fileKey].info.owner == msg.sender,
+            mKeyToFileInfo[fileKey].owner == msg.sender,
             "Not file owner"
         );
         address[] storage currentList = _fileWhitelists[fileKey];
@@ -538,7 +474,7 @@ contract Files is Initializable, UUPSUpgradeable {
         address[] calldata users
     ) external virtual {
         require(
-            mKeyToFileInfo[fileKey].info.owner == msg.sender,
+            mKeyToFileInfo[fileKey].owner == msg.sender,
             "Not file owner"
         );
         address[] storage currentList = _fileWhitelists[fileKey];
@@ -561,8 +497,8 @@ contract Files is Initializable, UUPSUpgradeable {
     function confirmServerUploadBatch(bytes32[] calldata fileKeys) external virtual onlyStorage {
         for (uint256 i = 0; i < fileKeys.length; i++) {
             bytes32 fileKey = fileKeys[i];
-            FileInfo storage file = mKeyToFileInfo[fileKey];
-            if (file.info.status == FileStatus.Processing) {
+            Info storage file = mKeyToFileInfo[fileKey];
+            if (file.status == FileStatus.Processing) {
                 // Kiểm tra xem server này đã vote chưa
                 if (!hasVoted[fileKey][msg.sender]) {
                     hasVoted[fileKey][msg.sender] = true;
@@ -570,11 +506,11 @@ contract Files is Initializable, UUPSUpgradeable {
                     
                     // Nếu file có > 1 chunk thì cần getRequiredVotes() vote
                     // Nếu file có 1 chunk thì chỉ cần 1 vote (từ server chẵn)
-                    uint256 requiredVotes = file.info.totalChunks > 1 ? getRequiredVotes() : 1;
+                    uint256 requiredVotes = file.totalChunks > 1 ? getRequiredVotes() : 1;
                     
                     if (fileVotes[fileKey] >= requiredVotes) {
-                        file.info.status = FileStatus.Active;
-                        emit FileActivated(file.info.owner, fileKey);
+                        file.status = FileStatus.Active;
+                        emit FileActivated(file.owner, fileKey);
                     }
                 }
             }

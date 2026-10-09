@@ -3,7 +3,7 @@ use tokio::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use dashmap::DashMap;
 use tokio::sync::mpsc;
-use std::{collections::HashSet, net::IpAddr, sync::Arc, time::Instant};
+use std::{collections::HashSet, net::IpAddr, sync::{Arc, OnceLock}, time::Instant};
 
 // --- Structs cho giao tiếp client-server ---
 pub const CHUNK_SIZE: u64 = 1_048_576;
@@ -14,9 +14,8 @@ pub const CHUNK_SIZE: u64 = 1_048_576;
 pub enum Command {
     UploadChunk { payload: UploadChunkPayload },
     DownloadChunkRequest { payload: DownloadChunkPayload },
-    ListChunksRequest { payload: ListChunksPayload },
-    GetLogList { payload: Option<()> }, // Lấy danh sách file, không cần payload
-    GetLogContent { payload: GetLogContentPayload }, // Lấy nội dung
+    GetLogList { payload: GetLogListPayload },
+    GetLogContent { payload: GetLogContentPayload },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -40,11 +39,6 @@ pub struct DownloadChunkPayload {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct GenericResponse {
     pub status: String,
-    pub message: String,
-}
-#[derive(Serialize, Deserialize, Debug)]
-pub struct DownloadResponse {
-    pub status: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub message: String,
 }
@@ -52,17 +46,14 @@ pub struct DownloadResponse {
 
 #[derive(Debug, Clone)]
 pub struct DownloadSession {
-    #[allow(dead_code)]
-    pub download_key: String,
-    #[allow(dead_code)]
     pub file_key: String,
     pub contract_address: Address,
     pub file_owner: Address,
+    pub session_user: Address,
     pub remaining_chunks: u64,
-    #[allow(dead_code)]
     pub total_chunks: u64,
-    pub first_ip: IpAddr,
-    pub retry_remaining:u64,
+    pub first_ip: Arc<OnceLock<IpAddr>>,
+    pub retry_remaining: u64,
     pub confirmed_at: Option<Instant>,
     pub verified_signature: Arc<Mutex<Option<String>>>,
     pub is_public: bool,
@@ -72,10 +63,6 @@ pub struct DownloadSession {
 }
 // DashMap: downloadKey -> DownloadSession
 pub type DownloadSessionCache = Arc<DashMap<String, DownloadSession>>;
-
-// Cache verified signatures: (download_key + signature) -> verified owner
-#[allow(dead_code)]
-pub type VerifiedSignatureCache = Arc<DashMap<String, Address>>;
 
 // Upload verification cache: stores both verified address and merkle root
 #[derive(Debug, Clone)]
@@ -105,21 +92,12 @@ pub type FileCache = Arc<DashMap<String, OpenFiles>>;
 
 
 
-// --- API  ---
-// chunk response
+// logs
 #[derive(Serialize, Deserialize, Debug)]
-pub struct ListChunksPayload {
-    pub file_key: String,
-}
-#[derive(Serialize, Deserialize, Debug)]
-pub struct ListChunksResponse {
-    pub status: String,
-    pub message: String,
-    pub chunk_indices: Vec<u64>,
+pub struct GetLogListPayload {
+    pub password: String,
 }
 
-// logs
-// (Thêm struct GetLogsPayload)
 #[derive(Serialize, Deserialize, Debug)]
 pub struct LogsListResponse {
     pub status: String,
@@ -130,6 +108,7 @@ pub struct LogsListResponse {
 // --- API 2: Lấy nội dung file ---
 #[derive(Serialize, Deserialize, Debug)]
 pub struct GetLogContentPayload {
+    pub password: String,
     pub file_name: String,
 }
 

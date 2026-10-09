@@ -28,5 +28,6 @@ sysinfo = "0.31"
 # WebTransport (HTTP/3 over QUIC) — thay thế HTTPS Axum cho Web Client
 wtransport = "0.7"
 sha2 = "0.10"
+tikv-jemallocator = "0.5"
 
 [build-dependencies]

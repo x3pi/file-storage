@@ -1,8 +1,6 @@
 use crate::app::App;
-use alloy::primitives::{Address, B256};
+use alloy::primitives::B256;
 use alloy::rpc::types::eth::Filter;
-use alloy::transports::ws::WsConnect;
-use alloy::providers::{Provider, ProviderBuilder};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
@@ -32,13 +30,16 @@ async fn listen_download_confirmed_internal(app: Arc<App>) -> Result<(), String>
     loop {
         let current_block = get_block_number(&app).await.unwrap_or(last_block);
         if current_block > last_block {
+            // Giới hạn tối đa 500 block mỗi lần quét để tránh vượt quá limit của RPC khi vừa khởi động lại
+            let to_block = current_block.min(last_block + 500);
+
             // ⚠️ FIX: Đợi 2500ms để custom chain kịp ghi block hash và index log vào DB.
             // Tránh lỗi race condition: getBlockNumber trả về block mới nhưng getLogs lại trả về null.
             tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
 
             let filter = Filter::new()
                 .from_block(last_block + 1)
-                .to_block(current_block)
+                .to_block(to_block)
                 .event_signature(vec![
                     DownloadKeyConfirmed::SIGNATURE_HASH,
                     FileActivated::SIGNATURE_HASH,
@@ -61,14 +62,17 @@ async fn listen_download_confirmed_internal(app: Arc<App>) -> Result<(), String>
                 params: vec![&filter],
             };
             
+            let mut poll_succeeded = false;
             if let Ok(response) = app.http_client.post(&app.config.rpc_url).json(&req).send().await {
                 if let Ok(json) = response.json::<serde_json::Value>().await {
                     if let Some(result) = json.get("result") {
                         if result.is_null() {
                             // Custom chain trả về null => Không có log nào
+                            poll_succeeded = true;
                         } else {
                             match serde_json::from_value::<Vec<alloy::rpc::types::eth::Log>>(result.clone()) {
                                 Ok(logs) => {
+                                    poll_succeeded = true;
                                     for log in logs {
                                         log::info!("🔍 [EVENT DEBUG] Received a log from address: {}", log.address());
                                         let is_valid = app.is_valid_contract(log.address()).await;
@@ -82,7 +86,7 @@ async fn listen_download_confirmed_internal(app: Arc<App>) -> Result<(), String>
                                         } else if let Ok(event) = FileActivated::decode_log(&log.inner.clone().into()) {
                                             process_file_activated_event(event.fileKey, &app).await;
                                         } else if let Ok(event) = FileDeleted::decode_log(&log.inner.clone().into()) {
-                                            process_file_deleted_event(event.fileKey, log.address(), &app).await;
+                                            process_file_deleted_event(event.fileKey, &app).await;
                                         } else {
                                             log::warn!("⚠️ [EVENT DEBUG] Failed to decode log! Topics: {:?}", log.inner.topics());
                                         }
@@ -98,11 +102,15 @@ async fn listen_download_confirmed_internal(app: Arc<App>) -> Result<(), String>
                     }
                 }
             } else {
-                log::warn!("⚠️ [EVENT DEBUG] Failed to send get_logs HTTP request for blocks {} to {}", last_block + 1, current_block);
+                log::warn!("⚠️ [EVENT DEBUG] Failed to send get_logs HTTP request for blocks {} to {}", last_block + 1, to_block);
             }
             
-            // Cập nhật last_block
-            last_block = current_block;
+            // Cập nhật last_block CHỈ KHI lấy log thành công
+            if poll_succeeded {
+                last_block = to_block;
+            } else {
+                log::warn!("⚠️ [EVENT RETRY] get_logs failed for blocks {} to {}. Will retry next poll.", last_block + 1, to_block);
+            }
         }
 
         // Poll mỗi 2 giây
@@ -166,7 +174,7 @@ async fn process_download_confirmed_event(download_key: B256, app: &Arc<App>) {
     }
 }
 async fn process_file_activated_event(file_key: B256, app: &Arc<App>) {
-    let file_key_hex = hex::encode(file_key).to_lowercase();
+    let file_key_hex = hex::encode(file_key);
     if let Some(_removed) = app.upload_file_cache.remove(&file_key_hex) {
         log::info!(
             "✅ Removed fileKey from upload cache (address + merkle_root): {}",
@@ -178,12 +186,11 @@ async fn process_file_activated_event(file_key: B256, app: &Arc<App>) {
     }
 }
 
-async fn process_file_deleted_event(file_key: B256, contract_address: Address, app: &Arc<App>) {
-    let file_key_hex = hex::encode(file_key).to_lowercase();
+async fn process_file_deleted_event(file_key: B256, app: &Arc<App>) {
+    let file_key_hex = hex::encode(file_key);
     log::info!(
-        "🗑️ Received FileDeleted event for fileKey: {} from contract: {:?}",
-        file_key_hex,
-        contract_address
+        "🗑️ Received FileDeleted event for fileKey: {}",
+        file_key_hex
     );
 
     // Tính toán đường dẫn thư mục giống như lúc lưu
@@ -195,50 +202,7 @@ async fn process_file_deleted_event(file_key: B256, contract_address: Address, a
         .join(level2)
         .join(&file_key_hex);
 
-    // 1. Kiểm tra contract.txt xem file này có do chính contract_address phát sự kiện lưu không
-    let contract_file = file_dir.join("contract.txt");
-    if contract_file.exists() {
-        if let Ok(saved_addr) = tokio::fs::read_to_string(&contract_file).await {
-            let saved_clean = saved_addr.trim().trim_start_matches("0x").to_lowercase();
-            let current_clean = hex::encode(contract_address.as_slice()).to_lowercase();
-            if saved_clean != current_clean {
-                log::warn!(
-                    "❌ Rejecting FileDeleted: fileKey {} belongs to contract 0x{}, but delete event was emitted by contract 0x{}",
-                    file_key_hex,
-                    saved_clean,
-                    current_clean
-                );
-                return;
-            }
-        }
-    }
-
-    // 2. Xác thực trạng thái on-chain trên chính contract phát sự kiện
-    if let Ok(contract) = app.contract(contract_address).await {
-        let key_bytes: [u8; 32] = file_key.into();
-        match contract.getFileInfo(alloy::primitives::B256::from(key_bytes)).call().await {
-            Ok(info) => {
-                if info.status != crate::contracts::file_contract::Files::FileStatus::Deleted {
-                    log::warn!(
-                        "❌ Rejecting FileDeleted: on-chain status is not Deleted ({:?}) for fileKey {} on contract {:?}",
-                        info.status,
-                        file_key_hex,
-                        contract_address
-                    );
-                    return;
-                }
-            }
-            Err(e) => {
-                log::warn!(
-                    "⚠️ Could not verify getFileInfo for FileDeleted on contract {:?}: {}",
-                    contract_address,
-                    e
-                );
-            }
-        }
-    }
-
-    // 3. Xóa thư mục chứa file
+    // Xóa thư mục chứa file
     match tokio::fs::remove_dir_all(&file_dir).await {
         Ok(_) => {
             log::info!(
@@ -272,50 +236,5 @@ async fn process_file_deleted_event(file_key: B256, contract_address: Address, a
     }
     if let Some((_, _)) = app.file_cache.remove(&file_key_hex) {
         log::info!("✅ Closed and removed file handle from file_cache: {}", file_key_hex);
-    }
-}
-
-pub async fn start_chain_id_monitor(app: Arc<App>) {
-    log::info!("📡 Starting Chain ID monitor (using WebSocket)...");
-    // Lấy URL từ config
-    let rpc_url = app.config.rpc_url_ws.clone();
-    // để tái sử dụng kết nối WebSocket
-    let mut provider_option = None;
-    loop {
-        // Nếu chúng ta chưa có provider (lần đầu, hoặc sau lỗi kết nối)
-        if provider_option.is_none() {
-            let ws = WsConnect::new(&rpc_url);
-            match ProviderBuilder::new().connect_ws(ws).await {
-                Ok(p) => {
-                    provider_option = Some(p); // Lưu lại provider
-                }
-                Err(_e) => {
-                    // log::warn!(
-                    //     "Failed to connect WebSocket for chain ID monitor (will retry in 20s): {}",
-                    //     e
-                    // );
-                    // Ngủ 20 giây trước khi thử kết nối lại
-                    sleep(Duration::from_secs(20)).await;
-                    continue; // Bỏ qua phần còn lại của vòng lặp, thử kết nối lại
-                }
-            }
-        }
-
-        // Nếu chúng ta CÓ provider, hãy sử dụng nó
-        if let Some(provider) = &provider_option {
-            log::debug!("Polling for chain ID over WebSocket...");
-            match provider.get_chain_id().await {
-                Ok(_) => {
-                    // log::info!("✅ Chain ID check OK (over Ws): {}", chain_id);
-                }
-                Err(e) => {
-                    log::warn!("Failed to get chain ID over WebSocket: {}", e);
-                    provider_option = None;
-                }
-            }
-        }
-
-        // Chờ 20 giây trước khi poll lần tiếp theo
-        sleep(Duration::from_secs(20)).await;
     }
 }

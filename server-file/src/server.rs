@@ -4,7 +4,7 @@ use crate::app::App;
 use crate::download_manager;
 use crate::ethereum::{handle_download_request, verify_download_chunk, verify_upload_chunk};
 use crate::models::{
-    Command, DownloadResponse, GenericResponse, ListChunksResponse, LogFileContent,
+    Command, GenericResponse, LogFileContent,
     LogsContentResponse, LogsListResponse, CHUNK_SIZE,
 };
 
@@ -34,7 +34,7 @@ async fn send_error_response(
 
 async fn send_download_response(
     stream: &mut QuicStreamHandler, // Nhận stream
-    response: &DownloadResponse,
+    response: &GenericResponse,
     chunk_data: Option<Vec<u8>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut response_json = serde_json::to_vec(response)?;
@@ -47,15 +47,6 @@ async fn send_download_response(
         stream.send(Bytes::from(data)).await?;
     }
     
-    Ok(())
-}
-async fn send_list_chunks_response(
-    stream: &mut QuicStreamHandler,
-    response: &ListChunksResponse,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut response_json = serde_json::to_vec(response)?;
-    response_json.push(b'\n');
-    stream.send(Bytes::from(response_json)).await?;
     Ok(())
 }
 async fn send_logs_content_response(
@@ -78,19 +69,14 @@ async fn send_logs_list_response(
     stream.send(Bytes::from(response_json)).await?;
     Ok(())
 }
-fn get_file_key_path(storage_root: &Path, file_key: &str) -> Option<PathBuf> {
-    let clean = file_key.trim_start_matches("0x").to_lowercase();
-    if clean.len() != 64 || !clean.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    let level1 = &clean[0..2];
-    let level2 = &clean[2..4];
-    Some(
-        storage_root
-            .join(level1)
-            .join(level2)
-            .join(&clean)
-    )
+#[allow(dead_code)]
+pub fn get_file_key_path(storage_root: &Path, file_key: &str) -> PathBuf {
+    let level1 = &file_key[0..2];
+    let level2 = &file_key[2..4];
+    storage_root
+        .join(level1) // Cấp 1
+        .join(level2) // Cấp 2
+        .join(file_key)
 }
 pub async fn handle_connection(
     mut connection: Box<dyn Connection>,
@@ -126,14 +112,18 @@ pub async fn handle_connection(
             let semaphore = app_clone.task_semaphore.clone();
             
             loop {
-                let data = match stream_handler.recv().await {
-                    Ok(Some(d)) => d,
-                    Ok(None) => {
+                let data = match tokio::time::timeout(tokio::time::Duration::from_secs(30), stream_handler.recv()).await {
+                    Ok(Ok(Some(d))) => d,
+                    Ok(Ok(None)) => {
                         log::debug!("[{}] ⚠️ Stream closed by client.", peer_clone);
                         break; // Khách hàng đã ngắt kết nối
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         log::debug!("[{}] ❌ Error reading from stream: {}", peer_clone, e);
+                        break;
+                    }
+                    Err(_) => {
+                        log::debug!("[{}] ⏱️ Stream read timeout (30s). Closing stream.", peer_clone);
                         break;
                     }
                 };
@@ -151,7 +141,8 @@ pub async fn handle_connection(
                     Err(e) => {
                         log::error!("[{}] ❌ Failed to parse command: {}", peer_clone, e);
                         let log_line = if line.len() > 200 {
-                            format!("{}... (truncated, {} bytes)", &line[..200], line.len())
+                            let truncated: String = line.chars().take(200).collect();
+                            format!("{}... (truncated, {} bytes)", truncated, line.len())
                         } else {
                             line.clone()
                         };
@@ -169,40 +160,33 @@ pub async fn handle_connection(
                 let start_time_wall_clock = Local::now();
                 
                 match command {
-                        Command::UploadChunk { payload } => {
-                            if payload.file_key.starts_with("0x") {
-                                let _ = send_error_response(&mut stream_handler, "Invalid format: file_key must not start with '0x'").await;
-                                break;
-                            }
-                            let log_file_key = payload.file_key.trim_start_matches("0x").to_lowercase();
+                        Command::UploadChunk { mut payload } => {
+                            payload.file_key = payload.file_key.trim_start_matches("0x").trim_start_matches("0X").to_lowercase();
+                            let log_file_key = payload.file_key.clone();
                             let log_chunk_index = payload.chunk_index;
-                            let _permit = match semaphore.acquire().await {
-                                Ok(permit) => permit,
-                                Err(e) => {
-                                    log::error!(
-                                        "[{}] Semaphore closed, cannot process upload: {}",
-                                        peer_clone,
-                                        e
-                                    );
-
-                                    _ = send_error_response(
-                                        &mut stream_handler,
-                                        "Server is shutting down",
-                                    )
-                                    .await;
-                                    return; // Thoát task này
-                                }
-                            };
                             
-                            // ✅ RECEIVE FRAME 2: Binary Chunk Data
-                            let chunk_data = match stream_handler.recv().await {
-                                Ok(Some(data)) => data.to_vec(),
-                                _ => {
+                            // ✅ RECEIVE FRAME 2: Binary Chunk Data có timeout 15s (TRƯỚC KHI LẤY PERMIT)
+                            let chunk_data = match tokio::time::timeout(tokio::time::Duration::from_secs(15), stream_handler.recv()).await {
+                                Ok(Ok(Some(data))) => data.to_vec(),
+                                Ok(Ok(None)) => {
                                     log::error!(
-                                        "[{}] ❌ Failed to receive binary chunk data (Frame 2) for chunk {} -k {}",
+                                        "[{}] ❌ Stream closed before binary chunk data for chunk {} -k {}",
                                         peer_clone,
                                         log_chunk_index,
                                         log_file_key
+                                    );
+                                    let _ = send_error_response(
+                                        &mut stream_handler,
+                                        "Stream closed before chunk data",
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                Ok(Err(e)) => {
+                                    log::error!(
+                                        "[{}] ❌ Error receiving binary chunk data: {}",
+                                        peer_clone,
+                                        e
                                     );
                                     let _ = send_error_response(
                                         &mut stream_handler,
@@ -211,33 +195,26 @@ pub async fn handle_connection(
                                     .await;
                                     return;
                                 }
-                            };
-
-                            if chunk_data.is_empty() || chunk_data.len() > CHUNK_SIZE as usize {
-                                log::error!(
-                                    "[{}] ❌ Chunk size invalid (len: {} bytes, max: {}) for chunk {} -k {}",
-                                    peer_clone,
-                                    chunk_data.len(),
-                                    CHUNK_SIZE,
-                                    log_chunk_index,
-                                    log_file_key
-                                );
-                                let _ = send_error_response(
-                                    &mut stream_handler,
-                                    "Chunk size exceeds 1MB limit or is empty",
-                                )
-                                .await;
-                                return;
-                            }
-
-                            
-                            // ✅ DUPLICATE CHUNK EARLY CHECK
-                            let is_duplicate = {
-                                if let Some(set) = app_clone.chunk_tracker.get(&payload.file_key) {
-                                    set.contains(&payload.chunk_index)
-                                } else {
-                                    false
+                                Err(_) => {
+                                    log::error!(
+                                        "[{}] ⏱️ Timeout (15s) receiving binary chunk data for chunk {} -k {}",
+                                        peer_clone,
+                                        log_chunk_index,
+                                        log_file_key
+                                    );
+                                    let _ = send_error_response(
+                                        &mut stream_handler,
+                                        "Timeout receiving binary chunk data",
+                                    )
+                                    .await;
+                                    return;
                                 }
+                            };
+                            
+                            // ✅ DUPLICATE CHUNK EARLY CHECK (dùng get_or_init_chunk_tracker để đọc từ .meta nếu vừa restart)
+                            let is_duplicate = {
+                                let set = app_clone.get_or_init_chunk_tracker(&payload.file_key);
+                                set.contains(&payload.chunk_index)
                             };
 
                             if is_duplicate {
@@ -250,6 +227,25 @@ pub async fn handle_connection(
                                 let _ = stream_handler.send(Bytes::from(response_json)).await;
                                 return; // Thoát luôn, tiết kiệm CPU và Ổ cứng!
                             }
+
+                            // ✅ CHỈ LẤY SEMAPHORE PERMIT KHI ĐÃ CÓ ĐẦY ĐỦ DATA TRONG TAY
+                            let _permit = match semaphore.acquire().await {
+                                Ok(permit) => permit,
+                                Err(e) => {
+                                    log::error!(
+                                        "[{}] Semaphore closed, cannot process upload: {}",
+                                        peer_clone,
+                                        e
+                                    );
+
+                                    let _ = send_error_response(
+                                        &mut stream_handler,
+                                        "Server is shutting down",
+                                    )
+                                    .await;
+                                    return; // Thoát task này
+                                }
+                            };
                             // ✅ UNIFIED VERIFICATION: Signature + Merkle Proof in one call
                             match verify_upload_chunk(&payload, &chunk_data, &app_clone).await {
                                 Ok(()) => {
@@ -284,31 +280,18 @@ pub async fn handle_connection(
                                 }
                             }
                             
-                            let file_key = payload.file_key.trim_start_matches("0x").to_lowercase();
-                            let contract_address_clean = payload.contract_address.trim().to_lowercase();
+                            let file_key = payload.file_key.clone();
                             let chunk_index = payload.chunk_index;
                             let file_cache = app_clone.file_cache.clone();
                             let storage_root = app_clone.storage_root.clone();
                             let store_result: Result<PathBuf, std::io::Error> =
                                 tokio::task::spawn_blocking(move || {
-                                    if file_key.len() < 4 {
-                                        return Err(std::io::Error::new(
-                                            std::io::ErrorKind::InvalidInput,
-                                            "Invalid file key length",
-                                        ));
-                                    }
                                     let level1 = &file_key[0..2];
                                     let level2 = &file_key[2..4];
                                     let file_dir: PathBuf =
                                         storage_root.join(level1).join(level2).join(&file_key);
                                     std::fs::create_dir_all(&file_dir)?;
                                     
-                                    // Ghi thông tin contract sở hữu file để phục vụ xác thực khi xóa
-                                    let contract_path = file_dir.join("contract.txt");
-                                    if !contract_path.exists() {
-                                        let _ = std::fs::write(&contract_path, &contract_address_clean);
-                                    }
-
                                     // CÁCH MỚI: Ghi vào [file_key].bin
                                     let bin_path = file_dir.join(format!("{}.bin", file_key));
                                     let meta_path = file_dir.join(format!("{}.meta", file_key));
@@ -320,35 +303,27 @@ pub async fn handle_connection(
                                     let open_files = if let Some(files) = file_cache.get(&file_key) {
                                         files.value().clone()
                                     } else {
-                                        let bin_file = OpenOptions::new()
-                                            .write(true)
-                                            .create(true)
-                                            .open(&bin_path)?;
-                                        let meta_file = OpenOptions::new()
-                                            .append(true)
-                                            .create(true)
-                                            .open(&meta_path)?;
-                                        let new_of = crate::models::OpenFiles {
-                                            bin_file: std::sync::Arc::new(bin_file),
-                                            meta_file: std::sync::Arc::new(std::sync::Mutex::new(meta_file)),
-                                        };
-                                        file_cache.insert(file_key.clone(), new_of.clone());
-                                        new_of
+                                        file_cache.entry(file_key.clone()).or_insert_with(|| {
+                                            let bin_file = OpenOptions::new()
+                                                .write(true)
+                                                .create(true)
+                                                .open(&bin_path).unwrap();
+                                            let meta_file = OpenOptions::new()
+                                                .append(true)
+                                                .create(true)
+                                                .open(&meta_path).unwrap();
+                                            crate::models::OpenFiles {
+                                                bin_file: std::sync::Arc::new(bin_file),
+                                                meta_file: std::sync::Arc::new(std::sync::Mutex::new(meta_file)),
+                                            }
+                                        }).value().clone()
                                     };
                                         
-                                    let offset = (chunk_index as u64)
-                                        .checked_mul(CHUNK_SIZE)
-                                        .ok_or_else(|| {
-                                            std::io::Error::new(
-                                                std::io::ErrorKind::InvalidInput,
-                                                "Chunk index offset overflow",
-                                            )
-                                        })?;
+                                    let offset = (chunk_index as u64) * CHUNK_SIZE;
                                     open_files.bin_file.write_all_at(&chunk_data, offset)?;
                                     
                                     // Ghi index vào file meta
-                                    let mut meta_file_guard = open_files.meta_file.lock()
-                                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Mutex poison error: {}", e)))?;
+                                    let mut meta_file_guard = open_files.meta_file.lock().unwrap();
                                     meta_file_guard.write_all(format!("{}\n", chunk_index).as_bytes())?;
                                     
                                     Ok(bin_path)
@@ -376,10 +351,10 @@ pub async fn handle_connection(
                             match store_result {
                                 Ok(_chunk_path) => {
                                     // TRACK CHUNK: Ghi nhận ngay khi lưu ổ cứng thành công
-                                    let total_chunks = if let Some(info) = app_clone.upload_file_cache.get(&log_file_key) {
-                                        info.total_chunks
+                                    let (total_chunks, contract_addr) = if let Some(info) = app_clone.upload_file_cache.get(&log_file_key) {
+                                        (info.total_chunks, info.contract_address)
                                     } else {
-                                        0
+                                        (0, alloy::primitives::Address::ZERO)
                                     };
                                     
                                     if total_chunks == 0 {
@@ -395,16 +370,22 @@ pub async fn handle_connection(
                                     }
 
                                     // Tính toán nhanh số chunk (Chỉ tốn ~2 nano-giây, cực kỳ nhẹ)
-                                    let expected_chunks = if log_chunk_index % 2 == 0 {
+                                    // SVR-4: Xử lý Edge Case chẵn/lẻ khi file chỉ có 1 chunk (total_chunks = 1)
+                                    let expected_chunks = if total_chunks == 1 {
+                                        if log_chunk_index == 0 { 1 } else { 0 }
+                                    } else if log_chunk_index % 2 == 0 {
                                         (total_chunks + 1) / 2
                                     } else {
                                         total_chunks / 2
                                     };
 
+                                    if expected_chunks == 0 {
+                                        log::warn!("[{}] ⚠️ Unexpected chunk {} for total_chunks {} (expected 0 chunks for this parity)", peer_clone, log_chunk_index, total_chunks);
+                                        continue;
+                                    }
+
                                     let is_completed = {
-                                        let mut set = app_clone.chunk_tracker
-                                            .entry(log_file_key.clone())
-                                            .or_insert_with(std::collections::HashSet::new);
+                                        let mut set = app_clone.get_or_init_chunk_tracker(&log_file_key);
                                         set.insert(log_chunk_index);
                                         set.len() as u64 == expected_chunks
                                     };
@@ -414,20 +395,14 @@ pub async fn handle_connection(
                                         // Sử dụng remove để đảm bảo chỉ có ĐÚNG MỘT luồng vào được đây để xử lý hoàn thành
                                         if let Some((_, _)) = app_clone.chunk_tracker.remove(&log_file_key) {
                                             log::info!("[{}] 🎯 File {} fully received for this node ({} / {} total chunks). Queueing for confirm.", peer_clone, log_file_key, expected_chunks, total_chunks);
-                                            let contract_addr = if let Some(info) = app_clone.upload_file_cache.get(&log_file_key) {
-                                                log::info!("Extracted contract_addr from cache: {}", info.contract_address);
-                                                info.contract_address
-                                            } else {
-                                                log::error!("CACHE MISS for {}! Cannot confirm.", log_file_key);
-                                                let response = GenericResponse {
-                                                    status: "ERROR".to_string(),
-                                                    message: "Cache miss for contract address".to_string(),
-                                                };
-                                                let mut response_json: Vec<u8> = serde_json::to_vec(&response).unwrap_or_default();
-                                                response_json.push(b'\n');
-                                                let _ = stream_handler.send(bytes::Bytes::from(response_json)).await;
-                                                return;
-                                            };
+                                            log::info!("Extracted contract_addr from cache: {}", contract_addr);
+                                            // Ghi vào pending_uploads.txt để không bị mất khi restart
+                                            let pending_file_path = app_clone.storage_root.join("pending_uploads.txt");
+                                            let line = format!("{},{}\n", log_file_key, contract_addr);
+                                            use tokio::io::AsyncWriteExt;
+                                            if let Ok(mut file) = tokio::fs::OpenOptions::new().create(true).append(true).open(&pending_file_path).await {
+                                                let _ = file.write_all(line.as_bytes()).await;
+                                            }
                                             let _ = app_clone.upload_batch_sender.send((log_file_key.clone(), contract_addr)).await;
                                             status_str = "COMPLETED";
                                         }
@@ -503,11 +478,9 @@ pub async fn handle_connection(
                                 }
                             }
                         }
-                        Command::DownloadChunkRequest { payload } => {
-                            if payload.file_key.starts_with("0x") || payload.download_key.starts_with("0x") {
-                                let _ = send_error_response(&mut stream_handler, "Invalid format: keys must not start with '0x'").await;
-                                break;
-                            }
+                        Command::DownloadChunkRequest { mut payload } => {
+                            payload.file_key = payload.file_key.trim_start_matches("0x").trim_start_matches("0X").to_lowercase();
+                            payload.download_key = payload.download_key.trim_start_matches("0x").trim_start_matches("0X").to_lowercase();
                             let log_file_key = payload.file_key.clone();
                             let log_chunk_index = payload.chunk_index;
 
@@ -636,7 +609,7 @@ pub async fn handle_connection(
                                 Ok(false) => {
                                     let error_message =
                                         "Ownership or signature verification failed".to_string();
-                                    let response = DownloadResponse {
+                                    let response = GenericResponse {
                                         status: "ERROR".to_string(),
                                         message: error_message,
                                     };
@@ -656,7 +629,7 @@ pub async fn handle_connection(
                                 }
                                 Err(er) => {
                                     // log::error!("-[{}] ❌ Verification error: {}", peer_clone, er);
-                                    let response = DownloadResponse {
+                                    let response = GenericResponse {
                                         status: "ERROR".to_string(),
                                         message: format!("Verification error: {}", er),
                                     };
@@ -672,59 +645,21 @@ pub async fn handle_connection(
                                 }
                             }
                         }
-                        Command::ListChunksRequest { payload } => {
-                            let file_path = match get_file_key_path(&app_clone.storage_root, &payload.file_key) {
-                                Some(p) => p,
-                                None => {
-                                    let response = ListChunksResponse {
-                                        status: "ERROR".to_string(),
-                                        message: "Invalid file_key: must be a 64-character hex string".to_string(),
-                                        chunk_indices: vec![],
-                                    };
-                                    let _ = send_list_chunks_response(&mut stream_handler, &response).await;
-                                    continue;
-                                }
-                            };
-                            if !file_path.exists() {
-                                let response = ListChunksResponse {
-                                    status: "ERROR".to_string(),
-                                    message: "File not found".to_string(),
-                                    chunk_indices: vec![],
-                                };
-                                let _ = send_list_chunks_response(&mut stream_handler, &response).await;
-                                continue;
-                            }
-                            match download_manager::list_chunks(&file_path).await {
-                                Ok(indices) => {
-                                    let response = ListChunksResponse {
-                                        status: "SUCCESS".to_string(),
-                                        message: format!("Found {} chunks", indices.len()),
-                                        chunk_indices: indices,
-                                    };
-                                    if let Err(e) =
-                                        send_list_chunks_response(&mut stream_handler, &response)
-                                            .await
-                                    {
-                                        log::error!(
-                                            "[{}] Error sending list chunks response: {}",
-                                            peer_clone,
-                                            e
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    log::error!("[{}] Failed to list chunks: {}", peer_clone, e);
-                                    let response = ListChunksResponse {
-                                        status: "ERROR".to_string(),
-                                        message: format!("Failed to list chunks: {}", e),
-                                        chunk_indices: vec![],
-                                    };
-                                    let _ = send_list_chunks_response(&mut stream_handler, &response).await;
-                                }
-                            }
-                        }
-                        Command::GetLogList { payload: _ } => {
+                        Command::GetLogList { payload } => {
                             log::debug!("[{}] Handling GetLogList (no semaphore)", peer_clone);
+
+                            use sha2::{Digest, Sha256};
+                            let incoming_hash = hex::encode(Sha256::digest(payload.password.as_bytes()));
+                            if incoming_hash != app_clone.config.admin_log_password_hash {
+                                log::warn!("[{}] ❌ Unauthorized GetLogList attempt with invalid password", peer_clone);
+                                let response = LogsListResponse {
+                                    status: "ERROR".to_string(),
+                                    message: "Unauthorized: Invalid admin password".to_string(),
+                                    available_files: vec![],
+                                };
+                                let _ = send_logs_list_response(&mut stream_handler, &response).await;
+                                return;
+                            }
 
                             let logs_dir = app_clone.log_dir.clone();
                             let mut files_with_meta = Vec::new();
@@ -804,83 +739,55 @@ pub async fn handle_connection(
                         Command::GetLogContent { payload } => {
                             log::debug!("[{}] Handling GetLogContent (no semaphore)", peer_clone);
 
+                            use sha2::{Digest, Sha256};
+                            let incoming_hash = hex::encode(Sha256::digest(payload.password.as_bytes()));
+                            if incoming_hash != app_clone.config.admin_log_password_hash {
+                                log::warn!("[{}] ❌ Unauthorized GetLogContent attempt with invalid password", peer_clone);
+                                let response = LogsContentResponse {
+                                    status: "ERROR".to_string(),
+                                    message: "Unauthorized: Invalid admin password".to_string(),
+                                    log_content: None,
+                                };
+                                let _ = send_logs_content_response(&mut stream_handler, &response).await;
+                                return;
+                            }
+
                             let logs_dir = app_clone.log_dir.clone();
-                            let message: String;
-                            let mut response_status = "SUCCESS".to_string();
-                            let mut final_log_content: Option<LogFileContent> = None;
+                            let file_to_read_path = logs_dir.join(&payload.file_name);
 
-                            // 1. Strict validation: Only allow plain alphanumeric filenames with .log extension
-                            // Forbid any path separators, .., or hidden files
-                            let is_safe_name = !payload.file_name.is_empty()
-                                && !payload.file_name.contains('/')
-                                && !payload.file_name.contains('\\')
-                                && !payload.file_name.contains("..")
-                                && !payload.file_name.starts_with('.')
-                                && payload.file_name.ends_with(".log")
-                                && payload.file_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-');
-
-                            if !is_safe_name {
-                                message = format!(
-                                    "Error: File '{}' not found or invalid.",
-                                    payload.file_name
-                                );
-                                response_status = "ERROR".to_string();
+                            let (response_status, message, final_log_content) = if !file_to_read_path.starts_with(&logs_dir)
+                                || !file_to_read_path.is_file()
+                            {
+                                (
+                                    "ERROR".to_string(),
+                                    format!("Error: File '{}' not found or invalid.", payload.file_name),
+                                    None,
+                                )
                             } else {
-                                // 2. Canonicalize directory and file path to guarantee it stays strictly inside logs_dir
-                                match std::fs::canonicalize(&logs_dir) {
-                                    Ok(canonical_logs_dir) => {
-                                        let file_to_read = canonical_logs_dir.join(&payload.file_name);
-                                        match std::fs::canonicalize(&file_to_read) {
-                                            Ok(canonical_file_path) => {
-                                                if canonical_file_path.starts_with(&canonical_logs_dir) && canonical_file_path.is_file() {
-                                                    match fs::read_to_string(&canonical_file_path).await {
-                                                        Ok(content) => {
-                                                            final_log_content = Some(LogFileContent {
-                                                                file_name: payload.file_name.clone(),
-                                                                content,
-                                                            });
-                                                            message = format!(
-                                                                "Retrieved content for file: {}",
-                                                                payload.file_name
-                                                            );
-                                                        }
-                                                        Err(e) => {
-                                                            log::warn!(
-                                                                "[{}] Failed to read log file {:?}: {}",
-                                                                peer_clone,
-                                                                canonical_file_path,
-                                                                e
-                                                            );
-                                                            message = format!(
-                                                                "Found file '{}', but failed to read its content: {}",
-                                                                payload.file_name, e
-                                                            );
-                                                            response_status = "ERROR".to_string();
-                                                        }
-                                                    }
-                                                } else {
-                                                    message = format!(
-                                                        "Error: File '{}' not found or invalid.",
-                                                        payload.file_name
-                                                    );
-                                                    response_status = "ERROR".to_string();
-                                                }
-                                            }
-                                            Err(_) => {
-                                                message = format!(
-                                                    "Error: File '{}' not found or invalid.",
-                                                    payload.file_name
-                                                );
-                                                response_status = "ERROR".to_string();
-                                            }
-                                        }
-                                    }
-                                    Err(_) => {
-                                        message = "Error: Logs directory not accessible.".to_string();
-                                        response_status = "ERROR".to_string();
+                                match fs::read_to_string(&file_to_read_path).await {
+                                    Ok(content) => (
+                                        "SUCCESS".to_string(),
+                                        format!("Retrieved content for file: {}", payload.file_name),
+                                        Some(LogFileContent {
+                                            file_name: payload.file_name.clone(),
+                                            content,
+                                        }),
+                                    ),
+                                    Err(e) => {
+                                        log::warn!(
+                                            "[{}] Failed to read log file {:?}: {}",
+                                            peer_clone,
+                                            file_to_read_path,
+                                            e
+                                        );
+                                        (
+                                            "ERROR".to_string(),
+                                            format!("Found file '{}', but failed to read its content: {}", payload.file_name, e),
+                                            None,
+                                        )
                                     }
                                 }
-                            }
+                            };
 
                             let response = LogsContentResponse {
                                 status: response_status,
@@ -888,7 +795,7 @@ pub async fn handle_connection(
                                 log_content: final_log_content,
                             };
 
-                            // Gửi response (payload LỚN, 500KB+)
+                            // Gửi response
                             if let Err(e) =
                                 send_logs_content_response(&mut stream_handler, &response).await
                             {

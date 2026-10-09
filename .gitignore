@@ -2,17 +2,11 @@ server-file/target
 server-file/log_*
 server-file/storage_7081
 server-file/storage_7082
-
-# Environment files
-**/.env*
-!**/.env.example
-!**/.env.server1
-!**/.env.server2
-
-# Certificates and keys
-**/*.pem*
-**/*.key*
-**/*.crt*
-**/*.local
+server-file/.env*
+!server-file/.env.example
+server-file/certificate.pem
+server-file/private.key
+server-file/fullchain.crt
+server-file/real_private.key
 server-file/cert.conf
 server-file/file-storage.code-workspace
