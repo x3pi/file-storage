@@ -59,8 +59,17 @@ pub async fn verify_upload_chunk(
     chunk_data: &[u8],
     app: &Arc<App>,
 ) -> Result<(), String> {
+    let c_addr = payload.contract_address.parse::<alloy::primitives::Address>()
+        .map_err(|e| format!("Invalid contract_address: {}", e))?;
+
     // 1. Check cache first
     if let Some(cached_info) = app.upload_file_cache.get(&payload.file_key) {
+        if cached_info.contract_address != c_addr {
+            return Err(format!(
+                "File key {} belongs to contract {}, but request specified {}",
+                payload.file_key, cached_info.contract_address, c_addr
+            ));
+        }
         if payload.chunk_index >= cached_info.total_chunks {
             return Err(format!(
                 "Chunk index {} exceeds total_chunks {}",
@@ -103,6 +112,12 @@ pub async fn verify_upload_chunk(
 
         // Double check cache
         if let Some(cached_info) = app.upload_file_cache.get(&payload.file_key) {
+            if cached_info.contract_address != c_addr {
+                return Err(format!(
+                    "File key {} belongs to contract {}, but request specified {}",
+                    payload.file_key, cached_info.contract_address, c_addr
+                ));
+            }
             if payload.chunk_index >= cached_info.total_chunks {
                 return Err(format!(
                     "Chunk index {} exceeds total_chunks {}",
@@ -120,9 +135,6 @@ pub async fn verify_upload_chunk(
             }
         } else {
             // Fetch file owner from SC
-            let c_addr = payload.contract_address.parse::<alloy::primitives::Address>()
-                .map_err(|e| format!("Invalid contract_address: {}", e))?;
-
             if !app.is_valid_contract(c_addr).await {
                 return Err(format!("Contract {} is not registered or invalid", c_addr));
             }
@@ -414,6 +426,8 @@ pub async fn confirm_upload_batch(app: Arc<App>, contract_address: alloy::primit
             let mut byte_array = [0u8; 32];
             byte_array.copy_from_slice(&decoded);
             keys.push(alloy::primitives::B256::from(byte_array));
+        } else {
+            log::error!("❌ Corrupted file_key in batch confirmation: '{}' (len: {})", key_hex, decoded.len());
         }
     }
 

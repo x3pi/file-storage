@@ -394,6 +394,7 @@ pub async fn handle_connection(
                                     if is_completed {
                                         // Sử dụng remove để đảm bảo chỉ có ĐÚNG MỘT luồng vào được đây để xử lý hoàn thành
                                         if let Some((_, _)) = app_clone.chunk_tracker.remove(&log_file_key) {
+                                            app_clone.file_cache.remove(&log_file_key); // Đóng ngay file descriptor để tránh rò rỉ FD
                                             log::info!("[{}] 🎯 File {} fully received for this node ({} / {} total chunks). Queueing for confirm.", peer_clone, log_file_key, expected_chunks, total_chunks);
                                             log::info!("Extracted contract_addr from cache: {}", contract_addr);
                                             // Ghi vào pending_uploads.txt để không bị mất khi restart

@@ -50,6 +50,12 @@ pub async fn initialize_download_session<'a>(
         app.download_cache.remove(&download_key_clean);
     }
     if let Some(session_ref) = app.download_cache.get(&download_key_clean) {
+        if session_ref.contract_address != contract_address {
+            return Err(format!(
+                "Download key '{}' belongs to contract {}, but request specified {}",
+                download_key_clean, session_ref.contract_address, contract_address
+            ));
+        }
         return Ok(session_ref);
     }
 
@@ -80,6 +86,12 @@ pub async fn initialize_download_session<'a>(
 
     // DOUBLE CHECK: Sau khi có lock, kiểm tra lại cache lần nữa
     if let Some(session_ref) = app.download_cache.get(&download_key_clean) {
+        if session_ref.contract_address != contract_address {
+            return Err(format!(
+                "Download key '{}' belongs to contract {}, but request specified {}",
+                download_key_clean, session_ref.contract_address, contract_address
+            ));
+        }
         return Ok(session_ref);
     }
 

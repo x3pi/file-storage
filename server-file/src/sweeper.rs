@@ -23,7 +23,23 @@ pub fn spawn_background_sweeper(app: Arc<App>) {
                 app.invalid_download_keys.remove(key);
             }
 
-            // 2. Dọn dẹp Download/Upload Session bỏ hoang (mỗi 1 giờ quét 1 lần)
+            // 2. Dọn dẹp Download Session đã hoàn tất (sau 60 giây ân hạn để đóng file handle và giải phóng RAM)
+            let mut confirmed_download_keys = Vec::new();
+            for entry in app.download_cache.iter() {
+                if let Some(confirmed_at) = entry.value().confirmed_at {
+                    if now.duration_since(confirmed_at).as_secs() > 60 {
+                        confirmed_download_keys.push(entry.key().clone());
+                    }
+                }
+            }
+            if !confirmed_download_keys.is_empty() {
+                for key in &confirmed_download_keys {
+                    app.download_cache.remove(key); // Xóa session -> tự động drop và đóng file_handle .bin
+                }
+                log::info!("🧹 Đã dọn dẹp {} download session hoàn tất (đã đóng file handle).", confirmed_download_keys.len());
+            }
+
+            // 3. Dọn dẹp Download/Upload Session bỏ hoang (mỗi 1 giờ quét 1 lần)
             if now.duration_since(last_session_sweep).as_secs() < 3600 {
                 continue;
             }
