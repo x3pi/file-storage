@@ -81,7 +81,7 @@ contract Files is Initializable, UUPSUpgradeable {
     mapping(address => bool) public owners;
     address[] public ownerList;
 
-    uint256 public pricePerChunk = 0.0001 ether;
+    uint256 public pricePerChunk = 0 ether;
     uint256 private _txCounter;
 
     // --- State cho Multi-Server Voting ---
@@ -121,7 +121,6 @@ contract Files is Initializable, UUPSUpgradeable {
         // Logic khởi tạo
         owners[msg.sender] = true;
         ownerList.push(msg.sender);
-        pricePerChunk = 0.0001 ether;
     }
 
     function _authorizeUpgrade(
