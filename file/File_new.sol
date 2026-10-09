@@ -81,7 +81,7 @@ contract Files is Initializable, UUPSUpgradeable {
     mapping(address => bool) public owners;
     address[] public ownerList;
 
-    uint256 public pricePerChunk = 0.0001 ether;
+    uint256 public pricePerChunk = 0 ether;
     uint256 private _txCounter;
 
     // --- State cho Multi-Server Voting ---
@@ -367,6 +367,10 @@ contract Files is Initializable, UUPSUpgradeable {
         Info storage file = mKeyToFileInfo[fileKey];
         require(file.status == FileStatus.Active, "Not active");
         require(block.timestamp <= file.expireTime, "Expired");
+        require(
+            isPublicFile[fileKey] || msg.sender == file.owner || _isInWhitelist[fileKey][msg.sender],
+            "Not authorized to download private file"
+        );
 
         uint256 downloadFee = calculatePrice(file.totalChunks) * downloadTimes;
         require(msg.value >= downloadFee, "Insufficient payment");

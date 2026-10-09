@@ -163,6 +163,19 @@ pub async fn handle_connection(
                         Command::UploadChunk { mut payload } => {
                             payload.file_key = payload.file_key.trim_start_matches("0x").to_string();
                             payload.merkle_root = payload.merkle_root.trim_start_matches("0x").to_string();
+
+                            // SVR-HEX: Kiểm tra nghiêm ngặt file_key phải là 64 ký tự hex thường
+                            let is_valid_hex = payload.file_key.len() == 64
+                                && payload.file_key.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase());
+                            if !is_valid_hex {
+                                log::warn!("[{}] ❌ Invalid file_key format: '{}'", peer_clone, payload.file_key);
+                                let _ = send_error_response(
+                                    &mut stream_handler,
+                                    "Invalid file_key: must be 64 lowercase hex characters",
+                                ).await;
+                                return;
+                            }
+
                             let log_file_key = payload.file_key.clone();
                             let log_chunk_index = payload.chunk_index;
                             

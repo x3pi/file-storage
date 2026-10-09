@@ -198,6 +198,21 @@ pub async fn initialize_download_session<'a>(
     // Chuyển đổi Vec<Address> thành HashSet<Address> để tra cứu nhanh
     let whitelist: std::collections::HashSet<_> = whitelist_addresses.into_iter().collect();
 
+    // BẢO MẬT: Đối với file private, session_user phải là owner hoặc nằm trong whitelist
+    if !is_public && session_info.user != file_info_onchain.owner && !whitelist.contains(&session_info.user) {
+        log::warn!(
+            "❌ Download session unauthorized: user {:?} is neither owner ({:?}) nor in whitelist for private file {}",
+            session_info.user,
+            file_info_onchain.owner,
+            file_key
+        );
+        return Err(format!(
+            "Unauthorized download session: user {:?} is not authorized for private file {}",
+            session_info.user,
+            file_key
+        ));
+    }
+
     // Mở file .bin MỘT LẦN DUY NHẤT cho toàn bộ Session
     let bin_path = file_path.join(format!("{}.bin", file_key));
     let bin_file = std::fs::File::open(&bin_path)

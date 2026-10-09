@@ -274,6 +274,13 @@ async fn handle_upload_chunk(
     payload.file_key = payload.file_key.trim_start_matches("0x").to_string();
     payload.merkle_root = payload.merkle_root.trim_start_matches("0x").to_string();
 
+    let is_valid_hex = payload.file_key.len() == 64
+        && payload.file_key.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase());
+    if !is_valid_hex {
+        let _ = send_error_frame(&mut send, &req.id, resp_command, "Invalid file_key: must be 64 lowercase hex characters").await;
+        return;
+    }
+
     if chunk_data_in.is_empty() {
         let _ = send_error_frame(&mut send, &req.id, resp_command, "chunk data is empty").await;
         return;
@@ -295,7 +302,18 @@ async fn handle_upload_chunk(
 
     match crate::ethereum::verify_upload_chunk(&payload, &chunk_data_in, &app).await {
         Ok(_) => {
-            match app.write_chunk(&payload.file_key, payload.chunk_index, &chunk_data_in).await {
+            let _permit = match app.task_semaphore.acquire().await {
+                Ok(p) => p,
+                Err(e) => {
+                    log::error!("[WT][{}] Semaphore closed: {}", peer_ip, e);
+                    let _ = send_error_frame(&mut send, &req.id, resp_command, "Server is shutting down").await;
+                    return;
+                }
+            };
+            let write_result = app.write_chunk(&payload.file_key, payload.chunk_index, &chunk_data_in).await;
+            drop(_permit);
+
+            match write_result {
                 Ok(_) => {
                     let _ = send_chunk_frame(&mut send, &req.id, resp_command, payload.chunk_index, &[]).await;
                     
@@ -377,8 +395,9 @@ async fn read_frame(stream: &mut wtransport::RecvStream) -> Result<(Vec<u8>, Vec
         .map_err(|e| format!("read length: {}", e))?;
 
     let length = u32::from_be_bytes(len_buf) as usize;
-    if length < 2 || length > 2 * 1024 * 1024 { // 2MB max
-        return Err(format!("invalid frame length: {}", length));
+    const MAX_FRAME_LEN: usize = (crate::models::CHUNK_SIZE as usize) + 65536; // 1MB chunk + 64KB JSON (~1.06MB)
+    if length < 2 || length > MAX_FRAME_LEN {
+        return Err(format!("invalid frame length: {} (max allowed: {})", length, MAX_FRAME_LEN));
     }
 
     let mut json_len_buf = [0u8; 2];

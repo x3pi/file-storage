@@ -210,6 +210,20 @@ impl App {
         let storage_root = self.storage_root.clone();
 
         tokio::task::spawn_blocking(move || {
+            if file_key_owned.len() != 64 || !file_key_owned.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Invalid file key: must be 64 hex characters",
+                ));
+            }
+            let chunk_size = crate::models::CHUNK_SIZE; // 1MB
+            if chunk_data_owned.is_empty() || chunk_data_owned.len() > chunk_size as usize {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Chunk data cannot be empty or exceed 1MB",
+                ));
+            }
+
             let level1 = &file_key_owned[0..2];
             let level2 = &file_key_owned[2..4];
             let file_dir: PathBuf = storage_root.join(level1).join(level2).join(&file_key_owned);
@@ -225,27 +239,29 @@ impl App {
             let open_files = if let Some(files) = file_cache.get(&file_key_owned) {
                 files.value().clone()
             } else {
-                file_cache.entry(file_key_owned.clone()).or_insert_with(|| {
-                    let bin_file = OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .open(&bin_path).unwrap();
-                    let meta_file = OpenOptions::new()
-                        .append(true)
-                        .create(true)
-                        .open(&meta_path).unwrap();
-                    crate::models::OpenFiles {
-                        bin_file: std::sync::Arc::new(bin_file),
-                        meta_file: std::sync::Arc::new(std::sync::Mutex::new(meta_file)),
-                    }
-                }).value().clone()
+                let bin_file = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .open(&bin_path)?;
+                let meta_file = OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(&meta_path)?;
+                let new_open_files = crate::models::OpenFiles {
+                    bin_file: std::sync::Arc::new(bin_file),
+                    meta_file: std::sync::Arc::new(std::sync::Mutex::new(meta_file)),
+                };
+                file_cache.insert(file_key_owned.clone(), new_open_files.clone());
+                new_open_files
             };
 
-            let chunk_size = 1024 * 1024; // 1MB
-            let offset = chunk_index * chunk_size;
+            let offset = chunk_index
+                .checked_mul(chunk_size)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Offset calculation overflowed"))?;
             open_files.bin_file.write_all_at(&chunk_data_owned, offset)?;
 
-            let mut meta_file_guard = open_files.meta_file.lock().unwrap();
+            let mut meta_file_guard = open_files.meta_file.lock()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Mutex poison error: {}", e)))?;
             meta_file_guard.write_all(format!("{}\n", chunk_index).as_bytes())?;
 
             Ok(())
@@ -256,14 +272,14 @@ impl App {
     }
 
     pub fn get_or_init_chunk_tracker(&self, file_key: &str) -> dashmap::mapref::one::RefMut<'_, String, std::collections::HashSet<u64>> {
-        self.chunk_tracker.entry(file_key.to_string()).or_insert_with(|| {
+        if !self.chunk_tracker.contains_key(file_key) {
             let mut existing = std::collections::HashSet::new();
-            if file_key.len() >= 4 {
+            if file_key.len() == 64 && file_key.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
                 let level1 = &file_key[0..2];
                 let level2 = &file_key[2..4];
                 let file_dir: PathBuf = self.storage_root.join(level1).join(level2).join(file_key);
                 let meta_path = file_dir.join(format!("{}.meta", file_key));
-                if meta_path.exists() {
+                if meta_path.is_file() {
                     if let Ok(content) = std::fs::read_to_string(&meta_path) {
                         for line in content.lines() {
                             if let Ok(idx) = line.trim().parse::<u64>() {
@@ -273,7 +289,8 @@ impl App {
                     }
                 }
             }
-            existing
-        })
+            self.chunk_tracker.insert(file_key.to_string(), existing);
+        }
+        self.chunk_tracker.entry(file_key.to_string()).or_insert_with(std::collections::HashSet::new)
     }
 }

@@ -82,10 +82,22 @@ pub async fn verify_upload_chunk(
         ));
     }
 
+    // 1. Validate chunk size (<= 1MB limit and non-empty)
+    if chunk_data.is_empty() {
+        return Err("Chunk data cannot be empty".to_string());
+    }
+    if chunk_data.len() > CHUNK_SIZE as usize {
+        return Err(format!(
+            "Chunk size exceeds 1MB limit: got {} bytes, maximum allowed is {}",
+            chunk_data.len(),
+            CHUNK_SIZE
+        ));
+    }
+
     let clean_merkle_root = payload.merkle_root.trim_start_matches("0x");
 
-    // 1. Check cache first
-    if let Some(cached_info) = app.upload_file_cache.get(&canonical_file_key) {
+    // 2. Check cache first
+    let total_chunks = if let Some(cached_info) = app.upload_file_cache.get(&canonical_file_key) {
         if cached_info.contract_address != c_addr {
             return Err(format!(
                 "File key {} belongs to contract {}, but request specified {}",
@@ -107,6 +119,7 @@ pub async fn verify_upload_chunk(
                 cached_info.merkle_root, clean_merkle_root
             ));
         }
+        cached_info.total_chunks
     } else {
         let lock_key = format!("upload_{}", canonical_file_key);
         let lock_arc = {
@@ -155,6 +168,7 @@ pub async fn verify_upload_chunk(
                     cached_info.merkle_root, clean_merkle_root
                 ));
             }
+            cached_info.total_chunks
         } else {
             // SC validation
             if !app.is_valid_contract(c_addr).await {
@@ -171,6 +185,25 @@ pub async fn verify_upload_chunk(
             // Kiểm tra file thực sự tồn tại trên SC
             if result.owner == Address::ZERO {
                 return Err(format!("File key '{}' does not exist on contract {}", canonical_file_key, c_addr));
+            }
+
+            // Kiểm tra trạng thái và hạn dùng của file trên chain
+            let current_time_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| format!("System time error: {}", e))?
+                .as_secs();
+
+            if result.expireTime > 0 && result.expireTime <= current_time_secs {
+                return Err("File has expired on-chain".to_string());
+            }
+
+            use crate::contracts::file_contract::Files::FileStatus;
+            if result.status == FileStatus::Deleted {
+                return Err("File has been deleted on-chain".to_string());
+            }
+
+            if result.status != FileStatus::Processing {
+                return Err(format!("File status is not Processing: {:?}", result.status));
             }
 
             // Kiểm tra merkle_root gửi lên phải khớp với on-chain
@@ -215,7 +248,31 @@ pub async fn verify_upload_chunk(
                     created_at: std::time::Instant::now(),
                 },
             );
+
+            total_chunks
         }
+    };
+
+    // 3. Verify chunk index boundary
+    if payload.chunk_index >= total_chunks {
+        return Err(format!(
+            "Invalid chunk_index {}: exceeds total_chunks {}",
+            payload.chunk_index, total_chunks
+        ));
+    }
+
+    // 4. Verify Merkle proof depth to prevent second-preimage attack
+    let expected_depth = if total_chunks <= 1 {
+        0
+    } else {
+        total_chunks.next_power_of_two().trailing_zeros() as usize
+    };
+
+    if payload.merkle_proof_hashes.len() != expected_depth {
+        return Err(format!(
+            "Invalid Merkle proof depth: expected {} siblings for total_chunks {}, got {}",
+            expected_depth, total_chunks, payload.merkle_proof_hashes.len()
+        ));
     }
     
     // 4. Verify Merkle Proof (ALWAYS - even for cached files)
@@ -326,7 +383,15 @@ pub async fn verify_download_chunk(
         if !signature_valid {
             match run_recover_address_blocking(payload.download_key.clone(), payload.signature.clone()).await {
                 Ok(recovered_address) => {
-                    if recovered_address == session_owner || recovered_address == session_user || whitelist.contains(&recovered_address) {
+                    let is_authorized = if is_public {
+                        recovered_address == session_owner || recovered_address == session_user || whitelist.contains(&recovered_address)
+                    } else {
+                        // File private: Người ký PHẢI là owner hoặc trong whitelist, VÀ phải là session_user hoặc session_owner
+                        (recovered_address == session_owner || whitelist.contains(&recovered_address))
+                            && (recovered_address == session_user || recovered_address == session_owner)
+                    };
+
+                    if is_authorized {
                         log::info!(
                             "✅ Download authorized: Signer address {:?} verified for download key {}",
                             recovered_address, payload.download_key
@@ -343,7 +408,7 @@ pub async fn verify_download_chunk(
                             session_user
                         );
                         return Err(format!(
-                            "Signer {:?} not authorized for download. Expected owner {:?} or user {:?}",
+                            "Signer {:?} not authorized for download. Expected owner {:?} or authorized session user {:?}",
                             recovered_address, session_owner, session_user
                         ));
                     }
