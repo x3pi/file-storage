@@ -267,8 +267,21 @@ async fn main() {
                             }
                             Err(e) => {
                                 let err_str = e.to_string();
-                                let is_timeout = err_str.to_lowercase().contains("timeout");
-                                if is_timeout {
+                                if is_already_confirmed(&err_str) {
+                                    log::info!("✅ [TX Manager] Batch {} file(s) đã được confirm on-chain trước đó. Xóa khỏi pending.", current_batch.len());
+                                    for k in &current_batch {
+                                        upload_retry_counts.remove(k);
+                                    }
+                                    remove_pending_uploads(&pending_upload_path, &current_batch, &addr.to_string()).await;
+                                } else if is_terminal_contract_revert(&err_str) {
+                                    log::error!("❌ [TX Manager] confirm_upload_batch gặp lỗi contract không thể phục hồi: {}. Ghi vào failed_uploads.txt và xóa khỏi pending.", err_str);
+                                    for k in &current_batch {
+                                        upload_retry_counts.remove(k);
+                                        record_failed_upload(&app_clone.storage_root, k, &addr.to_string(), &err_str).await;
+                                    }
+                                    remove_pending_uploads(&pending_upload_path, &current_batch, &addr.to_string()).await;
+                                } else {
+                                    // Mọi lỗi mạng / RPC tạm thời (timeout, connection reset, nonce, gas price,...): Retry tối đa 5 lần
                                     let mut to_retry = Vec::new();
                                     let mut exceeded_keys = Vec::new();
 
@@ -285,11 +298,20 @@ async fn main() {
 
                                     if !exceeded_keys.is_empty() {
                                         log::error!(
-                                            "❌ [TX Manager] confirm_upload_batch cho {} file(s) đã thất bại sau {} lần thử lại timeout: {:?}. Hủy retry và xóa khỏi pending.",
+                                            "🚨 [TX Manager] confirm_upload_batch cho {} file(s) đã THẤT BẠI sau {} lần thử lại: {}. Lưu vào failed_uploads.txt để admin debug và xóa khỏi pending.",
                                             exceeded_keys.len(),
                                             MAX_TX_RETRIES,
-                                            exceeded_keys
+                                            err_str
                                         );
+                                        for k in &exceeded_keys {
+                                            record_failed_upload(
+                                                &app_clone.storage_root,
+                                                k,
+                                                &addr.to_string(),
+                                                &format!("Exceeded {} retries. Last error: {}", MAX_TX_RETRIES, err_str),
+                                            )
+                                            .await;
+                                        }
                                         remove_pending_uploads(&pending_upload_path, &exceeded_keys, &addr.to_string()).await;
                                     }
 
@@ -298,7 +320,7 @@ async fn main() {
                                         // Exponential backoff: 15s * 2^(attempt - 1), tối đa 120s
                                         let delay_secs = (15u64 * (1u64 << (max_attempt - 1).min(3))).min(120);
                                         log::warn!(
-                                            "⚠️ [TX Manager] confirm_upload_batch timeout: {}. Thử lại {} file(s) sau {}s (lần {}/{})",
+                                            "⚠️ [TX Manager] confirm_upload_batch gặp lỗi tạm thời: {}. Thử lại {} file(s) sau {}s (lần {}/{})",
                                             err_str,
                                             to_retry.len(),
                                             delay_secs,
@@ -313,13 +335,6 @@ async fn main() {
                                             }
                                         });
                                     }
-                                } else {
-                                    // Lỗi dứt khoát (Revert, invalid params, caller not storage,...): Xóa khỏi pending vì retry cũng vô ích
-                                    for k in &current_batch {
-                                        upload_retry_counts.remove(k);
-                                    }
-                                    log::error!("❌ [TX Manager] confirm_upload_batch lỗi không thể phục hồi: {}. Xóa khỏi pending.", err_str);
-                                    remove_pending_uploads(&pending_upload_path, &current_batch, &addr.to_string()).await;
                                 }
                             }
                         }
@@ -357,14 +372,23 @@ async fn main() {
                         }
                         Err(e) => {
                             let err_str = e.to_string();
-                            let is_timeout = err_str.to_lowercase().contains("timeout");
-                            if is_timeout {
+                            if is_already_confirmed(&err_str) {
+                                log::info!("✅ [TX Manager] Download key {} đã được confirm on-chain trước đó. Xóa khỏi pending.", download_key);
+                                download_retry_counts.remove(&download_key);
+                                remove_pending_download(&pending_dl_path, &download_key).await;
+                            } else if is_terminal_contract_revert(&err_str) {
+                                log::error!("❌ [TX Manager] Download confirmation gặp lỗi contract không thể phục hồi: {}. Ghi vào failed_confirmations.txt và xóa khỏi pending.", err_str);
+                                download_retry_counts.remove(&download_key);
+                                record_failed_download(&app_clone.storage_root, &download_key, &contract_addr, &err_str).await;
+                                remove_pending_download(&pending_dl_path, &download_key).await;
+                            } else {
+                                // Mọi lỗi mạng / RPC tạm thời khác -> retry
                                 let count = download_retry_counts.entry(download_key.clone()).or_insert(0);
                                 *count += 1;
                                 if *count <= MAX_TX_RETRIES {
                                     let delay_secs = (15u64 * (1u64 << (*count - 1).min(3))).min(120);
                                     log::warn!(
-                                        "⚠️ [TX Manager] Download confirmation timeout: {}. Thử lại sau {}s (lần {}/{})",
+                                        "⚠️ [TX Manager] Download confirmation gặp lỗi tạm thời: {}. Thử lại sau {}s (lần {}/{})",
                                         err_str,
                                         delay_secs,
                                         *count,
@@ -380,17 +404,20 @@ async fn main() {
                                 } else {
                                     download_retry_counts.remove(&download_key);
                                     log::error!(
-                                        "❌ [TX Manager] Download confirmation cho key {} đã thất bại sau {} lần thử lại timeout. Hủy retry và xóa khỏi pending.",
+                                        "🚨 [TX Manager] Download confirmation cho key {} đã THẤT BẠI sau {} lần thử lại: {}. Lưu vào failed_confirmations.txt để admin debug và xóa khỏi pending.",
                                         download_key,
-                                        MAX_TX_RETRIES
+                                        MAX_TX_RETRIES,
+                                        err_str
                                     );
+                                    record_failed_download(
+                                        &app_clone.storage_root,
+                                        &download_key,
+                                        &contract_addr,
+                                        &format!("Exceeded {} retries. Last error: {}", MAX_TX_RETRIES, err_str),
+                                    )
+                                    .await;
                                     remove_pending_download(&pending_dl_path, &download_key).await;
                                 }
-                            } else {
-                                download_retry_counts.remove(&download_key);
-                                // Lỗi dứt khoát (Revert, Already confirmed, Invalid key,...): Xóa khỏi pending vì retry cũng vô ích
-                                log::error!("❌ [TX Manager] Download confirmation lỗi không thể phục hồi: {}. Xóa khỏi pending.", err_str);
-                                remove_pending_download(&pending_dl_path, &download_key).await;
                             }
                         }
                     }
@@ -577,5 +604,39 @@ pub(crate) async fn remove_pending_download(path: &std::path::Path, download_key
             format!("{}\n", remaining_lines.join("\n"))
         };
         let _ = write_atomic(path, &new_content).await;
+    }
+}
+
+pub(crate) fn is_already_confirmed(err_str: &str) -> bool {
+    let lower = err_str.to_lowercase();
+    lower.contains("already confirmed") || lower.contains("confirmed already")
+}
+
+pub(crate) fn is_terminal_contract_revert(err_str: &str) -> bool {
+    let lower = err_str.to_lowercase();
+    lower.contains("invalid key")
+        || lower.contains("file does not exist")
+        || lower.contains("caller is not a storage server")
+        || lower.contains("not authorized")
+        || lower.contains("unauthorized")
+}
+
+pub(crate) async fn record_failed_upload(storage_root: &std::path::Path, file_key: &str, contract: &str, reason: &str) {
+    let failed_path = storage_root.join("failed_uploads.txt");
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let line = format!("[{}] FileKey: {}, Contract: {}, Reason: {}\n", now, file_key, contract, reason);
+    use tokio::io::AsyncWriteExt;
+    if let Ok(mut file) = tokio::fs::OpenOptions::new().create(true).append(true).open(&failed_path).await {
+        let _ = file.write_all(line.as_bytes()).await;
+    }
+}
+
+pub(crate) async fn record_failed_download(storage_root: &std::path::Path, download_key: &str, contract: &str, reason: &str) {
+    let failed_path = storage_root.join("failed_confirmations.txt");
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let line = format!("[{}] DownloadKey: {}, Contract: {}, Reason: {}\n", now, download_key, contract, reason);
+    use tokio::io::AsyncWriteExt;
+    if let Ok(mut file) = tokio::fs::OpenOptions::new().create(true).append(true).open(&failed_path).await {
+        let _ = file.write_all(line.as_bytes()).await;
     }
 }

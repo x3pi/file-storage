@@ -70,6 +70,18 @@ async fn send_logs_list_response(
     Ok(())
 }
 
+/// So sánh 2 slice byte trong thời gian không đổi (Constant-time) để chống Timing Attack
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// SVR-SEC: Kiểm tra rate limit cho admin log API
 /// Trả về true nếu IP bị block (quá 5 lần sai mật khẩu trong 10 phút)
 pub(crate) fn is_admin_rate_limited(app: &App, ip: IpAddr) -> bool {
@@ -647,7 +659,7 @@ pub async fn handle_connection(
 
                             use sha2::{Digest, Sha256};
                             let incoming_hash = hex::encode(Sha256::digest(payload.password.as_bytes()));
-                            if incoming_hash != app_clone.config.admin_log_password_hash {
+                            if !constant_time_eq(incoming_hash.as_bytes(), app_clone.config.admin_log_password_hash.as_bytes()) {
                                 record_admin_fail(&app_clone, peer_clone.ip());
                                 log::warn!("[{}] ❌ Unauthorized GetLogList attempt with invalid password (fail count incremented)", peer_clone);
                                 let response = LogsListResponse {
@@ -751,7 +763,7 @@ pub async fn handle_connection(
 
                             use sha2::{Digest, Sha256};
                             let incoming_hash = hex::encode(Sha256::digest(payload.password.as_bytes()));
-                            if incoming_hash != app_clone.config.admin_log_password_hash {
+                            if !constant_time_eq(incoming_hash.as_bytes(), app_clone.config.admin_log_password_hash.as_bytes()) {
                                 record_admin_fail(&app_clone, peer_clone.ip());
                                 log::warn!("[{}] ❌ Unauthorized GetLogContent attempt with invalid password (fail count incremented)", peer_clone);
                                 let response = LogsContentResponse {

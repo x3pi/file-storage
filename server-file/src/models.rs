@@ -58,7 +58,7 @@ pub struct DownloadSession {
     pub verified_signature: Arc<Mutex<Option<String>>>,
     pub is_public: bool,
     pub whitelist: HashSet<Address>,
-    pub created_at: Instant, // Lưu thời gian tạo session để Sweeper quét
+    pub last_access: Arc<std::sync::atomic::AtomicU64>, // Thời điểm client tải chunk gần nhất (unix timestamp secs)
     pub file_handle: Arc<std::fs::File>,
 }
 // DashMap: downloadKey -> DownloadSession

@@ -387,3 +387,64 @@ fn test_merkle_depth_calculation() {
     assert_eq!(calc_depth(16), 4);
     assert_eq!(calc_depth(1024), 10);
 }
+
+// =========================================================================
+// 5. SECURITY & DEAD-LETTER LOGGING TESTS
+// =========================================================================
+
+#[test]
+fn test_constant_time_eq_admin_password() {
+    use crate::server::constant_time_eq;
+    assert!(constant_time_eq(b"password123", b"password123"));
+    assert!(!constant_time_eq(b"password123", b"password124"));
+    assert!(!constant_time_eq(b"password123", b"xassword123"));
+    assert!(!constant_time_eq(b"short", b"longer_string"));
+    assert!(constant_time_eq(b"", b""));
+}
+
+#[tokio::test]
+async fn test_failed_dead_letter_logging() {
+    let (storage_root, log_dir) = create_temp_env();
+    let file_key = "abc123key";
+    let contract = "0x1234567890abcdef1234567890abcdef12345678";
+    let reason = "Exceeded 5 retries. Last error: connection refused";
+
+    super::record_failed_upload(&storage_root, file_key, contract, reason).await;
+    let failed_upload_file = storage_root.join("failed_uploads.txt");
+    assert!(failed_upload_file.exists());
+    let content = tokio::fs::read_to_string(&failed_upload_file).await.unwrap();
+    assert!(content.contains(file_key));
+    assert!(content.contains(contract));
+    assert!(content.contains(reason));
+
+    let dl_key = "dlkey456";
+    super::record_failed_download(&storage_root, dl_key, contract, "Invalid key").await;
+    let failed_dl_file = storage_root.join("failed_confirmations.txt");
+    assert!(failed_dl_file.exists());
+    let dl_content = tokio::fs::read_to_string(&failed_dl_file).await.unwrap();
+    assert!(dl_content.contains(dl_key));
+    assert!(dl_content.contains("Invalid key"));
+
+    cleanup_temp_env(storage_root, log_dir);
+}
+
+#[test]
+fn test_error_classification_revert_vs_transient() {
+    // Already confirmed -> xóa bình thường
+    assert!(super::is_already_confirmed("execution reverted: already confirmed"));
+    assert!(super::is_already_confirmed("Confirmed already by peer"));
+
+    // Terminal contract revert -> ghi failed ngay
+    assert!(super::is_terminal_contract_revert("execution reverted: Invalid key"));
+    assert!(super::is_terminal_contract_revert("File does not exist"));
+    assert!(super::is_terminal_contract_revert("Caller is not a storage server"));
+
+    // Transient errors -> phải retry
+    assert!(!super::is_already_confirmed("connection refused"));
+    assert!(!super::is_terminal_contract_revert("connection refused"));
+    assert!(!super::is_terminal_contract_revert("error sending request for url"));
+    assert!(!super::is_terminal_contract_revert("nonce too low"));
+    assert!(!super::is_terminal_contract_revert("replacement transaction underpriced"));
+    assert!(!super::is_terminal_contract_revert("timeout waiting for receipt"));
+}
+

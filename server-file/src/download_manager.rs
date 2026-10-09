@@ -231,7 +231,12 @@ pub async fn initialize_download_session<'a>(
         verified_signature: Arc::new(Mutex::new(None)),
         is_public,
         whitelist,
-        created_at: std::time::Instant::now(), // Ghi nhận thời điểm bắt đầu tải
+        last_access: Arc::new(std::sync::atomic::AtomicU64::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        )),
         file_handle: Arc::new(bin_file),
     };
     // ✅ Insert vào cache
@@ -314,6 +319,11 @@ pub async fn descrease_chunk_count(download_key: &str, app: &Arc<App>) -> Result
             }
         };
         let session = entry.get_mut();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        session.last_access.store(now_secs, std::sync::atomic::Ordering::Relaxed);
         if session.remaining_chunks > 0 {
             session.remaining_chunks -= 1;
             let rem = session.remaining_chunks;

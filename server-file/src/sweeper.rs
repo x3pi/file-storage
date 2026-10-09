@@ -23,6 +23,17 @@ pub fn spawn_background_sweeper(app: Arc<App>) {
                 app.invalid_download_keys.remove(key);
             }
 
+            // 1b. Dọn dẹp Admin Rate Limiter (xóa IP đã hết thời gian phạt 10 phút)
+            let mut expired_admin_ips = Vec::new();
+            for entry in app.admin_rate_limiter.iter() {
+                if entry.value().1.elapsed().as_secs() > 600 {
+                    expired_admin_ips.push(*entry.key());
+                }
+            }
+            for ip in &expired_admin_ips {
+                app.admin_rate_limiter.remove(ip);
+            }
+
             // 2. Dọn dẹp Download Session đã hoàn tất (sau 60 giây ân hạn để đóng file handle và giải phóng RAM)
             let mut confirmed_download_keys = Vec::new();
             for entry in app.download_cache.iter() {
@@ -46,11 +57,16 @@ pub fn spawn_background_sweeper(app: Arc<App>) {
             }
             last_session_sweep = now;
             
-            // Dọn dẹp Download Session theo đúng cấu hình session_timeout_seconds
+            // Dọn dẹp Download Session theo last_access (chỉ xóa khi client bỏ hoang / không tải quá session_timeout_seconds)
             let mut expired_download_keys = Vec::new();
             let dl_timeout_secs = app.config.session_timeout_seconds;
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
             for entry in app.download_cache.iter() {
-                if now.duration_since(entry.created_at).as_secs() > dl_timeout_secs {
+                let last_active = entry.last_access.load(std::sync::atomic::Ordering::Relaxed);
+                if now_secs.saturating_sub(last_active) > dl_timeout_secs {
                     expired_download_keys.push(entry.key().clone());
                 }
             }
@@ -58,7 +74,7 @@ pub fn spawn_background_sweeper(app: Arc<App>) {
                 for key in &expired_download_keys {
                     app.download_cache.remove(key);
                 }
-                log::info!("🧹 Đã dọn dẹp xong {} download session bỏ hoang quá {}s khỏi RAM.", expired_download_keys.len(), dl_timeout_secs);
+                log::info!("🧹 Đã dọn dẹp xong {} download session không hoạt động quá {}s khỏi RAM.", expired_download_keys.len(), dl_timeout_secs);
             }
 
             // 4. Dọn dẹp Upload Session bỏ hoang (dùng chung 30 phút theo cấu hình)
