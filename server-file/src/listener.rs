@@ -8,24 +8,204 @@ use tokio::time::{sleep, Duration};
 use crate::contracts::file_contract::Files::{DownloadKeyConfirmed, FileActivated, FileDeleted};
 use alloy::sol_types::SolEvent;
 
-pub async fn listen_download_confirmed_events(app: Arc<App>) {
-    loop {
-        match listen_download_confirmed_internal(app.clone()).await {
-            Ok(_) => {}
-            Err(_) => {}
-        }
-        sleep(Duration::from_millis(100)).await;
+pub const LAST_SCANNED_BLOCK_FILE: &str = "last_scanned_block.txt";
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CatchupPlan {
+    None { start_block: u64 },
+    CatchupRequired {
+        realtime_start: u64,
+        catchup_from: u64,
+        catchup_to: u64,
+    },
+}
+
+/// Xác định kế hoạch quét block:
+/// - Nếu block trong file > block hiện tại (chain reset / testnet mới): ưu tiên lấy block hiện tại, KHÔNG quét lùi.
+/// - Nếu block trong file < block hiện tại: Luồng 1 chạy từ block hiện tại, Luồng 2 quét bù FileDeleted từ saved + 1 đến current.
+/// - Các trường hợp khác: bắt đầu từ block hiện tại.
+pub fn determine_catchup_plan(saved_block: Option<u64>, current_block: u64) -> CatchupPlan {
+    match saved_block {
+        Some(saved) if saved > current_block => CatchupPlan::None {
+            start_block: current_block,
+        },
+        Some(saved) if saved < current_block => CatchupPlan::CatchupRequired {
+            realtime_start: current_block,
+            catchup_from: saved + 1,
+            catchup_to: current_block,
+        },
+        _ => CatchupPlan::None {
+            start_block: current_block,
+        },
     }
 }
 
-async fn listen_download_confirmed_internal(app: Arc<App>) -> Result<(), String> {
-    // Lấy block hiện tại làm mốc
-    let mut last_block = match get_block_number(&app).await {
+pub async fn read_saved_last_block(storage_root: &std::path::Path) -> Option<u64> {
+    let path = storage_root.join(LAST_SCANNED_BLOCK_FILE);
+    match tokio::fs::read_to_string(&path).await {
+        Ok(content) => content.trim().parse::<u64>().ok(),
+        Err(_) => None,
+    }
+}
+
+pub async fn write_saved_last_block(storage_root: &std::path::Path, block: u64) {
+    let path = storage_root.join(LAST_SCANNED_BLOCK_FILE);
+    let _ = tokio::fs::write(&path, block.to_string()).await;
+}
+
+/// Luồng 2 (Worker ngầm): Quét bù các sự kiện FileDeleted trong quá khứ khi server tắt
+async fn catch_up_historical_deleted_events(app: Arc<App>, from_block: u64, to_target_block: u64) {
+    log::info!(
+        "🚀 [CATCH-UP WORKER] Bắt đầu quét bù FileDeleted từ block {} đến {}...",
+        from_block,
+        to_target_block
+    );
+
+    let mut cursor = from_block;
+    let mut deleted_count = 0;
+
+    while cursor <= to_target_block {
+        let chunk_to = (cursor + 499).min(to_target_block);
+        let filter = Filter::new()
+            .from_block(cursor)
+            .to_block(chunk_to)
+            .event_signature(vec![FileDeleted::SIGNATURE_HASH]);
+
+        #[derive(serde::Serialize)]
+        struct RpcRequest<'a> {
+            jsonrpc: &'static str,
+            id: u64,
+            method: &'static str,
+            params: Vec<&'a Filter>,
+        }
+
+        let req = RpcRequest {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "eth_getLogs",
+            params: vec![&filter],
+        };
+
+        match app.http_client.post(&app.config.rpc_url).json(&req).send().await {
+            Ok(resp) => {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    if let Some(result) = json.get("result") {
+                        if !result.is_null() {
+                            if let Ok(logs) = serde_json::from_value::<Vec<alloy::rpc::types::eth::Log>>(result.clone()) {
+                                for log in logs {
+                                    if let Ok(true) = app.check_contract_validity(log.address()).await {
+                                        if let Ok(event) = FileDeleted::decode_log(&log.inner.clone().into()) {
+                                            deleted_count += 1;
+                                            process_file_deleted_event(event.fileKey, log.address(), &app).await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        cursor = chunk_to + 1;
+                    } else if let Some(err) = json.get("error") {
+                        let err_str = err.to_string();
+                        log::warn!(
+                            "⚠️ [CATCH-UP WORKER] RPC error cho block {}..={}: {}.",
+                            cursor,
+                            chunk_to,
+                            err_str
+                        );
+                        if err_str.contains("prune") || err_str.contains("range") {
+                            log::error!("🛑 [CATCH-UP WORKER] Block cũ bị RPC prune. Dừng quét bù.");
+                            break;
+                        }
+                        cursor = chunk_to + 1;
+                    } else {
+                        cursor = chunk_to + 1;
+                    }
+                } else {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+            Err(e) => {
+                log::warn!("⚠️ [CATCH-UP WORKER] Lỗi kết nối RPC: {}. Thử lại sau 1s...", e);
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    log::info!(
+        "✅ [CATCH-UP WORKER] Hoàn tất quét bù! Đã xử lý {} sự kiện FileDeleted trong phạm vi block {}..={}",
+        deleted_count,
+        from_block,
+        to_target_block
+    );
+}
+
+pub async fn listen_download_confirmed_events(app: Arc<App>) {
+    let mut is_initial_start = true;
+    loop {
+        match listen_download_confirmed_internal(app.clone(), is_initial_start).await {
+            Ok(_) => {}
+            Err(e) => {
+                log::warn!("⚠️ [LISTENER] Polling error: {}. Reconnecting in 1s...", e);
+            }
+        }
+        is_initial_start = false;
+        sleep(Duration::from_millis(1000)).await;
+    }
+}
+
+async fn listen_download_confirmed_internal(
+    app: Arc<App>,
+    is_initial_start: bool,
+) -> Result<(), String> {
+    let current_block = match get_block_number(&app).await {
         Ok(b) => b,
         Err(e) => return Err(format!("Failed to get initial block number: {}", e)),
     };
 
-    log::info!("🔄 [POLLING] Started polling for events from block {}", last_block);
+    let saved_block = read_saved_last_block(&app.storage_root).await;
+    let mut last_block = current_block;
+
+    if is_initial_start {
+        let plan = determine_catchup_plan(saved_block, current_block);
+        match plan {
+            CatchupPlan::None { start_block } => {
+                if let Some(saved) = saved_block {
+                    if saved > current_block {
+                        log::warn!(
+                            "⚠️ [LISTENER] Block trong file ({}) > block hiện tại ({}) (có thể do reset mạng blockchain). Ưu tiên lấy block hiện tại {} và KHÔNG quét lùi.",
+                            saved, current_block, current_block
+                        );
+                        write_saved_last_block(&app.storage_root, current_block).await;
+                    }
+                } else {
+                    write_saved_last_block(&app.storage_root, current_block).await;
+                }
+                last_block = start_block;
+            }
+            CatchupPlan::CatchupRequired {
+                realtime_start,
+                catchup_from,
+                catchup_to,
+            } => {
+                log::info!(
+                    "🔄 [LISTENER] Phát hiện saved_block={} < current_block={}. Khởi chạy luồng 2 quét bù FileDeleted từ block {} đến {}.",
+                    catchup_from - 1, current_block, catchup_from, catchup_to
+                );
+                let app_catchup = app.clone();
+                tokio::spawn(async move {
+                    catch_up_historical_deleted_events(app_catchup, catchup_from, catchup_to).await;
+                });
+                last_block = realtime_start;
+            }
+        }
+    } else if let Some(saved) = saved_block {
+        if saved <= current_block {
+            last_block = saved;
+        }
+    }
+
+    log::info!("🔄 [POLLING] Started realtime polling for events from block {}", last_block);
 
     let mut consecutive_parse_errors = 0;
 
@@ -130,6 +310,7 @@ async fn listen_download_confirmed_internal(app: Arc<App>) -> Result<(), String>
             // Cập nhật last_block CHỈ KHI lấy log thành công
             if poll_succeeded {
                 last_block = to_block;
+                write_saved_last_block(&app.storage_root, to_block).await;
             } else {
                 log::warn!("⚠️ [EVENT RETRY] get_logs failed for blocks {} to {}. Will retry next poll.", last_block + 1, to_block);
             }

@@ -435,3 +435,46 @@ fn test_error_classification_revert_vs_transient() {
     assert!(!super::is_terminal_contract_revert("timeout waiting for receipt"));
 }
 
+#[tokio::test]
+async fn test_listener_catchup_plan_and_block_persistence() {
+    use crate::listener::{determine_catchup_plan, read_saved_last_block, write_saved_last_block, CatchupPlan};
+
+    // 1. Trường hợp: Block trong file (200_000) > Block hiện tại (500) do reset mạng
+    // Yêu cầu: Ưu tiên lấy block hiện tại, KHÔNG quét lùi
+    let plan_reset = determine_catchup_plan(Some(200_000), 500);
+    assert_eq!(plan_reset, CatchupPlan::None { start_block: 500 });
+
+    // 2. Trường hợp: Block trong file (95_000) < Block hiện tại (100_000) do tắt server
+    // Yêu cầu: Luồng 1 chạy realtime từ 100_000, Luồng 2 quét bù FileDeleted từ 95_001..=100_000
+    let plan_catchup = determine_catchup_plan(Some(95_000), 100_000);
+    assert_eq!(
+        plan_catchup,
+        CatchupPlan::CatchupRequired {
+            realtime_start: 100_000,
+            catchup_from: 95_001,
+            catchup_to: 100_000,
+        }
+    );
+
+    // 3. Trường hợp: Block trong file trùng với block hiện tại
+    let plan_equal = determine_catchup_plan(Some(100_000), 100_000);
+    assert_eq!(plan_equal, CatchupPlan::None { start_block: 100_000 });
+
+    // 4. Trường hợp: Chưa có file lưu block (None)
+    let plan_none = determine_catchup_plan(None, 100_000);
+    assert_eq!(plan_none, CatchupPlan::None { start_block: 100_000 });
+
+    // 5. Kiểm tra đọc/ghi block vào file trên đĩa
+    let (storage_root, log_dir) = create_temp_env();
+    assert_eq!(read_saved_last_block(&storage_root).await, None);
+
+    write_saved_last_block(&storage_root, 12345).await;
+    assert_eq!(read_saved_last_block(&storage_root).await, Some(12345));
+
+    write_saved_last_block(&storage_root, 67890).await;
+    assert_eq!(read_saved_last_block(&storage_root).await, Some(67890));
+
+    cleanup_temp_env(storage_root, log_dir);
+}
+
+

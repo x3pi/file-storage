@@ -629,6 +629,7 @@ pub(crate) async fn record_failed_upload(storage_root: &std::path::Path, file_ke
     use tokio::io::AsyncWriteExt;
     if let Ok(mut file) = tokio::fs::OpenOptions::new().create(true).append(true).open(&failed_path).await {
         let _ = file.write_all(line.as_bytes()).await;
+        let _ = file.flush().await;
     }
 }
 
@@ -639,5 +640,6 @@ pub(crate) async fn record_failed_download(storage_root: &std::path::Path, downl
     use tokio::io::AsyncWriteExt;
     if let Ok(mut file) = tokio::fs::OpenOptions::new().create(true).append(true).open(&failed_path).await {
         let _ = file.write_all(line.as_bytes()).await;
+        let _ = file.flush().await;
     }
 }
