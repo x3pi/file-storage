@@ -182,7 +182,7 @@ async fn handle_download_chunk(
             return;
         }
     };
-    payload.download_key = payload.download_key.trim_start_matches("0x").trim_start_matches("0X").to_lowercase();
+    payload.download_key = payload.download_key.trim_start_matches("0x").to_string();
 
     // --- Xây dựng payload để tái dụng business logic hiện có ---
     let mut dl_payload = DownloadChunkPayload {
@@ -270,8 +270,9 @@ async fn handle_upload_chunk(
         }
     };
     
-    // Đảm bảo file_key thống nhất viết thường và không có '0x' ở đầu
-    payload.file_key = payload.file_key.trim_start_matches("0x").trim_start_matches("0X").to_lowercase();
+    // Cắt bỏ prefix 0x
+    payload.file_key = payload.file_key.trim_start_matches("0x").to_string();
+    payload.merkle_root = payload.merkle_root.trim_start_matches("0x").to_string();
 
     if chunk_data_in.is_empty() {
         let _ = send_error_frame(&mut send, &req.id, resp_command, "chunk data is empty").await;

@@ -16,7 +16,7 @@ pub async fn initialize_download_session<'a>(
     app: &'a Arc<App>,
     _request_ip: IpAddr,
 ) -> Result<Ref<'a, String, DownloadSession>, String> {
-    let download_key_clean = download_key.trim_start_matches("0x").trim_start_matches("0X").to_lowercase();
+    let download_key_clean = download_key.trim_start_matches("0x").to_string();
     let timeout_duration = Duration::from_secs(app.config.session_timeout_seconds);
 
     // 0. Kiểm tra contract hợp lệ
@@ -101,7 +101,7 @@ pub async fn initialize_download_session<'a>(
         Ok(b) => {
             app.invalid_download_keys.insert(download_key_clean.clone(), std::time::Instant::now());
             return Err(format!(
-                "Invalid download key length: expected 32 bytes, got {} bytes",
+                "Invalid download key length: expected 32 bytes (64 hex characters), got {} bytes",
                 b.len()
             ));
         }
@@ -110,6 +110,14 @@ pub async fn initialize_download_session<'a>(
             return Err(format!("Invalid download key hex: {}", e));
         }
     };
+
+    let canonical_key = hex::encode(&download_key_bytes);
+    if download_key_clean != canonical_key {
+        return Err(format!(
+            "Download key format mismatch: '{}' must match on-chain canonical hex (lowercase 64 chars)",
+            download_key_clean
+        ));
+    }
 
     let download_key_b256 = B256::from_slice(&download_key_bytes);
     
@@ -282,7 +290,7 @@ pub async fn list_chunks(file_path: &Path) -> Result<Vec<u64>, String> {
     Ok(chunks)
 }
 pub async fn descrease_chunk_count(download_key: &str, app: &Arc<App>) -> Result<u64, String> {
-    let download_key_clean = download_key.trim_start_matches("0x").trim_start_matches("0X").to_lowercase();
+    let download_key_clean = download_key.trim_start_matches("0x").to_string();
     let (remaining, should_confirm, contract_address) = {
         let mut entry = match app.download_cache.entry(download_key_clean.clone()) {
             dashmap::mapref::entry::Entry::Occupied(o) => o,

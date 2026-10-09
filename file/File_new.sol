@@ -368,13 +368,18 @@ contract Files is Initializable, UUPSUpgradeable {
         require(file.status == FileStatus.Active, "Not active");
         require(block.timestamp <= file.expireTime, "Expired");
 
-        uint256 downloadFee = calculatePrice(file.totalChunks) *
-            downloadTimes;
+        uint256 downloadFee = calculatePrice(file.totalChunks) * downloadTimes;
         require(msg.value >= downloadFee, "Insufficient payment");
 
         _txCounter++;
         bytes32 downloadKey = keccak256(
-            abi.encodePacked(address(this), fileKey, msg.sender, block.timestamp, _txCounter)
+            abi.encodePacked(
+                address(this),
+                fileKey,
+                msg.sender,
+                block.timestamp,
+                _txCounter
+            )
         );
 
         mDownloadKeyToSession[downloadKey] = DownloadSession({
@@ -402,7 +407,9 @@ contract Files is Initializable, UUPSUpgradeable {
         }
         session.confirmations.push(msg.sender);
         Info storage file = mKeyToFileInfo[session.fileKey];
-        uint256 requiredConfirmations = file.totalChunks > 1 ? storageServerList.length : 1;
+        uint256 requiredConfirmations = file.totalChunks > 1
+            ? storageServerList.length
+            : 1;
         if (session.confirmations.length >= requiredConfirmations) {
             session.isConfirmed = true;
             emit DownloadKeyConfirmed(downloadKey, session.fileKey);
@@ -430,10 +437,7 @@ contract Files is Initializable, UUPSUpgradeable {
     // --- CÁC HÀM MỚI TỪ FileV2 ---
 
     function setPublicStatus(bytes32 fileKey, bool status) public virtual {
-        require(
-            mKeyToFileInfo[fileKey].owner == msg.sender,
-            "Not file owner"
-        );
+        require(mKeyToFileInfo[fileKey].owner == msg.sender, "Not file owner");
         isPublicFile[fileKey] = status;
     }
 
@@ -441,10 +445,7 @@ contract Files is Initializable, UUPSUpgradeable {
         bytes32 fileKey,
         address[] calldata users
     ) public virtual {
-        require(
-            mKeyToFileInfo[fileKey].owner == msg.sender,
-            "Not file owner"
-        );
+        require(mKeyToFileInfo[fileKey].owner == msg.sender, "Not file owner");
         address[] storage currentList = _fileWhitelists[fileKey];
         for (uint256 i = 0; i < users.length; i++) {
             if (!_isInWhitelist[fileKey][users[i]] && users[i] != address(0)) {
@@ -473,10 +474,7 @@ contract Files is Initializable, UUPSUpgradeable {
         bytes32 fileKey,
         address[] calldata users
     ) external virtual {
-        require(
-            mKeyToFileInfo[fileKey].owner == msg.sender,
-            "Not file owner"
-        );
+        require(mKeyToFileInfo[fileKey].owner == msg.sender, "Not file owner");
         address[] storage currentList = _fileWhitelists[fileKey];
         for (uint256 i = 0; i < users.length; i++) {
             address userToRemove = users[i];
@@ -494,7 +492,9 @@ contract Files is Initializable, UUPSUpgradeable {
         }
     }
 
-    function confirmServerUploadBatch(bytes32[] calldata fileKeys) external virtual onlyStorage {
+    function confirmServerUploadBatch(
+        bytes32[] calldata fileKeys
+    ) external virtual onlyStorage {
         for (uint256 i = 0; i < fileKeys.length; i++) {
             bytes32 fileKey = fileKeys[i];
             Info storage file = mKeyToFileInfo[fileKey];
@@ -503,11 +503,13 @@ contract Files is Initializable, UUPSUpgradeable {
                 if (!hasVoted[fileKey][msg.sender]) {
                     hasVoted[fileKey][msg.sender] = true;
                     fileVotes[fileKey] += 1;
-                    
+
                     // Nếu file có > 1 chunk thì cần getRequiredVotes() vote
                     // Nếu file có 1 chunk thì chỉ cần 1 vote (từ server chẵn)
-                    uint256 requiredVotes = file.totalChunks > 1 ? getRequiredVotes() : 1;
-                    
+                    uint256 requiredVotes = file.totalChunks > 1
+                        ? getRequiredVotes()
+                        : 1;
+
                     if (fileVotes[fileKey] >= requiredVotes) {
                         file.status = FileStatus.Active;
                         emit FileActivated(file.owner, fileKey);

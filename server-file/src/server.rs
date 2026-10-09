@@ -161,7 +161,8 @@ pub async fn handle_connection(
                 
                 match command {
                         Command::UploadChunk { mut payload } => {
-                            payload.file_key = payload.file_key.trim_start_matches("0x").trim_start_matches("0X").to_lowercase();
+                            payload.file_key = payload.file_key.trim_start_matches("0x").to_string();
+                            payload.merkle_root = payload.merkle_root.trim_start_matches("0x").to_string();
                             let log_file_key = payload.file_key.clone();
                             let log_chunk_index = payload.chunk_index;
                             
@@ -480,8 +481,8 @@ pub async fn handle_connection(
                             }
                         }
                         Command::DownloadChunkRequest { mut payload } => {
-                            payload.file_key = payload.file_key.trim_start_matches("0x").trim_start_matches("0X").to_lowercase();
-                            payload.download_key = payload.download_key.trim_start_matches("0x").trim_start_matches("0X").to_lowercase();
+                            payload.file_key = payload.file_key.trim_start_matches("0x").to_string();
+                            payload.download_key = payload.download_key.trim_start_matches("0x").to_string();
                             let log_file_key = payload.file_key.clone();
                             let log_chunk_index = payload.chunk_index;
 
