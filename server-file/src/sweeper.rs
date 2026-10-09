@@ -39,8 +39,8 @@ pub fn spawn_background_sweeper(app: Arc<App>) {
                 log::info!("🧹 Đã dọn dẹp {} download session hoàn tất (đã đóng file handle).", confirmed_download_keys.len());
             }
 
-            // 3. Dọn dẹp Download/Upload Session bỏ hoang (mỗi 5 phút quét 1 lần)
-            let sweep_interval = std::cmp::min(app.config.session_timeout_seconds, 300);
+            // 3. Dọn dẹp Download/Upload Session bỏ hoang (mỗi 15 phút quét 1 lần)
+            let sweep_interval = 900; // 15 phút quét một lần để tiết kiệm CPU
             if now.duration_since(last_session_sweep).as_secs() < sweep_interval {
                 continue;
             }
