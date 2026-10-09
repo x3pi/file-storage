@@ -47,3 +47,21 @@ pub async fn write_atomic(path: &std::path::Path, content: &str) -> std::io::Res
     tokio::fs::rename(&tmp_path, path).await?;
     Ok(())
 }
+
+/// Dọn các file tạm `*.tmp.<pid>.<nonce>` do `write_atomic` để lại khi process crash giữa `write` và `rename`.
+/// Chỉ quét thư mục gốc (không đệ quy). Trả về số file đã xoá.
+pub async fn cleanup_stale_tmp_files(dir: &std::path::Path) -> usize {
+    let mut removed = 0;
+    if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.contains(".tmp.") && entry.file_type().await.map(|t| t.is_file()).unwrap_or(false) {
+                if tokio::fs::remove_file(entry.path()).await.is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+    }
+    removed
+}

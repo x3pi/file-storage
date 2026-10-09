@@ -325,8 +325,9 @@ fn test_tx_manager_exponential_backoff_calculation() {
     assert_eq!(retry_delay_secs(5), 120); // Lần 5: cap ở 120s
     assert_eq!(retry_delay_secs(6), 120);
 
-    // Kiểm tra hằng số MAX_TX_RETRIES = 5
-    assert_eq!(super::MAX_TX_RETRIES, 5);
+    // MAX_TX_RETRIES phải đủ lớn để chịu outage ~1 giờ: tổng backoff >= 3000s
+    let total: u64 = (1..=super::MAX_TX_RETRIES).map(retry_delay_secs).sum();
+    assert!(total >= 3000, "tổng thời gian retry quá ngắn: {}s", total);
 }
 
 // =========================================================================
@@ -480,23 +481,25 @@ async fn test_listener_catchup_plan_and_block_persistence() {
         cursor: 97_500,
         to: 100_000,
     };
-    let plan_resumed = determine_catchup_plan(Some(100_010), Some(saved_progress), 105_000);
+    let plan_resumed = determine_catchup_plan(Some(100_010), Some(saved_progress.clone()), 105_000);
     assert_eq!(
         plan_resumed,
         CatchupPlanResult {
             realtime_start: 105_000,
-            catchup_ranges: vec![
-                BlockRange {
-                    from: 97_500,
-                    to: 100_000,
-                },
-                BlockRange {
-                    from: 100_011,
-                    to: 105_000,
-                },
-            ],
+            // Gộp thành MỘT dải duy nhất [cursor cũ .. current] để chỉ cần 1 file tiến độ là đủ
+            catchup_ranges: vec![BlockRange {
+                from: 97_500,
+                to: 105_000,
+            }],
             should_clear_catchup_file: false,
         }
+    );
+
+    // 3b. Chỉ có tiến độ dở dang, không có khoảng trống mới (saved == current)
+    let plan_only_progress = determine_catchup_plan(Some(100_010), Some(saved_progress), 100_010);
+    assert_eq!(
+        plan_only_progress.catchup_ranges,
+        vec![BlockRange { from: 97_500, to: 100_000 }]
     );
 
     // 4. Trường hợp: Block trùng nhau hoặc chưa có file
@@ -530,3 +533,35 @@ async fn test_listener_catchup_plan_and_block_persistence() {
 }
 
 
+
+
+#[test]
+fn test_classify_rpc_error_and_catchup_backoff() {
+    use crate::listener::{catchup_backoff_ms, classify_rpc_error, RpcErrorKind};
+
+    assert_eq!(classify_rpc_error("{\"message\":\"block range is too large\"}"), RpcErrorKind::RangeTooLarge);
+    assert_eq!(classify_rpc_error("query returned more than 10000 results, limit exceeded"), RpcErrorKind::RangeTooLarge);
+    assert_eq!(classify_rpc_error("historical state has been pruned"), RpcErrorKind::Pruned);
+    assert_eq!(classify_rpc_error("missing trie node"), RpcErrorKind::Pruned);
+    assert_eq!(classify_rpc_error("internal error"), RpcErrorKind::Other);
+
+    assert_eq!(catchup_backoff_ms(1), 1000);
+    assert_eq!(catchup_backoff_ms(2), 2000);
+    assert_eq!(catchup_backoff_ms(3), 4000);
+    assert_eq!(catchup_backoff_ms(6), 30_000);
+    assert_eq!(catchup_backoff_ms(100), 30_000);
+}
+
+#[tokio::test]
+async fn test_cleanup_stale_tmp_files() {
+    let (storage_root, log_dir) = create_temp_env();
+    std::fs::write(storage_root.join("pending_uploads.tmp.123.456"), "x").unwrap();
+    std::fs::write(storage_root.join("pending_uploads.txt"), "keep").unwrap();
+
+    let removed = crate::utils::cleanup_stale_tmp_files(&storage_root).await;
+    assert_eq!(removed, 1);
+    assert!(storage_root.join("pending_uploads.txt").exists());
+    assert!(!storage_root.join("pending_uploads.tmp.123.456").exists());
+
+    cleanup_temp_env(storage_root, log_dir);
+}

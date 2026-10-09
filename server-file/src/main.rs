@@ -14,7 +14,9 @@ pub mod utils;
 #[cfg(test)]
 mod tests;
 
-pub(crate) const MAX_TX_RETRIES: u32 = 5;
+/// Số lần retry tối đa cho lỗi tạm thời. Với backoff 15s,30s,60s rồi 120s/lần, 30 lần ≈ 1 giờ
+/// -> chịu được outage RPC/chain khoảng 1 giờ trước khi chuyển sang failed_*.txt.
+pub(crate) const MAX_TX_RETRIES: u32 = 30;
 use crate::app::App;
 use flexi_logger::{detailed_format, Cleanup, Criterion, FileSpec, Logger, Naming};
 use network::transport::Transport;
@@ -100,6 +102,10 @@ async fn main() {
             app.storage_root.display(),
             e
         );
+    }
+    let stale_tmp = utils::cleanup_stale_tmp_files(&app.storage_root).await;
+    if stale_tmp > 0 {
+        log::info!("🧹 Đã dọn {} file tạm *.tmp.* còn sót lại trong {:?}", stale_tmp, app.storage_root);
     }
     tokio::spawn(async move {
         let mut sys = System::new();

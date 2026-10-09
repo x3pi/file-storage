@@ -31,8 +31,9 @@ pub struct CatchupPlanResult {
 }
 
 /// Xác định kế hoạch quét block đảm bảo:
-/// 1. KHÔNG QUÉT TRÙNG (No Overlaps): Các dải block khép kín, không chồng chéo với Realtime.
-/// 2. KHÔNG QUÉT THỪA (No Redundant work): Bỏ qua nếu đã quét, xử lý nối dải nếu crash nhiều lần.
+/// 1. KHÔNG SÓT: luôn gộp mọi khoảng cần quét (tiến trình dở dang + khoảng trống mới) thành MỘT dải duy nhất,
+///    nên chỉ cần lưu một dải vào `catchup_progress.txt` là đủ — crash nhiều lần cũng không mất khoảng nào.
+/// 2. Quét lại một phần là an toàn (xử lý FileDeleted idempotent, có kiểm tra đĩa trước).
 /// 3. RESET SAFETY: Nếu block trong file > current_block -> Ưu tiên current_block, KHÔNG quét lùi.
 pub fn determine_catchup_plan(
     saved_last_block: Option<u64>,
@@ -50,47 +51,33 @@ pub fn determine_catchup_plan(
         }
     }
 
-    let mut ranges = Vec::new();
+    let mut from: Option<u64> = None;
+    let mut to: u64 = 0;
 
-    // 2. Nếu có tiến trình quét bù cũ dở dang (do restart giữa chừng)
+    // 2. Tiến trình quét bù cũ dở dang (do restart giữa chừng)
     if let Some(catchup) = saved_catchup {
         if catchup.cursor <= catchup.to && catchup.to <= current_block {
-            ranges.push(BlockRange {
-                from: catchup.cursor,
-                to: catchup.to,
-            });
+            from = Some(catchup.cursor);
+            to = catchup.to;
         }
     }
 
-    // 3. Nếu có khoảng trống giữa saved_last_block và current_block
+    // 3. Khoảng trống giữa saved_last_block và current_block
     if let Some(saved) = saved_last_block {
         if saved < current_block {
-            let new_from = saved + 1;
-            let new_to = current_block;
-
-            // Kiểm tra xem có bị trùng với range cũ không
-            if let Some(last_range) = ranges.last_mut() {
-                if last_range.to == saved {
-                    // Nối liền 2 dải
-                    last_range.to = new_to;
-                } else if new_from > last_range.to {
-                    ranges.push(BlockRange {
-                        from: new_from,
-                        to: new_to,
-                    });
-                }
-            } else {
-                ranges.push(BlockRange {
-                    from: new_from,
-                    to: new_to,
-                });
-            }
+            from = Some(from.map_or(saved + 1, |f| f.min(saved + 1)));
+            to = to.max(current_block);
         }
     }
+
+    let catchup_ranges = match from {
+        Some(f) if f <= to => vec![BlockRange { from: f, to }],
+        _ => Vec::new(),
+    };
 
     CatchupPlanResult {
         realtime_start: current_block,
-        catchup_ranges: ranges,
+        catchup_ranges,
         should_clear_catchup_file: false,
     }
 }
@@ -134,7 +121,45 @@ pub async fn clear_catchup_progress(storage_root: &std::path::Path) {
     let _ = tokio::fs::remove_file(&path).await;
 }
 
-/// Luồng 2 (Worker ngầm): Quét bù các sự kiện FileDeleted trong quá khứ khi server tắt
+#[derive(Debug, PartialEq, Eq)]
+pub enum RpcErrorKind {
+    /// Dải block/kết quả quá lớn -> giảm kích thước đoạn quét rồi thử lại
+    RangeTooLarge,
+    /// Dữ liệu lịch sử đã bị node RPC cắt bỏ -> không thể quét bù
+    Pruned,
+    /// Lỗi khác (tạm thời) -> thử lại với backoff
+    Other,
+}
+
+/// Phân loại lỗi trả về từ `eth_getLogs`.
+pub fn classify_rpc_error(err_str: &str) -> RpcErrorKind {
+    let lower = err_str.to_lowercase();
+    if lower.contains("prune") || lower.contains("missing trie") || lower.contains("history has been") {
+        RpcErrorKind::Pruned
+    } else if lower.contains("range")
+        || lower.contains("too large")
+        || lower.contains("too many")
+        || lower.contains("exceed")
+        || lower.contains("limit")
+    {
+        RpcErrorKind::RangeTooLarge
+    } else {
+        RpcErrorKind::Other
+    }
+}
+
+/// Backoff cho worker quét bù: 1s, 2s, 4s ... tối đa 30s.
+pub fn catchup_backoff_ms(consecutive_errors: u32) -> u64 {
+    (1000u64 << consecutive_errors.saturating_sub(1).min(5)).min(30_000)
+}
+
+const CATCHUP_MAX_STEP: u64 = 500;
+
+/// Luồng 2 (Worker ngầm): Quét bù các sự kiện FileDeleted trong quá khứ khi server tắt.
+/// - Chỉ tiến `cursor` (và ghi `catchup_progress.txt`) khi một đoạn đã xử lý xong.
+/// - Lỗi "range quá lớn": giảm kích thước đoạn rồi thử lại, KHÔNG bỏ dải.
+/// - Lỗi "pruned": dừng worker, GIỮ nguyên file tiến độ để admin xử lý (không xoá).
+/// - Lỗi mạng/RPC khác: backoff tăng dần (tối đa 30s), không bao giờ tự bỏ dải.
 async fn catch_up_historical_deleted_events(app: Arc<App>, ranges: Vec<BlockRange>) {
     if ranges.is_empty() {
         return;
@@ -157,13 +182,15 @@ async fn catch_up_historical_deleted_events(app: Arc<App>, ranges: Vec<BlockRang
         );
 
         let mut cursor = range.from;
-        let mut consecutive_errors = 0;
+        let mut step = CATCHUP_MAX_STEP;
+        let mut consecutive_errors: u32 = 0;
+        let mut consecutive_parse_errors = 0;
 
         // Ghi mốc khởi đầu của dải này trước khi vào vòng lặp
         write_catchup_progress(&app.storage_root, cursor, range.to).await;
 
         while cursor <= range.to {
-            let chunk_to = (cursor + 499).min(range.to);
+            let chunk_to = (cursor + step - 1).min(range.to);
             let mut batch_deleted_count = 0;
 
             let filter = Filter::new()
@@ -189,97 +216,106 @@ async fn catch_up_historical_deleted_events(app: Arc<App>, ranges: Vec<BlockRang
             let mut batch_succeeded = false;
 
             match app.http_client.post(&app.config.rpc_url).json(&req).send().await {
-                Ok(resp) => {
-                    match resp.json::<serde_json::Value>().await {
-                        Ok(json) => {
-                            if let Some(result) = json.get("result") {
-                                if result.is_null() {
-                                    batch_succeeded = true;
-                                    consecutive_errors = 0;
-                                } else {
-                                    match serde_json::from_value::<Vec<alloy::rpc::types::eth::Log>>(result.clone()) {
-                                        Ok(logs) => {
-                                            batch_succeeded = true;
-                                            consecutive_errors = 0;
+                Ok(resp) => match resp.json::<serde_json::Value>().await {
+                    Ok(json) => {
+                        if let Some(result) = json.get("result") {
+                            if result.is_null() {
+                                batch_succeeded = true;
+                            } else {
+                                match serde_json::from_value::<Vec<alloy::rpc::types::eth::Log>>(result.clone()) {
+                                    Ok(logs) => {
+                                        batch_succeeded = true;
+                                        consecutive_parse_errors = 0;
 
-                                            for log in logs {
-                                                if let Ok(event) = FileDeleted::decode_log(&log.inner.clone().into()) {
-                                                    let file_key_hex = hex::encode(event.fileKey);
+                                        for log in logs {
+                                            if let Ok(event) = FileDeleted::decode_log(&log.inner.clone().into()) {
+                                                let file_key_hex = hex::encode(event.fileKey);
 
-                                                    // 🎯 CẢI TIẾN 2: DISK-FIRST CHECK (Chống quét thừa RPC, tăng tốc 50 lần)
-                                                    // Nếu file không tồn tại trên ổ cứng của server này -> Bỏ qua ngay lập tức!
-                                                    if file_key_hex.len() >= 4 {
-                                                        let level1 = &file_key_hex[0..2];
-                                                        let level2 = &file_key_hex[2..4];
-                                                        let file_dir = app.storage_root.join(level1).join(level2).join(&file_key_hex);
-                                                        if !file_dir.exists() {
-                                                            continue;
-                                                        }
+                                                // DISK-FIRST CHECK: file không có trên ổ cứng của node này -> bỏ qua, không tốn RPC
+                                                let level1 = &file_key_hex[0..2];
+                                                let level2 = &file_key_hex[2..4];
+                                                let file_dir = app.storage_root.join(level1).join(level2).join(&file_key_hex);
+                                                if !tokio::fs::try_exists(&file_dir).await.unwrap_or(false) {
+                                                    continue;
+                                                }
+
+                                                match app.check_contract_validity(log.address()).await {
+                                                    Ok(true) => {
+                                                        total_deleted += 1;
+                                                        batch_deleted_count += 1;
+                                                        process_file_deleted_event(event.fileKey, log.address(), &app).await;
                                                     }
-
-                                                    // Chỉ khi file THỰC SỰ có trên đĩa cứng mới kiểm tra contract và xóa
-                                                    match app.check_contract_validity(log.address()).await {
-                                                        Ok(true) => {
-                                                            total_deleted += 1;
-                                                            batch_deleted_count += 1;
-                                                            process_file_deleted_event(event.fileKey, log.address(), &app).await;
-                                                        }
-                                                        Ok(false) => {
-                                                            continue;
-                                                        }
-                                                        Err(e) => {
-                                                            log::warn!("⚠️ [CATCH-UP RETRY] Lỗi RPC check contract validity: {}. Thử lại batch.", e);
-                                                            batch_succeeded = false;
-                                                            break;
-                                                        }
+                                                    Ok(false) => continue,
+                                                    Err(e) => {
+                                                        log::warn!("⚠️ [CATCH-UP RETRY] Lỗi RPC check contract validity: {}. Thử lại đoạn.", e);
+                                                        batch_succeeded = false;
+                                                        break;
                                                     }
                                                 }
                                             }
                                         }
-                                        Err(e) => {
-                                            consecutive_errors += 1;
-                                            log::warn!("⚠️ [CATCH-UP] Lỗi parse logs (lần {}): {:?}", consecutive_errors, e);
-                                            if consecutive_errors >= 5 {
-                                                log::error!("💀 [CATCH-UP CRITICAL] Quá 5 lần lỗi parse block {}..={}. Bỏ qua batch.", cursor, chunk_to);
-                                                batch_succeeded = true;
-                                                consecutive_errors = 0;
-                                            }
+                                    }
+                                    Err(e) => {
+                                        consecutive_parse_errors += 1;
+                                        log::warn!("⚠️ [CATCH-UP] Lỗi parse logs (lần {}): {:?}", consecutive_parse_errors, e);
+                                        if consecutive_parse_errors >= 5 {
+                                            log::error!("💀 [CATCH-UP CRITICAL] Quá 5 lần lỗi parse block {}..={}. Bỏ qua đoạn.", cursor, chunk_to);
+                                            batch_succeeded = true;
+                                            consecutive_parse_errors = 0;
                                         }
                                     }
                                 }
-                            } else if let Some(err) = json.get("error") {
-                                let err_str = err.to_string();
-                                log::warn!("⚠️ [CATCH-UP] RPC error cho block {}..={}: {}", cursor, chunk_to, err_str);
-                                if err_str.contains("prune") || err_str.contains("range") {
-                                    log::error!("🛑 [CATCH-UP] Block cũ bị RPC prune. Dừng dải quét này.");
-                                    break;
+                            }
+                        } else if let Some(err) = json.get("error") {
+                            let err_str = err.to_string();
+                            match classify_rpc_error(&err_str) {
+                                RpcErrorKind::Pruned => {
+                                    log::error!(
+                                        "🛑 [CATCH-UP CRITICAL] Dữ liệu block {}..={} đã bị RPC cắt bỏ: {}. Dừng worker, GIỮ file {} để xử lý thủ công.",
+                                        cursor, chunk_to, err_str, CATCHUP_PROGRESS_FILE
+                                    );
+                                    return;
+                                }
+                                RpcErrorKind::RangeTooLarge if step > 1 => {
+                                    step = (step / 4).max(1);
+                                    log::warn!(
+                                        "⚠️ [CATCH-UP] RPC báo dải quá lớn ({}). Giảm kích thước đoạn xuống {} block và thử lại.",
+                                        err_str, step
+                                    );
+                                    continue; // thử lại ngay với đoạn nhỏ hơn, không tính là lỗi liên tiếp
+                                }
+                                _ => {
+                                    log::warn!("⚠️ [CATCH-UP] RPC error cho block {}..={}: {}", cursor, chunk_to, err_str);
                                 }
                             }
-                        }
-                        Err(e) => {
-                            log::warn!("⚠️ [CATCH-UP] Lỗi parse JSON response: {}", e);
+                        } else {
+                            log::warn!("⚠️ [CATCH-UP] Response không có result/error cho block {}..={}", cursor, chunk_to);
                         }
                     }
-                }
-                Err(e) => {
-                    log::warn!("⚠️ [CATCH-UP] Lỗi mạng khi gọi get_logs: {}", e);
-                }
+                    Err(e) => log::warn!("⚠️ [CATCH-UP] Lỗi parse JSON response: {}", e),
+                },
+                Err(e) => log::warn!("⚠️ [CATCH-UP] Lỗi mạng khi gọi get_logs: {}", e),
             }
 
-            // 🎯 CẢI TIẾN 4 & MỤC 2 REVIEW: Chỉ tiến cursor khi batch đã hoàn thành thành công
             if batch_succeeded {
+                consecutive_errors = 0;
                 cursor = chunk_to + 1;
-                // Cập nhật lại cursor sau khi hoàn thành batch (chỉ ghi 1 lần duy nhất trên mỗi batch)
-                write_catchup_progress(&app.storage_root, cursor, range.to).await;
-
-                // Tối ưu độ trễ: Nếu không có file xóa thì chỉ nghỉ 10ms để quét cực nhanh, nếu có file xóa thì nghỉ 50ms
+                // Mỗi đoạn xong -> ghi tiến độ (atomic)
+                write_catchup_progress(&app.storage_root, cursor.min(range.to), range.to).await;
                 if batch_deleted_count > 0 {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    sleep(Duration::from_millis(50)).await;
                 } else {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    sleep(Duration::from_millis(10)).await;
                 }
             } else {
-                tokio::time::sleep(Duration::from_millis(1000)).await;
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                if consecutive_errors >= 30 {
+                    log::error!(
+                        "💀 [CATCH-UP CRITICAL] {} lần lỗi liên tiếp ở block {}..={}. Vẫn tiếp tục thử lại (backoff 30s).",
+                        consecutive_errors, cursor, chunk_to
+                    );
+                }
+                sleep(Duration::from_millis(catchup_backoff_ms(consecutive_errors))).await;
             }
         }
     }
@@ -330,6 +366,10 @@ async fn listen_download_confirmed_internal(
             clear_catchup_progress(&app.storage_root).await;
             write_saved_last_block(&app.storage_root, current_block).await;
         } else if !plan.catchup_ranges.is_empty() {
+            // Ghi dải gộp xuống đĩa TRƯỚC khi cập nhật last_scanned_block (bên dưới),
+            // để nếu crash ngay sau đó thì khoảng trống vẫn còn dấu vết.
+            let merged = &plan.catchup_ranges[0];
+            write_catchup_progress(&app.storage_root, merged.from, merged.to).await;
             log::info!(
                 "🔄 [LISTENER] Phát hiện {} dải cần quét bù quá khứ. Khởi chạy luồng 2 (Worker ngầm)...",
                 plan.catchup_ranges.len()
