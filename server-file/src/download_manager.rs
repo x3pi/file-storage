@@ -144,7 +144,7 @@ pub async fn initialize_download_session<'a>(
             "Download key '{}' not found on-chain",
             download_key_clean
         ));
-    } else if session_info.isConfirmed == true {
+    } else if session_info.isConfirmed {
         return Err(format!("Download key '{}' has expired", download_key_clean));
     }
 

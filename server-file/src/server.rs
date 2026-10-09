@@ -69,6 +69,40 @@ async fn send_logs_list_response(
     stream.send(Bytes::from(response_json)).await?;
     Ok(())
 }
+
+/// SVR-SEC: Kiểm tra rate limit cho admin log API
+/// Trả về true nếu IP bị block (quá 5 lần sai mật khẩu trong 10 phút)
+pub(crate) fn is_admin_rate_limited(app: &App, ip: IpAddr) -> bool {
+    if let Some(entry) = app.admin_rate_limiter.get(&ip) {
+        let (count, window_start) = *entry.value();
+        if window_start.elapsed() > std::time::Duration::from_secs(600) {
+            // Cửa sổ 10 phút đã hết → reset
+            drop(entry);
+            app.admin_rate_limiter.remove(&ip);
+            return false;
+        }
+        return count >= 5;
+    }
+    false
+}
+
+/// SVR-SEC: Ghi nhận lần thử sai mật khẩu admin từ IP
+pub(crate) fn record_admin_fail(app: &App, ip: IpAddr) {
+    let now = std::time::Instant::now();
+    app.admin_rate_limiter
+        .entry(ip)
+        .and_modify(|(count, window_start)| {
+            if window_start.elapsed() > std::time::Duration::from_secs(600) {
+                // Reset cửa sổ mới
+                *count = 1;
+                *window_start = now;
+            } else {
+                *count += 1;
+            }
+        })
+        .or_insert((1, now));
+}
+
 #[allow(dead_code)]
 pub fn get_file_key_path(storage_root: &Path, file_key: &str) -> PathBuf {
     let level1 = &file_key[0..2];
@@ -342,7 +376,7 @@ pub async fn handle_connection(
                                     }
 
                                     let is_completed = {
-                                        let mut set = app_clone.get_or_init_chunk_tracker(&log_file_key);
+                                        let mut set = app_clone.get_or_init_chunk_tracker(&log_file_key).await;
                                         set.insert(log_chunk_index);
                                         set.len() as u64 == expected_chunks
                                     };
@@ -599,10 +633,23 @@ pub async fn handle_connection(
                         Command::GetLogList { payload } => {
                             log::debug!("[{}] Handling GetLogList (no semaphore)", peer_clone);
 
+                            // SVR-SEC: Rate limit — chặn brute-force mật khẩu admin (5 lần sai / 10 phút)
+                            if is_admin_rate_limited(&app_clone, peer_clone.ip()) {
+                                log::warn!("[{}] 🚫 Admin rate limited (too many failed attempts)", peer_clone);
+                                let response = LogsListResponse {
+                                    status: "ERROR".to_string(),
+                                    message: "Too many failed attempts. Try again later.".to_string(),
+                                    available_files: vec![],
+                                };
+                                let _ = send_logs_list_response(&mut stream_handler, &response).await;
+                                return;
+                            }
+
                             use sha2::{Digest, Sha256};
                             let incoming_hash = hex::encode(Sha256::digest(payload.password.as_bytes()));
                             if incoming_hash != app_clone.config.admin_log_password_hash {
-                                log::warn!("[{}] ❌ Unauthorized GetLogList attempt with invalid password", peer_clone);
+                                record_admin_fail(&app_clone, peer_clone.ip());
+                                log::warn!("[{}] ❌ Unauthorized GetLogList attempt with invalid password (fail count incremented)", peer_clone);
                                 let response = LogsListResponse {
                                     status: "ERROR".to_string(),
                                     message: "Unauthorized: Invalid admin password".to_string(),
@@ -690,10 +737,23 @@ pub async fn handle_connection(
                         Command::GetLogContent { payload } => {
                             log::debug!("[{}] Handling GetLogContent (no semaphore)", peer_clone);
 
+                            // SVR-SEC: Rate limit — chặn brute-force mật khẩu admin (5 lần sai / 10 phút)
+                            if is_admin_rate_limited(&app_clone, peer_clone.ip()) {
+                                log::warn!("[{}] 🚫 Admin rate limited (too many failed attempts)", peer_clone);
+                                let response = LogsContentResponse {
+                                    status: "ERROR".to_string(),
+                                    message: "Too many failed attempts. Try again later.".to_string(),
+                                    log_content: None,
+                                };
+                                let _ = send_logs_content_response(&mut stream_handler, &response).await;
+                                return;
+                            }
+
                             use sha2::{Digest, Sha256};
                             let incoming_hash = hex::encode(Sha256::digest(payload.password.as_bytes()));
                             if incoming_hash != app_clone.config.admin_log_password_hash {
-                                log::warn!("[{}] ❌ Unauthorized GetLogContent attempt with invalid password", peer_clone);
+                                record_admin_fail(&app_clone, peer_clone.ip());
+                                log::warn!("[{}] ❌ Unauthorized GetLogContent attempt with invalid password (fail count incremented)", peer_clone);
                                 let response = LogsContentResponse {
                                     status: "ERROR".to_string(),
                                     message: "Unauthorized: Invalid admin password".to_string(),
@@ -704,39 +764,52 @@ pub async fn handle_connection(
                             }
 
                             let logs_dir = app_clone.log_dir.clone();
-                            let file_to_read_path = logs_dir.join(&payload.file_name);
 
-                            let (response_status, message, final_log_content) = if !file_to_read_path.starts_with(&logs_dir)
-                                || !file_to_read_path.is_file()
+                            // SVR-SEC: Chặn Path Traversal — không cho phép "/" "\\" ".." trong tên file
+                            let (response_status, message, final_log_content) = if payload.file_name.contains('/')
+                                || payload.file_name.contains('\\')
+                                || payload.file_name.contains("..")
                             {
+                                log::warn!("[{}] 🚫 Path traversal attempt blocked: '{}'", peer_clone, payload.file_name);
                                 (
                                     "ERROR".to_string(),
-                                    format!("Error: File '{}' not found or invalid.", payload.file_name),
+                                    "Error: Invalid file name.".to_string(),
                                     None,
                                 )
                             } else {
-                                match fs::read_to_string(&file_to_read_path).await {
-                                    Ok(content) => (
-                                        "SUCCESS".to_string(),
-                                        format!("Retrieved content for file: {}", payload.file_name),
-                                        Some(LogFileContent {
-                                            file_name: payload.file_name.clone(),
-                                            content,
-                                        }),
-                                    ),
-                                    Err(e) => {
-                                        log::warn!(
-                                            "[{}] Failed to read log file {:?}: {}",
-                                            peer_clone,
-                                            file_to_read_path,
-                                            e
-                                        );
-                                        (
-                                            "ERROR".to_string(),
-                                            format!("Found file '{}', but failed to read its content: {}", payload.file_name, e),
-                                            None,
-                                        )
+                                let file_to_read_path = logs_dir.join(&payload.file_name);
+                                // SVR-SEC: Canonicalize cả 2 đường dẫn để chống symlink attack
+                                match (fs::canonicalize(&logs_dir).await, fs::canonicalize(&file_to_read_path).await) {
+                                    (Ok(canonical_dir), Ok(canonical_file)) if canonical_file.starts_with(&canonical_dir) && canonical_file.is_file() => {
+                                        match fs::read_to_string(&canonical_file).await {
+                                            Ok(content) => (
+                                                "SUCCESS".to_string(),
+                                                format!("Retrieved content for file: {}", payload.file_name),
+                                                Some(LogFileContent {
+                                                    file_name: payload.file_name.clone(),
+                                                    content,
+                                                }),
+                                            ),
+                                            Err(e) => {
+                                                log::warn!(
+                                                    "[{}] Failed to read log file {:?}: {}",
+                                                    peer_clone,
+                                                    file_to_read_path,
+                                                    e
+                                                );
+                                                (
+                                                    "ERROR".to_string(),
+                                                    format!("Found file '{}', but failed to read its content: {}", payload.file_name, e),
+                                                    None,
+                                                )
+                                            }
+                                        }
                                     }
+                                    _ => (
+                                        "ERROR".to_string(),
+                                        format!("Error: File '{}' not found or invalid.", payload.file_name),
+                                        None,
+                                    )
                                 }
                             };
 

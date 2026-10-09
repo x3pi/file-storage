@@ -9,6 +9,11 @@ mod models;
 
 mod server;
 mod sweeper;
+
+#[cfg(test)]
+mod tests;
+
+pub(crate) const MAX_TX_RETRIES: u32 = 5;
 use crate::app::App;
 use flexi_logger::{detailed_format, Cleanup, Criterion, FileSpec, Logger, Naming};
 use network::transport::Transport;
@@ -153,6 +158,8 @@ async fn main() {
         let mut upload_receiver = app_clone.upload_batch_receiver.lock().await;
         let pending_upload_path = app_clone.storage_root.join("pending_uploads.txt");
         let pending_dl_path = app_clone.storage_root.join("pending_confirmations.txt");
+        let mut upload_retry_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut download_retry_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
 
         // --- 1. STARTUP RECOVERY (Khôi phục các upload/download chưa hoàn thành từ đĩa) ---
         // Chạy trong task riêng biệt (tokio::spawn) để KHÔNG block task chính, tránh deadlock khi pending > 1000 items!
@@ -160,7 +167,7 @@ async fn main() {
         let pending_upload_recovery = pending_upload_path.clone();
         let pending_dl_recovery = pending_dl_path.clone();
         tokio::spawn(async move {
-            if pending_upload_recovery.exists() {
+            if tokio::fs::try_exists(&pending_upload_recovery).await.unwrap_or(false) {
                 if let Ok(content) = tokio::fs::read_to_string(&pending_upload_recovery).await {
                     let mut count = 0;
                     for line in content.lines() {
@@ -181,7 +188,7 @@ async fn main() {
                 }
             }
 
-            if pending_dl_recovery.exists() {
+            if tokio::fs::try_exists(&pending_dl_recovery).await.unwrap_or(false) {
                 if let Ok(content) = tokio::fs::read_to_string(&pending_dl_recovery).await {
                     let mut count = 0;
                     for line in content.lines() {
@@ -252,6 +259,9 @@ async fn main() {
                         log::info!("🚀 [TX Manager] Priority Upload Confirm ({} files) for contract {}", current_batch.len(), addr);
                         match crate::ethereum::confirm_upload_batch(app_clone.clone(), addr, current_batch.clone()).await {
                             Ok(()) => {
+                                for k in &current_batch {
+                                    upload_retry_counts.remove(k);
+                                }
                                 // CHỈ XOÁ KHỎI ĐĨA KHI TX THÀNH CÔNG TRÊN CHAIN
                                 remove_pending_uploads(&pending_upload_path, &current_batch, &addr.to_string()).await;
                             }
@@ -259,17 +269,55 @@ async fn main() {
                                 let err_str = e.to_string();
                                 let is_timeout = err_str.to_lowercase().contains("timeout");
                                 if is_timeout {
-                                    log::warn!("⚠️ [TX Manager] confirm_upload_batch timeout: {}. Giữ nguyên trên đĩa và thử lại sau 15s.", err_str);
-                                    let sender = app_clone.upload_batch_sender.clone();
-                                    let retry_batch = current_batch.clone();
-                                    tokio::spawn(async move {
-                                        tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
-                                        for k in retry_batch {
-                                            let _ = sender.send((k, addr)).await;
+                                    let mut to_retry = Vec::new();
+                                    let mut exceeded_keys = Vec::new();
+
+                                    for k in current_batch {
+                                        let count = upload_retry_counts.entry(k.clone()).or_insert(0);
+                                        *count += 1;
+                                        if *count <= MAX_TX_RETRIES {
+                                            to_retry.push((k, *count));
+                                        } else {
+                                            upload_retry_counts.remove(&k);
+                                            exceeded_keys.push(k);
                                         }
-                                    });
+                                    }
+
+                                    if !exceeded_keys.is_empty() {
+                                        log::error!(
+                                            "❌ [TX Manager] confirm_upload_batch cho {} file(s) đã thất bại sau {} lần thử lại timeout: {:?}. Hủy retry và xóa khỏi pending.",
+                                            exceeded_keys.len(),
+                                            MAX_TX_RETRIES,
+                                            exceeded_keys
+                                        );
+                                        remove_pending_uploads(&pending_upload_path, &exceeded_keys, &addr.to_string()).await;
+                                    }
+
+                                    if !to_retry.is_empty() {
+                                        let max_attempt = to_retry.iter().map(|(_, c)| *c).max().unwrap_or(1);
+                                        // Exponential backoff: 15s * 2^(attempt - 1), tối đa 120s
+                                        let delay_secs = (15u64 * (1u64 << (max_attempt - 1).min(3))).min(120);
+                                        log::warn!(
+                                            "⚠️ [TX Manager] confirm_upload_batch timeout: {}. Thử lại {} file(s) sau {}s (lần {}/{})",
+                                            err_str,
+                                            to_retry.len(),
+                                            delay_secs,
+                                            max_attempt,
+                                            MAX_TX_RETRIES
+                                        );
+                                        let sender = app_clone.upload_batch_sender.clone();
+                                        tokio::spawn(async move {
+                                            tokio::time::sleep(tokio::time::Duration::from_secs(delay_secs)).await;
+                                            for (k, _) in to_retry {
+                                                let _ = sender.send((k, addr)).await;
+                                            }
+                                        });
+                                    }
                                 } else {
                                     // Lỗi dứt khoát (Revert, invalid params, caller not storage,...): Xóa khỏi pending vì retry cũng vô ích
+                                    for k in &current_batch {
+                                        upload_retry_counts.remove(k);
+                                    }
                                     log::error!("❌ [TX Manager] confirm_upload_batch lỗi không thể phục hồi: {}. Xóa khỏi pending.", err_str);
                                     remove_pending_uploads(&pending_upload_path, &current_batch, &addr.to_string()).await;
                                 }
@@ -303,6 +351,7 @@ async fn main() {
 
                     match crate::ethereum::handle_confirm_download(download_key.clone(), contract_addr.clone(), app_clone.clone()).await {
                         Ok(()) => {
+                            download_retry_counts.remove(&download_key);
                             // Thành công: Xoá khỏi pending_confirmations.txt
                             remove_pending_download(&pending_dl_path, &download_key).await;
                         }
@@ -310,15 +359,35 @@ async fn main() {
                             let err_str = e.to_string();
                             let is_timeout = err_str.to_lowercase().contains("timeout");
                             if is_timeout {
-                                log::warn!("⚠️ [TX Manager] Download confirmation timeout: {}. Giữ trên đĩa và thử lại sau 15s.", err_str);
-                                let sender = app_clone.confirmation_sender.clone();
-                                let dl_key = download_key.clone();
-                                let c_addr = contract_addr.clone();
-                                tokio::spawn(async move {
-                                    tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
-                                    let _ = sender.send((dl_key, c_addr)).await;
-                                });
+                                let count = download_retry_counts.entry(download_key.clone()).or_insert(0);
+                                *count += 1;
+                                if *count <= MAX_TX_RETRIES {
+                                    let delay_secs = (15u64 * (1u64 << (*count - 1).min(3))).min(120);
+                                    log::warn!(
+                                        "⚠️ [TX Manager] Download confirmation timeout: {}. Thử lại sau {}s (lần {}/{})",
+                                        err_str,
+                                        delay_secs,
+                                        *count,
+                                        MAX_TX_RETRIES
+                                    );
+                                    let sender = app_clone.confirmation_sender.clone();
+                                    let dl_key = download_key.clone();
+                                    let c_addr = contract_addr.clone();
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(tokio::time::Duration::from_secs(delay_secs)).await;
+                                        let _ = sender.send((dl_key, c_addr)).await;
+                                    });
+                                } else {
+                                    download_retry_counts.remove(&download_key);
+                                    log::error!(
+                                        "❌ [TX Manager] Download confirmation cho key {} đã thất bại sau {} lần thử lại timeout. Hủy retry và xóa khỏi pending.",
+                                        download_key,
+                                        MAX_TX_RETRIES
+                                    );
+                                    remove_pending_download(&pending_dl_path, &download_key).await;
+                                }
                             } else {
+                                download_retry_counts.remove(&download_key);
                                 // Lỗi dứt khoát (Revert, Already confirmed, Invalid key,...): Xóa khỏi pending vì retry cũng vô ích
                                 log::error!("❌ [TX Manager] Download confirmation lỗi không thể phục hồi: {}. Xóa khỏi pending.", err_str);
                                 remove_pending_download(&pending_dl_path, &download_key).await;
@@ -456,14 +525,14 @@ async fn main() {
     }
 }
 
-async fn write_atomic(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+pub(crate) async fn write_atomic(path: &std::path::Path, content: &str) -> std::io::Result<()> {
     let tmp_path = path.with_extension("tmp");
     tokio::fs::write(&tmp_path, content).await?;
     tokio::fs::rename(&tmp_path, path).await?;
     Ok(())
 }
 
-async fn remove_pending_uploads(path: &std::path::Path, current_batch: &[String], addr_str: &str) {
+pub(crate) async fn remove_pending_uploads(path: &std::path::Path, current_batch: &[String], addr_str: &str) {
     if let Ok(content) = tokio::fs::read_to_string(path).await {
         let remaining_lines: Vec<&str> = content
             .lines()
@@ -492,7 +561,7 @@ async fn remove_pending_uploads(path: &std::path::Path, current_batch: &[String]
     }
 }
 
-async fn remove_pending_download(path: &std::path::Path, download_key: &str) {
+pub(crate) async fn remove_pending_download(path: &std::path::Path, download_key: &str) {
     if let Ok(content) = tokio::fs::read_to_string(path).await {
         let clean_dl_key = download_key.trim_start_matches("0x");
         let remaining_lines: Vec<&str> = content

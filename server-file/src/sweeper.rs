@@ -115,8 +115,8 @@ pub fn spawn_background_sweeper(app: Arc<App>) {
                         let level1 = &file_key[0..2];
                         let level2 = &file_key[2..4];
                         let file_dir = app.storage_root.join(level1).join(level2).join(file_key);
-                        if file_dir.exists() {
-                            if let Err(e) = std::fs::remove_dir_all(&file_dir) {
+                        if tokio::fs::try_exists(&file_dir).await.unwrap_or(false) {
+                            if let Err(e) = tokio::fs::remove_dir_all(&file_dir).await {
                                 log::warn!("⚠️ Lỗi khi xóa thư mục rác của upload session {}: {}", file_key, e);
                             }
                         }

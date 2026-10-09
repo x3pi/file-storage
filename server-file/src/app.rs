@@ -42,6 +42,7 @@ pub struct App {
     pub valid_contracts_cache: Arc<DashMap<Address, (bool, std::time::Instant)>>,
     pub invalid_download_keys: Arc<DashMap<String, std::time::Instant>>,
     pub http_client: alloy::transports::http::Client,
+    pub admin_rate_limiter: Arc<DashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
 }
 
 impl App {
@@ -86,6 +87,48 @@ impl App {
             valid_contracts_cache: Arc::new(DashMap::new()),
             invalid_download_keys: Arc::new(DashMap::new()),
             http_client,
+            admin_rate_limiter: Arc::new(DashMap::new()),
+        })
+    }
+
+    #[cfg(test)]
+    pub fn new_test(storage_root: PathBuf, log_dir: PathBuf) -> Arc<Self> {
+        use sha2::{Digest, Sha256};
+        let (confirmation_sender, confirmation_receiver) = mpsc::channel(1_000);
+        let (upload_batch_sender, upload_batch_receiver) = mpsc::channel(1_000);
+        let dummy_key = "0x0000000000000000000000000000000000000000000000000000000000000001";
+        let wallet = PrivateKeySigner::from_str(dummy_key).unwrap();
+        let http_client = alloy::transports::http::Client::builder().build().unwrap();
+        let config = crate::config::AppConfig {
+            rpc_url: "http://127.0.0.1:8545".to_string(),
+            rpc_url_ws: "ws://127.0.0.1:8546".to_string(),
+            registry_address: Address::ZERO,
+            private_key: dummy_key.to_string(),
+            storage_root: storage_root.to_string_lossy().to_string(),
+            session_timeout_seconds: 1800,
+            wt_addr: "127.0.0.1:7081".to_string(),
+            admin_log_password_hash: hex::encode(Sha256::digest(b"admin123")),
+        };
+
+        Arc::new(Self {
+            config,
+            download_cache: Arc::new(DashMap::new()),
+            confirmation_sender,
+            upload_file_cache: Arc::new(DashMap::new()),
+            file_cache: Arc::new(DashMap::new()),
+            confirmation_receiver: Arc::new(Mutex::new(confirmation_receiver)),
+            storage_root,
+            log_dir,
+            wallet,
+            init_locks: Arc::new(DashMap::new()),
+            task_semaphore: Arc::new(Semaphore::new(3000)),
+            chunk_tracker: Arc::new(DashMap::new()),
+            upload_batch_sender,
+            upload_batch_receiver: Arc::new(Mutex::new(upload_batch_receiver)),
+            valid_contracts_cache: Arc::new(DashMap::new()),
+            invalid_download_keys: Arc::new(DashMap::new()),
+            http_client,
+            admin_rate_limiter: Arc::new(DashMap::new()),
         })
     }
 
@@ -275,28 +318,40 @@ impl App {
         .and_then(|inner_result| inner_result)
     }
 
-    pub fn get_or_init_chunk_tracker(&self, file_key: &str) -> dashmap::mapref::one::RefMut<'_, String, std::collections::HashSet<u64>> {
+    /// Khởi tạo hoặc lấy chunk tracker cho file_key.
+    /// Đọc .meta file từ disk trong spawn_blocking để không block tokio runtime.
+    pub async fn get_or_init_chunk_tracker(&self, file_key: &str) -> dashmap::mapref::one::RefMut<'_, String, std::collections::HashSet<u64>> {
         if let Some(entry) = self.chunk_tracker.get_mut(file_key) {
             return entry;
         }
 
-        let mut existing = std::collections::HashSet::new();
-        if file_key.len() == 64 && file_key.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
-            let level1 = &file_key[0..2];
-            let level2 = &file_key[2..4];
-            let file_dir: PathBuf = self.storage_root.join(level1).join(level2).join(file_key);
-            let meta_path = file_dir.join(format!("{}.meta", file_key));
-            if meta_path.is_file() {
-                if let Ok(content) = std::fs::read_to_string(&meta_path) {
-                    for line in content.lines() {
-                        if let Ok(idx) = line.trim().parse::<u64>() {
-                            existing.insert(idx);
+        // Đọc .meta file từ disk trong spawn_blocking để không block tokio runtime
+        let file_key_owned = file_key.to_string();
+        let storage_root = self.storage_root.clone();
+        let existing = tokio::task::spawn_blocking(move || {
+            let mut set = std::collections::HashSet::new();
+            if file_key_owned.len() == 64 && file_key_owned.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
+                let level1 = &file_key_owned[0..2];
+                let level2 = &file_key_owned[2..4];
+                let file_dir: PathBuf = storage_root.join(level1).join(level2).join(&file_key_owned);
+                let meta_path = file_dir.join(format!("{}.meta", file_key_owned));
+                if meta_path.is_file() {
+                    if let Ok(content) = std::fs::read_to_string(&meta_path) {
+                        for line in content.lines() {
+                            if let Ok(idx) = line.trim().parse::<u64>() {
+                                set.insert(idx);
+                            }
                         }
                     }
                 }
             }
-        }
+            set
+        }).await.unwrap_or_default();
 
-        self.chunk_tracker.entry(file_key.to_string()).or_insert(existing)
+        let mut entry = self.chunk_tracker.entry(file_key.to_string()).or_default();
+        if !existing.is_empty() {
+            entry.extend(existing);
+        }
+        entry
     }
 }

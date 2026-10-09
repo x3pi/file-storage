@@ -340,7 +340,7 @@ async fn handle_upload_chunk(
                         }
 
                         let is_completed = {
-                            let mut set = app.get_or_init_chunk_tracker(&payload.file_key);
+                            let mut set = app.get_or_init_chunk_tracker(&payload.file_key).await;
                             set.insert(payload.chunk_index);
                             set.len() as u64 == expected_chunks
                         };
