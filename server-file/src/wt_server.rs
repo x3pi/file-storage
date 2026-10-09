@@ -350,13 +350,6 @@ async fn handle_upload_chunk(
                                 app.file_cache.remove(&payload.file_key); // Đóng ngay file descriptor để tránh rò rỉ FD
                                 log::info!("[WT][{}] 🎯 File {} fully received for this node ({} / {} total chunks). Queueing for confirm.", peer_ip, payload.file_key, expected_chunks, total_chunks);
                                 log::info!("Extracted contract_addr from cache: {}", contract_addr);
-                                // Ghi file pending_uploads.txt để phòng khi crash/restart
-                                let pending_file_path = app.storage_root.join("pending_uploads.txt");
-                                let line = format!("{},{}\n", payload.file_key, contract_addr);
-                                use tokio::io::AsyncWriteExt;
-                                if let Ok(mut file) = tokio::fs::OpenOptions::new().create(true).append(true).open(&pending_file_path).await {
-                                    let _ = file.write_all(line.as_bytes()).await;
-                                }
                                 let _ = app.upload_batch_sender.send((payload.file_key.clone(), contract_addr)).await;
                             }
                         }

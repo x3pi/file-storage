@@ -328,41 +328,14 @@ pub async fn descrease_chunk_count(download_key: &str, app: &Arc<App>) -> Result
     }; // Lock trên DashMap entry tự động giải phóng ở đây
 
     if should_confirm {
-        // Dùng try_send() cho bounded channel
         let contract_addr_str = contract_address.to_string();
-        if let Err(e) = app.confirmation_sender.try_send((download_key_clean.clone(), contract_addr_str.clone())) {
-            match e {
-                tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                    log::warn!("⚠️ Confirmation queue full! Falling back to disk for {}", download_key_clean);
-                    // Ghi ra file pending trên đĩa cứng
-                    let pending_file_path = app.storage_root.join("pending_confirmations.txt");
-                    // Dùng tokio::task::spawn để không block luồng hiện tại
-                    let key_to_write = download_key_clean.clone();
-                    tokio::spawn(async move {
-                        let mut file = match tokio::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&pending_file_path)
-                            .await
-                        {
-                            Ok(f) => f,
-                            Err(e) => {
-                                log::error!("❌ CRITICAL: Failed to open pending_confirmations.txt: {}", e);
-                                return;
-                            }
-                        };
-                        use tokio::io::AsyncWriteExt;
-                        let line = format!("{},{}\n", key_to_write, contract_addr_str);
-                        if let Err(err) = file.write_all(line.as_bytes()).await {
-                            log::error!("❌ CRITICAL: Failed to write to pending_confirmations.txt: {}", err);
-                        }
-                    });
-                }
-                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                    log::error!("❌ Failed to send to confirmation queue: Channel closed");
-                }
+        let sender = app.confirmation_sender.clone();
+        let key = download_key_clean.clone();
+        tokio::spawn(async move {
+            if let Err(e) = sender.send((key, contract_addr_str)).await {
+                log::error!("❌ Failed to send to confirmation queue: Channel closed: {}", e);
             }
-        }
+        });
     }
     Ok(remaining)
 }
