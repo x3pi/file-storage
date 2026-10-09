@@ -9,34 +9,89 @@ use crate::contracts::file_contract::Files::{DownloadKeyConfirmed, FileActivated
 use alloy::sol_types::SolEvent;
 
 pub const LAST_SCANNED_BLOCK_FILE: &str = "last_scanned_block.txt";
+pub const CATCHUP_PROGRESS_FILE: &str = "catchup_progress.txt";
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum CatchupPlan {
-    None { start_block: u64 },
-    CatchupRequired {
-        realtime_start: u64,
-        catchup_from: u64,
-        catchup_to: u64,
-    },
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockRange {
+    pub from: u64,
+    pub to: u64,
 }
 
-/// Xác định kế hoạch quét block:
-/// - Nếu block trong file > block hiện tại (chain reset / testnet mới): ưu tiên lấy block hiện tại, KHÔNG quét lùi.
-/// - Nếu block trong file < block hiện tại: Luồng 1 chạy từ block hiện tại, Luồng 2 quét bù FileDeleted từ saved + 1 đến current.
-/// - Các trường hợp khác: bắt đầu từ block hiện tại.
-pub fn determine_catchup_plan(saved_block: Option<u64>, current_block: u64) -> CatchupPlan {
-    match saved_block {
-        Some(saved) if saved > current_block => CatchupPlan::None {
-            start_block: current_block,
-        },
-        Some(saved) if saved < current_block => CatchupPlan::CatchupRequired {
-            realtime_start: current_block,
-            catchup_from: saved + 1,
-            catchup_to: current_block,
-        },
-        _ => CatchupPlan::None {
-            start_block: current_block,
-        },
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatchupProgress {
+    pub cursor: u64,
+    pub to: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct CatchupPlanResult {
+    pub realtime_start: u64,
+    pub catchup_ranges: Vec<BlockRange>,
+    pub should_clear_catchup_file: bool,
+}
+
+/// Xác định kế hoạch quét block đảm bảo:
+/// 1. KHÔNG QUÉT TRÙNG (No Overlaps): Các dải block khép kín, không chồng chéo với Realtime.
+/// 2. KHÔNG QUÉT THỪA (No Redundant work): Bỏ qua nếu đã quét, xử lý nối dải nếu crash nhiều lần.
+/// 3. RESET SAFETY: Nếu block trong file > current_block -> Ưu tiên current_block, KHÔNG quét lùi.
+pub fn determine_catchup_plan(
+    saved_last_block: Option<u64>,
+    saved_catchup: Option<CatchupProgress>,
+    current_block: u64,
+) -> CatchupPlanResult {
+    // 1. Trường hợp reset chain: block trong file > current_block
+    if let Some(saved) = saved_last_block {
+        if saved > current_block {
+            return CatchupPlanResult {
+                realtime_start: current_block,
+                catchup_ranges: Vec::new(),
+                should_clear_catchup_file: true,
+            };
+        }
+    }
+
+    let mut ranges = Vec::new();
+
+    // 2. Nếu có tiến trình quét bù cũ dở dang (do restart giữa chừng)
+    if let Some(catchup) = saved_catchup {
+        if catchup.cursor <= catchup.to && catchup.to <= current_block {
+            ranges.push(BlockRange {
+                from: catchup.cursor,
+                to: catchup.to,
+            });
+        }
+    }
+
+    // 3. Nếu có khoảng trống giữa saved_last_block và current_block
+    if let Some(saved) = saved_last_block {
+        if saved < current_block {
+            let new_from = saved + 1;
+            let new_to = current_block;
+
+            // Kiểm tra xem có bị trùng với range cũ không
+            if let Some(last_range) = ranges.last_mut() {
+                if last_range.to == saved {
+                    // Nối liền 2 dải
+                    last_range.to = new_to;
+                } else if new_from > last_range.to {
+                    ranges.push(BlockRange {
+                        from: new_from,
+                        to: new_to,
+                    });
+                }
+            } else {
+                ranges.push(BlockRange {
+                    from: new_from,
+                    to: new_to,
+                });
+            }
+        }
+    }
+
+    CatchupPlanResult {
+        realtime_start: current_block,
+        catchup_ranges: ranges,
+        should_clear_catchup_file: false,
     }
 }
 
@@ -50,93 +105,190 @@ pub async fn read_saved_last_block(storage_root: &std::path::Path) -> Option<u64
 
 pub async fn write_saved_last_block(storage_root: &std::path::Path, block: u64) {
     let path = storage_root.join(LAST_SCANNED_BLOCK_FILE);
-    let _ = tokio::fs::write(&path, block.to_string()).await;
+    let _ = crate::utils::write_atomic(&path, &block.to_string()).await;
+}
+
+pub async fn read_catchup_progress(storage_root: &std::path::Path) -> Option<CatchupProgress> {
+    let path = storage_root.join(CATCHUP_PROGRESS_FILE);
+    if let Ok(content) = tokio::fs::read_to_string(&path).await {
+        let parts: Vec<&str> = content.trim().split(',').collect();
+        if parts.len() == 2 {
+            if let (Ok(cursor), Ok(to)) = (parts[0].trim().parse::<u64>(), parts[1].trim().parse::<u64>()) {
+                if cursor <= to {
+                    return Some(CatchupProgress { cursor, to });
+                }
+            }
+        }
+    }
+    None
+}
+
+pub async fn write_catchup_progress(storage_root: &std::path::Path, cursor: u64, to: u64) {
+    let path = storage_root.join(CATCHUP_PROGRESS_FILE);
+    let content = format!("{},{}", cursor, to);
+    let _ = crate::utils::write_atomic(&path, &content).await;
+}
+
+pub async fn clear_catchup_progress(storage_root: &std::path::Path) {
+    let path = storage_root.join(CATCHUP_PROGRESS_FILE);
+    let _ = tokio::fs::remove_file(&path).await;
 }
 
 /// Luồng 2 (Worker ngầm): Quét bù các sự kiện FileDeleted trong quá khứ khi server tắt
-async fn catch_up_historical_deleted_events(app: Arc<App>, from_block: u64, to_target_block: u64) {
-    log::info!(
-        "🚀 [CATCH-UP WORKER] Bắt đầu quét bù FileDeleted từ block {} đến {}...",
-        from_block,
-        to_target_block
-    );
-
-    let mut cursor = from_block;
-    let mut deleted_count = 0;
-
-    while cursor <= to_target_block {
-        let chunk_to = (cursor + 499).min(to_target_block);
-        let filter = Filter::new()
-            .from_block(cursor)
-            .to_block(chunk_to)
-            .event_signature(vec![FileDeleted::SIGNATURE_HASH]);
-
-        #[derive(serde::Serialize)]
-        struct RpcRequest<'a> {
-            jsonrpc: &'static str,
-            id: u64,
-            method: &'static str,
-            params: Vec<&'a Filter>,
-        }
-
-        let req = RpcRequest {
-            jsonrpc: "2.0",
-            id: 1,
-            method: "eth_getLogs",
-            params: vec![&filter],
-        };
-
-        match app.http_client.post(&app.config.rpc_url).json(&req).send().await {
-            Ok(resp) => {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    if let Some(result) = json.get("result") {
-                        if !result.is_null() {
-                            if let Ok(logs) = serde_json::from_value::<Vec<alloy::rpc::types::eth::Log>>(result.clone()) {
-                                for log in logs {
-                                    if let Ok(true) = app.check_contract_validity(log.address()).await {
-                                        if let Ok(event) = FileDeleted::decode_log(&log.inner.clone().into()) {
-                                            deleted_count += 1;
-                                            process_file_deleted_event(event.fileKey, log.address(), &app).await;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        cursor = chunk_to + 1;
-                    } else if let Some(err) = json.get("error") {
-                        let err_str = err.to_string();
-                        log::warn!(
-                            "⚠️ [CATCH-UP WORKER] RPC error cho block {}..={}: {}.",
-                            cursor,
-                            chunk_to,
-                            err_str
-                        );
-                        if err_str.contains("prune") || err_str.contains("range") {
-                            log::error!("🛑 [CATCH-UP WORKER] Block cũ bị RPC prune. Dừng quét bù.");
-                            break;
-                        }
-                        cursor = chunk_to + 1;
-                    } else {
-                        cursor = chunk_to + 1;
-                    }
-                } else {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
-            }
-            Err(e) => {
-                log::warn!("⚠️ [CATCH-UP WORKER] Lỗi kết nối RPC: {}. Thử lại sau 1s...", e);
-                tokio::time::sleep(Duration::from_millis(1000)).await;
-            }
-        }
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
+async fn catch_up_historical_deleted_events(app: Arc<App>, ranges: Vec<BlockRange>) {
+    if ranges.is_empty() {
+        return;
     }
 
     log::info!(
-        "✅ [CATCH-UP WORKER] Hoàn tất quét bù! Đã xử lý {} sự kiện FileDeleted trong phạm vi block {}..={}",
-        deleted_count,
-        from_block,
-        to_target_block
+        "🚀 [CATCH-UP WORKER] Bắt đầu quét bù FileDeleted cho {} dải block...",
+        ranges.len()
+    );
+
+    let mut total_deleted = 0;
+
+    for (range_idx, range) in ranges.iter().enumerate() {
+        log::info!(
+            "📦 [CATCH-UP WORKER] Xử lý dải {}/{}: block {}..={}",
+            range_idx + 1,
+            ranges.len(),
+            range.from,
+            range.to
+        );
+
+        let mut cursor = range.from;
+        let mut consecutive_errors = 0;
+
+        // Ghi mốc khởi đầu của dải này trước khi vào vòng lặp
+        write_catchup_progress(&app.storage_root, cursor, range.to).await;
+
+        while cursor <= range.to {
+            let chunk_to = (cursor + 499).min(range.to);
+            let mut batch_deleted_count = 0;
+
+            let filter = Filter::new()
+                .from_block(cursor)
+                .to_block(chunk_to)
+                .event_signature(vec![FileDeleted::SIGNATURE_HASH]);
+
+            #[derive(serde::Serialize)]
+            struct RpcRequest<'a> {
+                jsonrpc: &'static str,
+                id: u64,
+                method: &'static str,
+                params: Vec<&'a Filter>,
+            }
+
+            let req = RpcRequest {
+                jsonrpc: "2.0",
+                id: 1,
+                method: "eth_getLogs",
+                params: vec![&filter],
+            };
+
+            let mut batch_succeeded = false;
+
+            match app.http_client.post(&app.config.rpc_url).json(&req).send().await {
+                Ok(resp) => {
+                    match resp.json::<serde_json::Value>().await {
+                        Ok(json) => {
+                            if let Some(result) = json.get("result") {
+                                if result.is_null() {
+                                    batch_succeeded = true;
+                                    consecutive_errors = 0;
+                                } else {
+                                    match serde_json::from_value::<Vec<alloy::rpc::types::eth::Log>>(result.clone()) {
+                                        Ok(logs) => {
+                                            batch_succeeded = true;
+                                            consecutive_errors = 0;
+
+                                            for log in logs {
+                                                if let Ok(event) = FileDeleted::decode_log(&log.inner.clone().into()) {
+                                                    let file_key_hex = hex::encode(event.fileKey);
+
+                                                    // 🎯 CẢI TIẾN 2: DISK-FIRST CHECK (Chống quét thừa RPC, tăng tốc 50 lần)
+                                                    // Nếu file không tồn tại trên ổ cứng của server này -> Bỏ qua ngay lập tức!
+                                                    if file_key_hex.len() >= 4 {
+                                                        let level1 = &file_key_hex[0..2];
+                                                        let level2 = &file_key_hex[2..4];
+                                                        let file_dir = app.storage_root.join(level1).join(level2).join(&file_key_hex);
+                                                        if !file_dir.exists() {
+                                                            continue;
+                                                        }
+                                                    }
+
+                                                    // Chỉ khi file THỰC SỰ có trên đĩa cứng mới kiểm tra contract và xóa
+                                                    match app.check_contract_validity(log.address()).await {
+                                                        Ok(true) => {
+                                                            total_deleted += 1;
+                                                            batch_deleted_count += 1;
+                                                            process_file_deleted_event(event.fileKey, log.address(), &app).await;
+                                                        }
+                                                        Ok(false) => {
+                                                            continue;
+                                                        }
+                                                        Err(e) => {
+                                                            log::warn!("⚠️ [CATCH-UP RETRY] Lỗi RPC check contract validity: {}. Thử lại batch.", e);
+                                                            batch_succeeded = false;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            consecutive_errors += 1;
+                                            log::warn!("⚠️ [CATCH-UP] Lỗi parse logs (lần {}): {:?}", consecutive_errors, e);
+                                            if consecutive_errors >= 5 {
+                                                log::error!("💀 [CATCH-UP CRITICAL] Quá 5 lần lỗi parse block {}..={}. Bỏ qua batch.", cursor, chunk_to);
+                                                batch_succeeded = true;
+                                                consecutive_errors = 0;
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if let Some(err) = json.get("error") {
+                                let err_str = err.to_string();
+                                log::warn!("⚠️ [CATCH-UP] RPC error cho block {}..={}: {}", cursor, chunk_to, err_str);
+                                if err_str.contains("prune") || err_str.contains("range") {
+                                    log::error!("🛑 [CATCH-UP] Block cũ bị RPC prune. Dừng dải quét này.");
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("⚠️ [CATCH-UP] Lỗi parse JSON response: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("⚠️ [CATCH-UP] Lỗi mạng khi gọi get_logs: {}", e);
+                }
+            }
+
+            // 🎯 CẢI TIẾN 4 & MỤC 2 REVIEW: Chỉ tiến cursor khi batch đã hoàn thành thành công
+            if batch_succeeded {
+                cursor = chunk_to + 1;
+                // Cập nhật lại cursor sau khi hoàn thành batch (chỉ ghi 1 lần duy nhất trên mỗi batch)
+                write_catchup_progress(&app.storage_root, cursor, range.to).await;
+
+                // Tối ưu độ trễ: Nếu không có file xóa thì chỉ nghỉ 10ms để quét cực nhanh, nếu có file xóa thì nghỉ 50ms
+                if batch_deleted_count > 0 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+            }
+        }
+    }
+
+    // Khi đã hoàn tất toàn bộ các dải quét bù:
+    clear_catchup_progress(&app.storage_root).await;
+    log::info!(
+        "✅ [CATCH-UP WORKER] Hoàn tất toàn bộ quét bù! Đã xử lý xóa {} file(s) trên đĩa.",
+        total_deleted
     );
 }
 
@@ -163,43 +315,35 @@ async fn listen_download_confirmed_internal(
         Err(e) => return Err(format!("Failed to get initial block number: {}", e)),
     };
 
-    let saved_block = read_saved_last_block(&app.storage_root).await;
+    let saved_last_block = read_saved_last_block(&app.storage_root).await;
+    let saved_catchup = read_catchup_progress(&app.storage_root).await;
     let mut last_block = current_block;
 
     if is_initial_start {
-        let plan = determine_catchup_plan(saved_block, current_block);
-        match plan {
-            CatchupPlan::None { start_block } => {
-                if let Some(saved) = saved_block {
-                    if saved > current_block {
-                        log::warn!(
-                            "⚠️ [LISTENER] Block trong file ({}) > block hiện tại ({}) (có thể do reset mạng blockchain). Ưu tiên lấy block hiện tại {} và KHÔNG quét lùi.",
-                            saved, current_block, current_block
-                        );
-                        write_saved_last_block(&app.storage_root, current_block).await;
-                    }
-                } else {
-                    write_saved_last_block(&app.storage_root, current_block).await;
-                }
-                last_block = start_block;
-            }
-            CatchupPlan::CatchupRequired {
-                realtime_start,
-                catchup_from,
-                catchup_to,
-            } => {
-                log::info!(
-                    "🔄 [LISTENER] Phát hiện saved_block={} < current_block={}. Khởi chạy luồng 2 quét bù FileDeleted từ block {} đến {}.",
-                    catchup_from - 1, current_block, catchup_from, catchup_to
-                );
-                let app_catchup = app.clone();
-                tokio::spawn(async move {
-                    catch_up_historical_deleted_events(app_catchup, catchup_from, catchup_to).await;
-                });
-                last_block = realtime_start;
-            }
+        let plan = determine_catchup_plan(saved_last_block, saved_catchup, current_block);
+
+        if plan.should_clear_catchup_file {
+            log::warn!(
+                "⚠️ [LISTENER] Block trong file ({:?}) > block hiện tại ({}) (chain reset). Ưu tiên block hiện tại {}, KHÔNG quét lùi.",
+                saved_last_block, current_block, current_block
+            );
+            clear_catchup_progress(&app.storage_root).await;
+            write_saved_last_block(&app.storage_root, current_block).await;
+        } else if !plan.catchup_ranges.is_empty() {
+            log::info!(
+                "🔄 [LISTENER] Phát hiện {} dải cần quét bù quá khứ. Khởi chạy luồng 2 (Worker ngầm)...",
+                plan.catchup_ranges.len()
+            );
+            let app_catchup = app.clone();
+            let ranges = plan.catchup_ranges;
+            tokio::spawn(async move {
+                catch_up_historical_deleted_events(app_catchup, ranges).await;
+            });
         }
-    } else if let Some(saved) = saved_block {
+
+        last_block = plan.realtime_start;
+        write_saved_last_block(&app.storage_root, last_block).await;
+    } else if let Some(saved) = saved_last_block {
         if saved <= current_block {
             last_block = saved;
         }

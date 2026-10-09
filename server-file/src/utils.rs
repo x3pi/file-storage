@@ -24,12 +24,26 @@ pub fn retry_delay_secs(attempt: u32) -> u64 {
     (15u64 * (1u64 << (attempt - 1).min(3))).min(120)
 }
 
-/// Tính độ sâu của Merkle Tree từ tổng số chunk.
+/// Tính độ sâu của Merkle Tree từ tổng số chunk bằng phép toán bitwise chính xác,
+/// không sử dụng số thực (f64) để tránh sai số làm tròn khi chunk lớn.
 #[inline]
 pub fn merkle_tree_depth(total_chunks: u64) -> usize {
     if total_chunks <= 1 {
         0
     } else {
-        (total_chunks as f64).log2().ceil() as usize
+        total_chunks.next_power_of_two().trailing_zeros() as usize
     }
+}
+
+/// Ghi file an toàn (Atomic Write) qua file tạm và POSIX rename,
+/// tránh nguy cơ file bị rỗng (0-byte) khi sập nguồn hoặc crash đột ngột.
+pub async fn write_atomic(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_path = path.with_extension(format!("tmp.{}.{}", std::process::id(), nonce));
+    tokio::fs::write(&tmp_path, content).await?;
+    tokio::fs::rename(&tmp_path, path).await?;
+    Ok(())
 }

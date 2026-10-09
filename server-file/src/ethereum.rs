@@ -261,12 +261,8 @@ pub async fn verify_upload_chunk(
         ));
     }
 
-    // 4. Verify Merkle proof depth to prevent second-preimage attack
-    let expected_depth = if total_chunks <= 1 {
-        0
-    } else {
-        total_chunks.next_power_of_two().trailing_zeros() as usize
-    };
+    // 4. Verify Merkle proof depth to prevent second-preimage attack (dùng hàm utils dùng chung)
+    let expected_depth = crate::utils::merkle_tree_depth(total_chunks);
 
     if payload.merkle_proof_hashes.len() != expected_depth {
         return Err(format!(

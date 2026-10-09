@@ -554,10 +554,7 @@ async fn main() {
 }
 
 pub(crate) async fn write_atomic(path: &std::path::Path, content: &str) -> std::io::Result<()> {
-    let tmp_path = path.with_extension("tmp");
-    tokio::fs::write(&tmp_path, content).await?;
-    tokio::fs::rename(&tmp_path, path).await?;
-    Ok(())
+    crate::utils::write_atomic(path, content).await
 }
 
 pub(crate) async fn remove_pending_uploads(path: &std::path::Path, current_batch: &[String], addr_str: &str) {

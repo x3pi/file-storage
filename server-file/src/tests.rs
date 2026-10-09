@@ -373,6 +373,8 @@ fn test_merkle_depth_calculation() {
     assert_eq!(merkle_tree_depth(9), 4);
     assert_eq!(merkle_tree_depth(16), 4);
     assert_eq!(merkle_tree_depth(1024), 10);
+    assert_eq!(merkle_tree_depth(1025), 11);
+    assert_eq!(merkle_tree_depth(1_048_576), 20);
 }
 
 // =========================================================================
@@ -437,42 +439,92 @@ fn test_error_classification_revert_vs_transient() {
 
 #[tokio::test]
 async fn test_listener_catchup_plan_and_block_persistence() {
-    use crate::listener::{determine_catchup_plan, read_saved_last_block, write_saved_last_block, CatchupPlan};
+    use crate::listener::{
+        clear_catchup_progress, determine_catchup_plan, read_catchup_progress, read_saved_last_block,
+        write_catchup_progress, write_saved_last_block, BlockRange, CatchupPlanResult, CatchupProgress,
+    };
 
     // 1. Trường hợp: Block trong file (200_000) > Block hiện tại (500) do reset mạng
-    // Yêu cầu: Ưu tiên lấy block hiện tại, KHÔNG quét lùi
-    let plan_reset = determine_catchup_plan(Some(200_000), 500);
-    assert_eq!(plan_reset, CatchupPlan::None { start_block: 500 });
-
-    // 2. Trường hợp: Block trong file (95_000) < Block hiện tại (100_000) do tắt server
-    // Yêu cầu: Luồng 1 chạy realtime từ 100_000, Luồng 2 quét bù FileDeleted từ 95_001..=100_000
-    let plan_catchup = determine_catchup_plan(Some(95_000), 100_000);
+    // Yêu cầu: Ưu tiên lấy block hiện tại, KHÔNG quét lùi, xóa file tiến trình cũ nếu có
+    let plan_reset = determine_catchup_plan(Some(200_000), None, 500);
     assert_eq!(
-        plan_catchup,
-        CatchupPlan::CatchupRequired {
-            realtime_start: 100_000,
-            catchup_from: 95_001,
-            catchup_to: 100_000,
+        plan_reset,
+        CatchupPlanResult {
+            realtime_start: 500,
+            catchup_ranges: Vec::new(),
+            should_clear_catchup_file: true,
         }
     );
 
-    // 3. Trường hợp: Block trong file trùng với block hiện tại
-    let plan_equal = determine_catchup_plan(Some(100_000), 100_000);
-    assert_eq!(plan_equal, CatchupPlan::None { start_block: 100_000 });
+    // 2. Trường hợp: Lần đầu bật sau khi tắt (saved=95_000 < current=100_000)
+    // Yêu cầu: Luồng 1 chạy realtime từ 100_000, Luồng 2 quét bù đúng đoạn [95_001..=100_000]
+    let plan_catchup = determine_catchup_plan(Some(95_000), None, 100_000);
+    assert_eq!(
+        plan_catchup,
+        CatchupPlanResult {
+            realtime_start: 100_000,
+            catchup_ranges: vec![BlockRange {
+                from: 95_001,
+                to: 100_000,
+            }],
+            should_clear_catchup_file: false,
+        }
+    );
 
-    // 4. Trường hợp: Chưa có file lưu block (None)
-    let plan_none = determine_catchup_plan(None, 100_000);
-    assert_eq!(plan_none, CatchupPlan::None { start_block: 100_000 });
+    // 3. Trường hợp: Server bị crash giữa chừng lúc worker đang quét bù dở
+    // Worker cũ đang quét [95_001..=100_000], đã chạy tới cursor 97_500.
+    // Trong khi đó luồng realtime trước lúc crash đã chạy tới 100_010.
+    // Lần khởi động tiếp theo current_block = 105_000.
+    // Yêu cầu: Tiếp tục quét dở [97_500..=100_000], VÀ thêm dải mới [100_011..=105_000] (Không sót, không trùng!).
+    let saved_progress = CatchupProgress {
+        cursor: 97_500,
+        to: 100_000,
+    };
+    let plan_resumed = determine_catchup_plan(Some(100_010), Some(saved_progress), 105_000);
+    assert_eq!(
+        plan_resumed,
+        CatchupPlanResult {
+            realtime_start: 105_000,
+            catchup_ranges: vec![
+                BlockRange {
+                    from: 97_500,
+                    to: 100_000,
+                },
+                BlockRange {
+                    from: 100_011,
+                    to: 105_000,
+                },
+            ],
+            should_clear_catchup_file: false,
+        }
+    );
 
-    // 5. Kiểm tra đọc/ghi block vào file trên đĩa
+    // 4. Trường hợp: Block trùng nhau hoặc chưa có file
+    let plan_equal = determine_catchup_plan(Some(100_000), None, 100_000);
+    assert_eq!(plan_equal.catchup_ranges.len(), 0);
+
+    let plan_none = determine_catchup_plan(None, None, 100_000);
+    assert_eq!(plan_none.catchup_ranges.len(), 0);
+
+    // 5. Kiểm tra đọc/ghi Atomic block và catchup progress trên đĩa
     let (storage_root, log_dir) = create_temp_env();
     assert_eq!(read_saved_last_block(&storage_root).await, None);
+    assert_eq!(read_catchup_progress(&storage_root).await, None);
 
     write_saved_last_block(&storage_root, 12345).await;
     assert_eq!(read_saved_last_block(&storage_root).await, Some(12345));
 
-    write_saved_last_block(&storage_root, 67890).await;
-    assert_eq!(read_saved_last_block(&storage_root).await, Some(67890));
+    write_catchup_progress(&storage_root, 5000, 10000).await;
+    assert_eq!(
+        read_catchup_progress(&storage_root).await,
+        Some(CatchupProgress {
+            cursor: 5000,
+            to: 10000,
+        })
+    );
+
+    clear_catchup_progress(&storage_root).await;
+    assert_eq!(read_catchup_progress(&storage_root).await, None);
 
     cleanup_temp_env(storage_root, log_dir);
 }
