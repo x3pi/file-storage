@@ -180,6 +180,8 @@ async fn main() {
         let app_recovery = app_clone.clone();
         let pending_upload_recovery = pending_upload_path.clone();
         let pending_dl_recovery = pending_dl_path.clone();
+        let failed_upload_json_boot = failed_upload_json.clone();
+        let failed_dl_json_boot = failed_dl_json.clone();
         tokio::spawn(async move {
             if tokio::fs::try_exists(&pending_upload_recovery).await.unwrap_or(false) {
                 if let Ok(content) = tokio::fs::read_to_string(&pending_upload_recovery).await {
@@ -220,6 +222,35 @@ async fn main() {
                         log::info!("♻️ [TX Manager Recovery] Khôi phục {} download confirms chưa hoàn thành từ đĩa.", count);
                     }
                 }
+            }
+
+            // Khôi phục các bản ghi NEEDS_ADMIN_REVIEW thành PENDING_BACKGROUND_RETRY khi server khởi động lại
+            let mut boot_upload_records = load_failed_records(&failed_upload_json_boot).await;
+            let mut reset_uploads = 0;
+            for r in &mut boot_upload_records {
+                if r.status == "NEEDS_ADMIN_REVIEW" {
+                    r.status = "PENDING_BACKGROUND_RETRY".to_string();
+                    r.attempts = 0;
+                    reset_uploads += 1;
+                }
+            }
+            if reset_uploads > 0 {
+                let _ = save_failed_records(&failed_upload_json_boot, &boot_upload_records).await;
+                log::info!("♻️ [TX Manager Recovery] Khôi phục {} upload records NEEDS_ADMIN_REVIEW sang PENDING_BACKGROUND_RETRY.", reset_uploads);
+            }
+
+            let mut boot_dl_records = load_failed_records(&failed_dl_json_boot).await;
+            let mut reset_dls = 0;
+            for r in &mut boot_dl_records {
+                if r.status == "NEEDS_ADMIN_REVIEW" {
+                    r.status = "PENDING_BACKGROUND_RETRY".to_string();
+                    r.attempts = 0;
+                    reset_dls += 1;
+                }
+            }
+            if reset_dls > 0 {
+                let _ = save_failed_records(&failed_dl_json_boot, &boot_dl_records).await;
+                log::info!("♻️ [TX Manager Recovery] Khôi phục {} download records NEEDS_ADMIN_REVIEW sang PENDING_BACKGROUND_RETRY.", reset_dls);
             }
         });
 
@@ -288,9 +319,15 @@ async fn main() {
                                     remove_pending_uploads(&pending_upload_path, &current_batch, &addr.to_string()).await;
                                 } else if is_terminal_contract_revert(&err_str) {
                                     log::error!("❌ [TX Manager] confirm_upload_batch gặp lỗi contract không thể phục hồi: {}. Ghi vào failed_uploads.json và xóa khỏi pending.", err_str);
-                                    for k in &current_batch {
-                                        record_failed_upload_detailed(&app_clone.storage_root, k, &addr.to_string(), &err_str, 0, "TERMINAL_ERROR").await;
-                                    }
+                                    record_failed_upload_batch(
+                                        &app_clone.storage_root,
+                                        &current_batch,
+                                        &addr.to_string(),
+                                        &err_str,
+                                        0,
+                                        "TERMINAL_ERROR",
+                                    )
+                                    .await;
                                     remove_pending_uploads(&pending_upload_path, &current_batch, &addr.to_string()).await;
                                 } else {
                                     // Mọi lỗi mạng / RPC tạm thời (timeout, connection reset, nonce, gas price,...):
@@ -301,17 +338,15 @@ async fn main() {
                                         current_batch.len(),
                                         err_str
                                     );
-                                    for k in &current_batch {
-                                        record_failed_upload_detailed(
-                                            &app_clone.storage_root,
-                                            k,
-                                            &addr.to_string(),
-                                            &err_str,
-                                            1,
-                                            "PENDING_BACKGROUND_RETRY",
-                                        )
-                                        .await;
-                                    }
+                                    record_failed_upload_batch(
+                                        &app_clone.storage_root,
+                                        &current_batch,
+                                        &addr.to_string(),
+                                        &err_str,
+                                        1,
+                                        "PENDING_BACKGROUND_RETRY",
+                                    )
+                                    .await;
                                     remove_pending_uploads(&pending_upload_path, &current_batch, &addr.to_string()).await;
                                 }
                             }
@@ -430,6 +465,18 @@ async fn main() {
                                             upload_records[i].status = "TERMINAL_ERROR".to_string();
                                             upload_records[i].reason = err_str.clone();
                                         }
+                                    } else if is_transient_rpc_error(&err_str) {
+                                        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                                        log::warn!(
+                                            "⏳ [TX Manager Background] RPC/mạng tạm thời gián đoạn ({}). Tạm hoãn retry batch này, KHÔNG tăng attempts để bảo toàn bản ghi.",
+                                            err_str
+                                        );
+                                        for &i in &batch_indices {
+                                            upload_records[i].last_attempt_at = now.clone();
+                                            upload_records[i].reason = format!("Transient RPC Error: {}", err_str);
+                                        }
+                                        let _ = save_failed_records(&failed_upload_json, &upload_records).await;
+                                        continue;
                                     } else {
                                         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
                                         for &i in &batch_indices {
@@ -479,6 +526,16 @@ async fn main() {
                                     log::error!("❌ [TX Manager Background] Download key gặp lỗi contract vĩnh viễn: {}. Dừng retry.", err_str);
                                     dl_records[idx].status = "TERMINAL_ERROR".to_string();
                                     dl_records[idx].reason = err_str;
+                                } else if is_transient_rpc_error(&err_str) {
+                                    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                                    log::warn!(
+                                        "⏳ [TX Manager Background] RPC/mạng tạm thời gián đoạn ({}) khi confirm download {}. KHÔNG tăng attempts.",
+                                        err_str, dl_key
+                                    );
+                                    dl_records[idx].last_attempt_at = now;
+                                    dl_records[idx].reason = format!("Transient RPC Error: {}", err_str);
+                                    let _ = save_failed_records(&failed_dl_json, &dl_records).await;
+                                    continue;
                                 } else {
                                     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
                                     dl_records[idx].attempts += 1;
@@ -695,6 +752,26 @@ pub(crate) fn is_terminal_contract_revert(err_str: &str) -> bool {
         || lower.contains("unauthorized")
 }
 
+pub(crate) fn is_transient_rpc_error(err_str: &str) -> bool {
+    let lower = err_str.to_lowercase();
+    lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("deadline has elapsed")
+        || lower.contains("transport")
+        || lower.contains("failed to send request")
+        || lower.contains("error sending request")
+        || lower.contains("hyper::error")
+        || lower.contains("dns")
+        || lower.contains("channel closed")
+        || lower.contains("broken pipe")
+        || lower.contains("502 bad gateway")
+        || lower.contains("503 service unavailable")
+        || lower.contains("504 gateway timeout")
+        || lower.contains("429 too many requests")
+}
+
 pub(crate) async fn load_failed_records(path: &std::path::Path) -> Vec<crate::models::FailedTxRecord> {
     if !path.exists() {
         return Vec::new();
@@ -743,9 +820,57 @@ pub(crate) async fn remove_failed_record(path: &std::path::Path, key: &str) {
     let _ = save_failed_records(path, &records).await;
 }
 
-#[allow(dead_code)]
-pub(crate) async fn record_failed_upload(storage_root: &std::path::Path, file_key: &str, contract: &str, reason: &str) {
-    record_failed_upload_detailed(storage_root, file_key, contract, reason, MAIN_TX_RETRIES, "PENDING_BACKGROUND_RETRY").await;
+/// Ghi nhận hàng loạt (Batch) các file upload thất bại vào JSON trong 1 lần I/O duy nhất (O(n)).
+/// Loại bỏ hoàn toàn vòng lặp N lần đọc/ghi đĩa atomic gây nghẽn O(n^2).
+pub(crate) async fn record_failed_upload_batch(
+    storage_root: &std::path::Path,
+    file_keys: &[String],
+    contract: &str,
+    reason: &str,
+    attempts: u32,
+    status: &str,
+) {
+    if file_keys.is_empty() {
+        return;
+    }
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let json_path = storage_root.join("failed_uploads.json");
+    let mut records = load_failed_records(&json_path).await;
+
+    for file_key in file_keys {
+        let clean_key = file_key.trim_start_matches("0x");
+        let new_record = crate::models::FailedTxRecord {
+            key: file_key.clone(),
+            contract_address: contract.to_string(),
+            attempts,
+            max_attempts: MAX_BACKGROUND_RETRIES,
+            reason: reason.to_string(),
+            status: status.to_string(),
+            first_failed_at: now.clone(),
+            last_attempt_at: now.clone(),
+            next_retry_at: None,
+        };
+        if let Some(existing) = records.iter_mut().find(|r| r.key.trim_start_matches("0x").eq_ignore_ascii_case(clean_key)) {
+            *existing = new_record;
+        } else {
+            records.push(new_record);
+        }
+    }
+    let _ = save_failed_records(&json_path, &records).await;
+
+    let failed_path = storage_root.join("failed_uploads.txt");
+    let mut log_lines = String::new();
+    for file_key in file_keys {
+        log_lines.push_str(&format!(
+            "[{}] FileKey: {}, Contract: {}, Status: {}, Attempts: {}, Reason: {}\n",
+            now, file_key, contract, status, attempts, reason
+        ));
+    }
+    use tokio::io::AsyncWriteExt;
+    if let Ok(mut file) = tokio::fs::OpenOptions::new().create(true).append(true).open(&failed_path).await {
+        let _ = file.write_all(log_lines.as_bytes()).await;
+        let _ = file.flush().await;
+    }
 }
 
 pub(crate) async fn record_failed_upload_detailed(
@@ -756,27 +881,12 @@ pub(crate) async fn record_failed_upload_detailed(
     attempts: u32,
     status: &str,
 ) {
-    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let json_path = storage_root.join("failed_uploads.json");
-    let record = crate::models::FailedTxRecord {
-        key: file_key.to_string(),
-        contract_address: contract.to_string(),
-        attempts,
-        max_attempts: MAX_BACKGROUND_RETRIES,
-        reason: reason.to_string(),
-        status: status.to_string(),
-        first_failed_at: now.clone(),
-        last_attempt_at: now.clone(),
-    };
-    upsert_failed_record(&json_path, record).await;
+    record_failed_upload_batch(storage_root, &[file_key.to_string()], contract, reason, attempts, status).await;
+}
 
-    let failed_path = storage_root.join("failed_uploads.txt");
-    let line = format!("[{}] FileKey: {}, Contract: {}, Status: {}, Attempts: {}, Reason: {}\n", now, file_key, contract, status, attempts, reason);
-    use tokio::io::AsyncWriteExt;
-    if let Ok(mut file) = tokio::fs::OpenOptions::new().create(true).append(true).open(&failed_path).await {
-        let _ = file.write_all(line.as_bytes()).await;
-        let _ = file.flush().await;
-    }
+#[allow(dead_code)]
+pub(crate) async fn record_failed_upload(storage_root: &std::path::Path, file_key: &str, contract: &str, reason: &str) {
+    record_failed_upload_detailed(storage_root, file_key, contract, reason, 1, "PENDING_BACKGROUND_RETRY").await;
 }
 
 #[allow(dead_code)]
@@ -803,6 +913,7 @@ pub(crate) async fn record_failed_download_detailed(
         status: status.to_string(),
         first_failed_at: now.clone(),
         last_attempt_at: now.clone(),
+        next_retry_at: None,
     };
     upsert_failed_record(&json_path, record).await;
 

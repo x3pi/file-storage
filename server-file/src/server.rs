@@ -391,9 +391,12 @@ pub async fn handle_connection(
                                         // Sử dụng remove để đảm bảo chỉ có ĐÚNG MỘT luồng vào được đây để xử lý hoàn thành
                                         if let Some((_, _)) = app_clone.chunk_tracker.remove(&log_file_key) {
                                             log::info!("[{}] 🎯 File {} fully received for this node ({} / {} total chunks). Syncing data to disk & queueing for confirm.", peer_clone, log_file_key, expected_chunks, total_chunks);
-                                            log::info!("Extracted contract_addr from cache: {}", contract_addr);
-                                            app_clone.finalize_upload_file(&log_file_key, contract_addr).await;
-                                            status_str = "COMPLETED";
+                                            if let Err(e) = app_clone.finalize_upload_file(&log_file_key, contract_addr).await {
+                                                log::error!("[{}] ❌ finalize_upload_file failed: {}", peer_clone, e);
+                                                status_str = "FAILED";
+                                            } else {
+                                                status_str = "COMPLETED";
+                                            }
                                         }
                                     }
 

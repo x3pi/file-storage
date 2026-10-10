@@ -345,7 +345,9 @@ async fn handle_upload_chunk(
                             if let Some((_, _)) = app.chunk_tracker.remove(&payload.file_key) {
                                 log::info!("[WT][{}] 🎯 File {} fully received for this node ({} / {} total chunks). Syncing data to disk & queueing for confirm.", peer_ip, payload.file_key, expected_chunks, total_chunks);
                                 log::info!("Extracted contract_addr from cache: {}", contract_addr);
-                                app.finalize_upload_file(&payload.file_key, contract_addr).await;
+                                if let Err(e) = app.finalize_upload_file(&payload.file_key, contract_addr).await {
+                                    log::error!("[WT][{}] ❌ finalize_upload_file failed: {}", peer_ip, e);
+                                }
                             }
                         }
                     }

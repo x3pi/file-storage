@@ -674,7 +674,14 @@ async fn test_finalize_upload_file_sync_data() {
     assert!(app.file_cache.contains_key(file_key));
 
     // Gọi finalize_upload_file (thực hiện sync_data và đẩy vào queue)
-    app.finalize_upload_file(file_key, contract_addr).await;
+    let res = app.finalize_upload_file(file_key, contract_addr).await;
+    assert!(res.is_ok(), "finalize_upload_file should succeed");
+
+    // WAL: pending_uploads.txt phải chứa dòng file_key
+    let wal_path = storage_root.join("pending_uploads.txt");
+    assert!(wal_path.exists(), "pending_uploads.txt must exist as WAL");
+    let wal_content = std::fs::read_to_string(&wal_path).unwrap();
+    assert!(wal_content.contains(file_key), "WAL must record unconfirmed file");
 
     // File cache phải được dọn dẹp (đóng file descriptor)
     assert!(!app.file_cache.contains_key(file_key));
@@ -729,3 +736,71 @@ async fn test_write_chunk_zero_copy_and_dir_cache() {
 
     cleanup_temp_env(storage_root, log_dir);
 }
+
+#[tokio::test]
+async fn test_record_failed_upload_batch_o_n() {
+    let (storage_root, log_dir) = create_temp_env();
+    let contract = "0x1234567890123456789012345678901234567890";
+    let keys: Vec<String> = (0..5).map(|i| format!("0xfile_key_{:04}", i)).collect();
+
+    // 1. Ghi batch 5 keys vào JSON trong 1 lần I/O O(n)
+    super::record_failed_upload_batch(
+        &storage_root,
+        &keys,
+        contract,
+        "Simulated batch timeout error",
+        1,
+        "PENDING_BACKGROUND_RETRY",
+    )
+    .await;
+
+    let json_path = storage_root.join("failed_uploads.json");
+    assert!(json_path.exists());
+    let records = super::load_failed_records(&json_path).await;
+    assert_eq!(records.len(), 5);
+    for (i, r) in records.iter().enumerate() {
+        assert_eq!(r.key, format!("0xfile_key_{:04}", i));
+        assert_eq!(r.contract_address, contract);
+        assert_eq!(r.attempts, 1);
+        assert_eq!(r.status, "PENDING_BACKGROUND_RETRY");
+        assert_eq!(r.reason, "Simulated batch timeout error");
+    }
+
+    // 2. Ghi đè cập nhật 2 keys trong batch sang TERMINAL_ERROR
+    let update_keys = vec![keys[0].clone(), keys[1].clone()];
+    super::record_failed_upload_batch(
+        &storage_root,
+        &update_keys,
+        contract,
+        "Terminal revert: Invalid key",
+        0,
+        "TERMINAL_ERROR",
+    )
+    .await;
+
+    let updated_records = super::load_failed_records(&json_path).await;
+    assert_eq!(updated_records.len(), 5, "Tổng số bản ghi không đổi, chỉ cập nhật");
+    assert_eq!(updated_records[0].status, "TERMINAL_ERROR");
+    assert_eq!(updated_records[1].status, "TERMINAL_ERROR");
+    assert_eq!(updated_records[2].status, "PENDING_BACKGROUND_RETRY");
+
+    cleanup_temp_env(storage_root, log_dir);
+}
+
+#[test]
+fn test_transient_rpc_error_circuit_breaker() {
+    // Các lỗi mạng/RPC tạm thời phải được nhận diện để KHÔNG đốt attempts
+    assert!(super::is_transient_rpc_error("error: connection refused"));
+    assert!(super::is_transient_rpc_error("HTTP 502 Bad Gateway"));
+    assert!(super::is_transient_rpc_error("HTTP 503 Service Unavailable"));
+    assert!(super::is_transient_rpc_error("request timeout waiting for response"));
+    assert!(super::is_transient_rpc_error("deadline has elapsed"));
+    assert!(super::is_transient_rpc_error("transport error: broken pipe"));
+    assert!(super::is_transient_rpc_error("failed to send request"));
+
+    // Lỗi logic hợp đồng hoặc nghiệp vụ: KHÔNG PHẢI transient RPC error
+    assert!(!super::is_transient_rpc_error("execution reverted: Invalid key"));
+    assert!(!super::is_transient_rpc_error("File does not exist"));
+    assert!(!super::is_transient_rpc_error("Caller is not a storage server"));
+}
+

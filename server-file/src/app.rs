@@ -354,15 +354,58 @@ impl App {
         entry
     }
 
-    /// Hoàn tất file upload: fsync dữ liệu file .bin xuống đĩa vật lý (sync_data)
-    /// và đẩy vào hàng đợi Transaction Manager để xác nhận on-chain.
-    pub async fn finalize_upload_file(&self, file_key: &str, contract_addr: Address) {
+    /// Hoàn tất file upload: fsync dữ liệu file .bin và .meta xuống đĩa vật lý (sync_data),
+    /// ghi Write-Ahead Log (pending_uploads.txt) và đẩy vào hàng đợi TX Manager để xác nhận on-chain.
+    pub async fn finalize_upload_file(&self, file_key: &str, contract_addr: Address) -> std::io::Result<()> {
         if let Some((_, open_files)) = self.file_cache.remove(file_key) {
             let bin = open_files.bin_file.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                let _ = bin.sync_data();
-            }).await;
+            let meta = open_files.meta_file.clone();
+            let sync_res = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                bin.sync_data()?;
+                if let Ok(meta_guard) = meta.lock() {
+                    meta_guard.sync_data()?;
+                }
+                Ok(())
+            })
+            .await;
+
+            match sync_res {
+                Ok(Ok(())) => {
+                    log::debug!("✅ [FSYNC] Đã sync_data thành công cho .bin và .meta của file {}", file_key);
+                }
+                Ok(Err(e)) => {
+                    log::error!(
+                        "CRITICAL: [FSYNC] Lỗi sync_data cho file {}: {}. Hủy enqueue xác nhận on-chain!",
+                        file_key,
+                        e
+                    );
+                    return Err(e);
+                }
+                Err(e) => {
+                    log::error!("CRITICAL: [FSYNC] spawn_blocking JoinError khi sync file {}: {}", file_key, e);
+                    return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
+                }
+            }
         }
+
+        // WAL (Write-Ahead Logging): Ghi vào pending_uploads.txt bền vững trước khi enqueue vào RAM channel.
+        // Giúp bảo đảm nếu server crash trước khi TX Manager kịp đọc channel thì sau khi khởi động lại
+        // server vẫn tự động phục hồi và xác nhận on-chain, client không cần phải tải lại.
+        let pending_upload_path = self.storage_root.join("pending_uploads.txt");
+        let line = format!("{},{}\n", file_key, contract_addr);
+        use tokio::io::AsyncWriteExt;
+        if let Ok(mut file) = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&pending_upload_path)
+            .await
+        {
+            let _ = file.write_all(line.as_bytes()).await;
+            let _ = file.flush().await;
+            let _ = file.sync_data().await;
+        }
+
         let _ = self.upload_batch_sender.send((file_key.to_string(), contract_addr)).await;
+        Ok(())
     }
 }

@@ -76,6 +76,8 @@ pub struct FailedTxRecord {
     pub status: String, // "PENDING_BACKGROUND_RETRY" | "NEEDS_ADMIN_REVIEW" | "TERMINAL_ERROR"
     pub first_failed_at: String,
     pub last_attempt_at: String,
+    #[serde(default)]
+    pub next_retry_at: Option<String>,
 }
 
 // Upload verification cache: stores both verified address and merkle root
