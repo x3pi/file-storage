@@ -565,3 +565,125 @@ async fn test_cleanup_stale_tmp_files() {
 
     cleanup_temp_env(storage_root, log_dir);
 }
+
+#[test]
+fn test_sparse_file_chunk_set_checking() {
+    use crate::utils::is_chunk_in_set;
+    use std::collections::HashSet;
+
+    // Giả sử Node 1 lưu các chunk chẵn: 0, 2, 4
+    let mut available_chunks = HashSet::new();
+    available_chunks.insert(0);
+    available_chunks.insert(2);
+    available_chunks.insert(4);
+
+    // Node 1 có chunk 0, 2, 4
+    assert!(is_chunk_in_set(&available_chunks, 0));
+    assert!(is_chunk_in_set(&available_chunks, 2));
+    assert!(is_chunk_in_set(&available_chunks, 4));
+
+    // Node 1 KHÔNG có chunk 1, 3 (thuộc Node 2) -> phải trả về false để ngăn đọc sparse file 1MB byte 0
+    assert!(!is_chunk_in_set(&available_chunks, 1));
+    assert!(!is_chunk_in_set(&available_chunks, 3));
+    assert!(!is_chunk_in_set(&available_chunks, 5));
+}
+
+#[test]
+fn test_retry_limits_and_fast_backoff_calculation() {
+    use crate::utils::main_retry_delay_secs;
+
+    assert_eq!(super::MAIN_TX_RETRIES, 3);
+    assert_eq!(super::MAX_BACKGROUND_RETRIES, 10);
+
+    // Luồng chính thử lại nhanh: 2s, 4s, 8s (tổng cộng 14s, không gây tắc nghẽn queue)
+    assert_eq!(main_retry_delay_secs(1), 2);
+    assert_eq!(main_retry_delay_secs(2), 4);
+    assert_eq!(main_retry_delay_secs(3), 8);
+    assert_eq!(main_retry_delay_secs(4), 8); // cap ở 8s
+}
+
+#[tokio::test]
+async fn test_failed_dead_letter_json_storage_and_recovery() {
+    let (storage_root, log_dir) = create_temp_env();
+    let file_key = "0xdeadbeef123";
+    let contract = "0x111122223333444455556666777788889999aaaa";
+    let reason = "timeout waiting for receipt";
+
+    // 1. Ghi failed upload dạng JSON
+    super::record_failed_upload_detailed(
+        &storage_root,
+        file_key,
+        contract,
+        reason,
+        super::MAIN_TX_RETRIES,
+        "PENDING_BACKGROUND_RETRY",
+    )
+    .await;
+
+    let json_file = storage_root.join("failed_uploads.json");
+    assert!(json_file.exists());
+
+    // 2. Load lại bản ghi JSON
+    let records = super::load_failed_records(&json_file).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].key, file_key);
+    assert_eq!(records[0].contract_address, contract);
+    assert_eq!(records[0].attempts, 3);
+    assert_eq!(records[0].max_attempts, 10);
+    assert_eq!(records[0].status, "PENDING_BACKGROUND_RETRY");
+    assert_eq!(records[0].reason, reason);
+
+    // 3. Upsert cập nhật số lần thử lại
+    let mut updated = records[0].clone();
+    updated.attempts = 10;
+    updated.status = "NEEDS_ADMIN_REVIEW".to_string();
+    super::upsert_failed_record(&json_file, updated).await;
+
+    let reloaded = super::load_failed_records(&json_file).await;
+    assert_eq!(reloaded.len(), 1);
+    assert_eq!(reloaded[0].attempts, 10);
+    assert_eq!(reloaded[0].status, "NEEDS_ADMIN_REVIEW");
+
+    // 4. Xoá bản ghi khi đã hoàn tất
+    super::remove_failed_record(&json_file, file_key).await;
+    let after_removal = super::load_failed_records(&json_file).await;
+    assert_eq!(after_removal.len(), 0);
+
+    cleanup_temp_env(storage_root, log_dir);
+}
+
+#[tokio::test]
+async fn test_finalize_upload_file_sync_data() {
+    let (storage_root, log_dir) = create_temp_env();
+    let app = App::new_test(storage_root.clone(), log_dir.clone());
+    let file_key = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+    let contract_addr = alloy::primitives::Address::ZERO;
+
+    // Tạo file tạm và mở file descriptor
+    let file_path = storage_root.join("test_file.bin");
+    let bin_file = std::fs::File::create(&file_path).unwrap();
+    let meta_file = std::fs::File::create(storage_root.join("test_file.meta")).unwrap();
+    app.file_cache.insert(
+        file_key.to_string(),
+        crate::models::OpenFiles {
+            bin_file: std::sync::Arc::new(bin_file),
+            meta_file: std::sync::Arc::new(std::sync::Mutex::new(meta_file)),
+        },
+    );
+
+    assert!(app.file_cache.contains_key(file_key));
+
+    // Gọi finalize_upload_file (thực hiện sync_data và đẩy vào queue)
+    app.finalize_upload_file(file_key, contract_addr).await;
+
+    // File cache phải được dọn dẹp (đóng file descriptor)
+    assert!(!app.file_cache.contains_key(file_key));
+
+    // Channel upload_batch_receiver phải nhận được key
+    let mut rx = app.upload_batch_receiver.lock().await;
+    let received = rx.try_recv().unwrap();
+    assert_eq!(received.0, file_key);
+    assert_eq!(received.1, contract_addr);
+
+    cleanup_temp_env(storage_root, log_dir);
+}

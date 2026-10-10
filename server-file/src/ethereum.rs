@@ -447,7 +447,7 @@ pub async fn handle_download_request(
     app: &Arc<App>,
 ) -> (GenericResponse, Option<Vec<u8>>) {
     // Initialize download session and check permissions (scope limits lock lifetime)
-    let (has_permission, file_handle) = {
+    let (has_permission, file_handle, is_available) = {
         let session = match app.download_cache.get(&payload.download_key) {
             Some(s) => s,
             None => {
@@ -457,7 +457,11 @@ pub async fn handle_download_request(
                 }, None);
             }
         };
-        (session.remaining_chunks > 0 || session.retry_remaining > 0, session.file_handle.clone())
+        (
+            session.remaining_chunks > 0 || session.retry_remaining > 0,
+            session.file_handle.clone(),
+            crate::utils::is_chunk_in_set(&session.available_chunks, payload.chunk_index),
+        )
     };
 
     // Check permission
@@ -465,6 +469,14 @@ pub async fn handle_download_request(
         return (GenericResponse {
             status: "ERROR".to_string(),
             message: "No remaining downloads for this key".to_string(),
+        }, None);
+    }
+
+    // Bảo vệ file thưa (sparse file): chỉ phục vụ chunk thực sự có trong .meta, từ chối chunk của node khác
+    if !is_available {
+        return (GenericResponse {
+            status: "ERROR".to_string(),
+            message: format!("Chunk {} is not stored on this node", payload.chunk_index),
         }, None);
     }
 

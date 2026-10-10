@@ -190,10 +190,12 @@ pub async fn initialize_download_session<'a>(
         .join(level2)
         .join(&file_key);
 
-    // Đếm số chunks
-    let chunk_count = count_chunks(&file_path)
+    // Lấy danh sách các chunk thực tế có trên node này
+    let chunks_list = list_chunks(&file_path)
         .await
-        .map_err(|e| format!("Failed to count chunks: {}", e))?;
+        .map_err(|e| format!("Failed to list chunks: {}", e))?;
+    let chunk_count = chunks_list.len() as u64;
+    let available_chunks = Arc::new(chunks_list.into_iter().collect::<std::collections::HashSet<u64>>());
 
     // Chuyển đổi Vec<Address> thành HashSet<Address> để tra cứu nhanh
     let whitelist: std::collections::HashSet<_> = whitelist_addresses.into_iter().collect();
@@ -238,6 +240,7 @@ pub async fn initialize_download_session<'a>(
                 .unwrap_or(0),
         )),
         file_handle: Arc::new(bin_file),
+        available_chunks,
     };
     // ✅ Insert vào cache
     app.download_cache.insert(download_key_clean.clone(), session);
@@ -250,6 +253,7 @@ pub async fn initialize_download_session<'a>(
     // Lock sẽ tự động được giải phóng (_lock bị drop) khi hàm kết thúc
 }
 
+#[allow(dead_code)]
 pub async fn count_chunks(file_path: &Path) -> Result<u64, String> {
     list_chunks(file_path).await.map(|v| v.len() as u64)
 }

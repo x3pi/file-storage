@@ -390,10 +390,9 @@ pub async fn handle_connection(
                                     if is_completed {
                                         // Sử dụng remove để đảm bảo chỉ có ĐÚNG MỘT luồng vào được đây để xử lý hoàn thành
                                         if let Some((_, _)) = app_clone.chunk_tracker.remove(&log_file_key) {
-                                            app_clone.file_cache.remove(&log_file_key); // Đóng ngay file descriptor để tránh rò rỉ FD
-                                            log::info!("[{}] 🎯 File {} fully received for this node ({} / {} total chunks). Queueing for confirm.", peer_clone, log_file_key, expected_chunks, total_chunks);
+                                            log::info!("[{}] 🎯 File {} fully received for this node ({} / {} total chunks). Syncing data to disk & queueing for confirm.", peer_clone, log_file_key, expected_chunks, total_chunks);
                                             log::info!("Extracted contract_addr from cache: {}", contract_addr);
-                                            let _ = app_clone.upload_batch_sender.send((log_file_key.clone(), contract_addr)).await;
+                                            app_clone.finalize_upload_file(&log_file_key, contract_addr).await;
                                             status_str = "COMPLETED";
                                         }
                                     }

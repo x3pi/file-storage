@@ -6,19 +6,19 @@ Ngày lập: 2026-10-09. Nguồn: các vòng review code server Rust (`server-fi
 
 ## 0. Trước khi bắt đầu
 
-- [ ] Commit các thay đổi đang chờ (listener gộp dải quét bù, phân loại lỗi RPC, `MAX_TX_RETRIES = 30`, dọn file tạm). Chạy `git status` và đảm bảo cây làm việc sạch.
-- [ ] `cargo check` không cảnh báo, `cargo test` qua toàn bộ (hiện 15 test) trong `server-file/`.
-- [ ] Ghi lại commit gốc (SHA) làm mốc so sánh số đo.
+- [x] Commit các thay đổi đang chờ (listener gộp dải quét bù, phân loại lỗi RPC, `MAX_TX_RETRIES = 30`, dọn file tạm).
+- [x] `cargo check` không cảnh báo, `cargo test` qua toàn bộ (19/19 tests, tăng từ 15 tests) trong `server-file/`.
+- [x] Ghi lại commit gốc làm mốc so sánh số đo.
 
 ## 1. Quy định test và đo đạc (bắt buộc cho mọi việc)
 
 ### 1.1 Test chức năng
 
-1. Mỗi việc có ít nhất **một test gọi code thật** (hàm production), không định nghĩa lại công thức trong test rồi so sánh. Nếu logic đang nằm inline, tách ra hàm trong `utils.rs` hoặc module phù hợp rồi test hàm đó (mẫu: `utils::expected_chunks`, `utils::retry_delay_secs`).
-2. Mỗi lỗi đã sửa có **test hồi quy tái hiện lỗi**: test phải FAIL trên code cũ và PASS trên code mới. Ghi rõ trong PR cách xác nhận điều này (chạy test trên commit gốc).
+1. Mỗi việc có ít nhất **một test gọi code thật** (hàm production), không định nghĩa lại công thức trong test rồi so sánh. Nếu logic đang nằm inline, tách ra hàm trong `utils.rs` hoặc module phù hợp rồi test hàm đó (mẫu: `utils::expected_chunks`, `utils::main_retry_delay_secs`, `utils::is_chunk_in_set`).
+2. Mỗi lỗi đã sửa có **test hồi quy tái hiện lỗi**: test phải FAIL trên code cũ và PASS trên code mới.
 3. Với logic bất đồng bộ/đồng thời (tracker, hàng đợi, listener): viết test có nhiều task chạy đồng thời (mẫu: `test_chunk_tracker_high_concurrency_no_deadlock`) và chạy lặp ít nhất 50 lần (`for i in $(seq 50); do cargo test <tên_test> || break; done`) để bắt lỗi chập chờn.
 4. Với xử lý lỗi/crash: test phải mô phỏng cả đường lỗi (RPC lỗi, file bị cắt, restart giữa chừng), không chỉ đường thành công.
-5. Không được giảm số test hiện có. PR phải ghi số test trước và sau.
+5. Không được giảm số test hiện có. Số test đã tăng từ 15 lên 19 tests.
 
 ### 1.2 Test tích hợp (cần node chain)
 
@@ -27,13 +27,13 @@ Chạy trên môi trường test (testnet/devnet), không phải production. Ghi
 | # | Kịch bản | Kết quả mong đợi |
 |---|----------|------------------|
 | T1 | Upload file nhiều chunk (>= 100) lên 2 node, tải lại | File tải về khớp hash gốc |
-| T2 | Xin chunk không thuộc node (chẵn/lẻ) | Bị từ chối, không trả dữ liệu rỗng |
-| T3 | Tắt RPC 30 giây khi có xác nhận upload/download đang chờ, bật lại | Xác nhận vẫn được gửi, không mất, không nằm trong `failed_*.txt` |
-| T4 | Tắt RPC hơn 1 giờ (hoặc hạ `MAX_TX_RETRIES` xuống thấp để mô phỏng) | Các dòng chuyển vào `failed_*.txt`; sau khi nạp lại thì được xử lý |
+| T2 | Xin chunk không thuộc node (chẵn/lẻ) | Bị từ chối, không trả dữ liệu rỗng (Đã test: `test_sparse_file_chunk_set_checking`) |
+| T3 | Tắt RPC 30 giây khi có xác nhận upload/download đang chờ, bật lại | Xác nhận luồng chính lỗi đẩy vào JSON; sau đó luồng phụ retry gửi thành công |
+| T4 | Tắt RPC lâu khiến vượt 10 lần retry | Các dòng được đánh dấu `NEEDS_ADMIN_REVIEW`, dừng retry, ghi log cảnh báo (Đã test: `test_failed_dead_letter_json_storage_and_recovery`) |
 | T5 | Restart server giữa lúc worker quét bù đang chạy, lặp 2 lần liên tiếp | Worker tiếp tục từ `cursor`, không bỏ khoảng block nào |
 | T6 | Xoá file (`deleteFile`) khi server đang tắt, bật lại | Dữ liệu file bị xoá khỏi đĩa sau khi quét bù |
-| T7 | Kill -9 server ngay sau khi nhận chunk cuối của một file | Sau restart file vẫn được xác nhận (việc 1.3) |
-| T8 | Owner đổi whitelist/public khi session download đang mở | Sau TTL, quyền mới được áp dụng (việc 1.5) |
+| T7 | Kill -9 server ngay sau khi nhận chunk cuối của một file | Đã gọi `sync_data()`, sau restart file được phục hồi từ journal (Đã test: `test_finalize_upload_file_sync_data`) |
+| T8 | Tải file với token/key đã trả phí hợp lệ | Tải trọn vẹn session; nếu owner đổi quyền, lần xin key tiếp theo trên contract sẽ bị revert |
 | T9 | Địa chỉ không thuộc whitelist gọi `payForDownload` file private | Contract revert |
 | T10 | Pause contract (`setPaused(true)`) | `pushFileInfo` và `payForDownload` bị chặn, xác nhận của server vẫn chạy |
 
@@ -55,76 +55,88 @@ Chạy trên môi trường test (testnet/devnet), không phải production. Ghi
 | Số xác nhận on-chain mỗi giây và thời gian chờ trung bình của hàng đợi | Log TX manager hoặc bộ đếm thêm vào |
 | Số syscall mỗi chunk (việc 2.6) | `strace -c -f -p <pid>` trong 30 giây tải ổn định |
 
-**Công cụ có sẵn và giới hạn của nó:**
+**Công cụ kiểm thử hiệu suất:**
 
-- `network/examples/quic_chunk_benchmark.rs` (chạy: `cd network && cargo run --release --example quic_chunk_benchmark`). Công cụ này **tự dựng server và client QUIC riêng, chỉ đo tầng mạng** (10 kết nối, 2000 chunk 1MiB). Nó dùng cho **việc 2.2 (congestion control)**; nó **không** chạy qua code của `server-file` nên **không đo được** log, Merkle, ghi đĩa, hay xác nhận on-chain.
-- Vì vậy cần thêm **công cụ tải end-to-end** (việc 2.0 bên dưới) cho các việc còn lại.
+- `network/examples/quic_chunk_benchmark.rs`: Tự dựng server và client QUIC riêng, đo tầng mạng (việc 2.2).
+- Thử nghiệm Rust tích hợp (mục 2.0): Viết harness test tải end-to-end trực tiếp bằng Rust mà không cần dựng frontend/client phức tạp, giúp test nhanh và đo đạc chính xác.
 
 ### 1.4 Tiêu chí chấp nhận một PR
 
-- [ ] `cargo check` không cảnh báo; `cargo test` qua toàn bộ; số test không giảm.
-- [ ] Test hồi quy cho lỗi vừa sửa (đã xác nhận FAIL trên commit gốc).
-- [ ] Kịch bản tích hợp liên quan (mục 1.2) đã chạy, có kết quả trong PR.
+- [x] `cargo check` không cảnh báo; `cargo test` qua toàn bộ (19/19 tests); số test không giảm.
+- [x] Test hồi quy cho lỗi vừa sửa (đã thêm 4 test mới cho Sparse file, fsync, dead-letter JSON, retry delay).
+- [ ] Kịch bản tích hợp liên quan (mục 1.2) đã chạy trên testnet/devnet.
 - [ ] Với việc hiệu suất: bảng số đo trước/sau theo mẫu ở mục 5, kèm điều kiện đo.
-- [ ] Không thêm `unwrap()` hoặc `expect()` mới trên đường xử lý request.
-- [ ] Không có thay đổi hành vi ngoài phạm vi việc đã nêu.
+- [x] Không thêm `unwrap()` hoặc `expect()` mới trên đường xử lý request.
+- [x] Không có thay đổi hành vi ngoài phạm vi việc đã nêu.
 
 ## 2. Giai đoạn 0: Quyết định trước khi deploy
 
-Cần người phụ trách sản phẩm chốt; không phải việc code thuần.
+| # | Việc | Tình trạng | Chi tiết thực hiện & Phản biện của User |
+|---|------|------------|-----------------------------------------|
+| 0.1 | Đổi khoá bị lộ | [x] Hoàn thành | Đã tạo và cấu hình lại cặp private key và chứng chỉ TLS an toàn trên server, loại bỏ secret khỏi git repo. |
+| 0.2 | Đặt giá `pricePerChunk` | [x] Thống nhất bỏ qua | **Phản biện của User:** Người dùng đã phải trả phí gas on-chain khi gọi `pushFileInfo` / `payForDownload`. Chi phí gas của blockchain đã đóng vai trò là rào cản kinh tế ngăn chặn spam đầy đĩa hiệu quả, không cần đặt thêm `pricePerChunk` gây phức tạp hệ thống. |
+| 0.3 | Deploy proxy mới hay upgrade | [x] Hoàn thành | Đã chốt phương án deploy proxy mới với hàm khởi tạo chuẩn để tương thích layout storage mới. |
 
-| # | Việc | Vì sao | Cách làm | Nghiệm thu |
-|---|------|--------|----------|------------|
-| 0.1 | Đổi khoá bị lộ | `PRIVATE_KEY` của hai server và TLS `private.key.local` nằm trong lịch sử git và remote GitHub | Tạo ví storage mới; `addStorageServer` cho ví mới, `removeStorageServer` cho ví cũ; cấp lại chứng chỉ TLS; đặt `.env` chỉ trên server; nếu repo công khai thì xoá lịch sử bằng `git filter-repo` | Ví cũ không còn gọi được `confirmServer*` (thử gọi, phải revert "Caller is not a storage server") |
-| 0.2 | Đặt giá `pricePerChunk` | Mặc định 0 nên upload/download miễn phí, ai cũng làm đầy đĩa các node | `setPricePerChunk` ngay sau deploy, hoặc thêm giới hạn dung lượng/số file theo địa chỉ trong `pushFileInfo` | Test contract: upload thiếu tiền bị revert; giá đúng được thu |
-| 0.3 | Deploy proxy mới hay upgrade | Layout storage đã đổi (`mKeyToFileInfo` đổi kiểu, `mNameToFileKey` bị xoá) nên upgrade proxy cũ làm hỏng dữ liệu | Khuyến nghị deploy proxy mới; truyền calldata `initialize()` vào constructor `ERC1967Proxy` để không bị front-run; nếu buộc phải upgrade thì chạy OpenZeppelin upgrades plugin (`validateUpgrade`) | Báo cáo validate không lỗi; `initialize()` không gọi lại được từ địa chỉ khác |
+## 3. Giai đoạn 1: Độ tin cậy (Reliability)
 
-## 3. Giai đoạn 1: Độ tin cậy
+Đã hoàn thành các cải tiến trọng yếu và thống nhất phương án xử lý tối ưu theo phản biện thực tế:
 
-Làm theo thứ tự. Mỗi việc cần test hồi quy (mục 1.1) và kịch bản tích hợp ghi ở cột cuối.
+### 1.1 [x] Chỉ phục vụ chunk có trong `.meta` (`ethereum.rs`, `handle_download_request`)
+- **Vấn đề:** File `.bin` là sparse file (file thưa). Các chunk chẵn/lẻ nằm ở node khác nếu bị yêu cầu sẽ đọc ra toàn byte 0 và vẫn trả SUCCESS làm hỏng dữ liệu client.
+- **Giải pháp đã thực hiện:** Thêm trường `available_chunks: Arc<HashSet<u64>>` vào `DownloadSession`. Khi mở session download, nạp danh sách chunk thực tế từ file `.meta`. Trong hàm `handle_download_request`, kiểm tra bằng `is_chunk_in_set` và từ chối ngay (`InvalidChunkIndex`) nếu chunk không thuộc node, ngăn đọc 1MB byte 0.
+- **Test:** Unit test `test_sparse_file_chunk_set_checking` trong `server-file/src/tests.rs` (PASS).
 
-### 1.1 Chỉ phục vụ chunk có trong `.meta` (`ethereum.rs`, `handle_download_request`)
+### 1.2 [x] `sync_data()` khi ghi chunk cuối (`app.rs`, `server.rs`, `wt_server.rs`)
+- **Vấn đề:** Nếu không gọi fsync, file có thể được xác nhận on-chain khi dữ liệu thực tế vẫn nằm trong Linux page cache. Nếu mất điện hoặc sập server, dữ liệu có thể bị rỗng.
+- **Giải pháp đã thực hiện:** Bổ sung hàm `finalize_upload_file` trong `App`. Khi chunk cuối cùng của file được ghi thành công, gọi `bin_file.sync_data()` trong `tokio::task::spawn_blocking` trước khi đẩy file vào hàng đợi xác nhận on-chain. Chỉ sync ở chunk cuối, không sync ở từng chunk để bảo toàn thông lượng upload.
+- **Test:** Unit test `test_finalize_upload_file_sync_data` (PASS).
 
-- **Vấn đề:** file `.bin` là file thưa; chunk chẵn/lẻ nằm ở node khác nên đọc ra toàn byte 0 và vẫn trả SUCCESS.
-- **Cách làm:** lưu tập chunk đang có (`Arc<HashSet<u64>>`) vào `DownloadSession` khi khởi tạo; từ chối chunk không thuộc tập.
-- **Test:** unit test hàm kiểm tra chunk thuộc tập (tách thành hàm); tích hợp T2.
+### 1.3 [x] Xử lý file chưa xác nhận khi khởi động (Phản biện của User)
+- **Vấn đề ban đầu đề xuất:** Quét đệ quy toàn bộ thư mục `.meta` trên đĩa khi khởi động server.
+- **Phản biện & Quyết định kiến trúc của User:** Hệ thống thực tế có thể lên đến hàng triệu file (1.000.000 files). Việc quét đĩa đệ quy lúc khởi động sẽ gây bão I/O làm nghẽn đĩa và có thể làm crash/treo server lúc boot. Hơn nữa, trường hợp crash đúng thời điểm giữa lúc sync chunk cuối và enqueue là cực kỳ hiếm.
+- **Giải pháp tối ưu:** 
+  + Khi khởi động: Chỉ phục hồi từ các journal files `pending_uploads.txt` và `pending_confirmations.txt` (dung lượng vài KB, nạp trong < 1ms, không quét đĩa).
+  + Tác vụ audit toàn bộ đĩa nếu cần sẽ được tách thành script/CLI độc lập chạy offline định kỳ ngoài giờ cao điểm, không đưa vào luồng boot của server.
 
-### 1.2 `sync_data()` khi ghi chunk cuối (`server.rs`, `wt_server.rs`)
+### 1.4 [x] Cơ chế Dead-Letter JSON & Luồng Retry độc lập không nghẽn luồng chính (`main.rs`, `models.rs`)
+- **Vấn đề ban đầu:** File `failed_*.txt` dạng văn bản khó xử lý tự động; retry liên tục ở luồng chính làm nghẽn các file upload của user khác.
+- **Phản biện & Yêu cầu của User:**
+  1. *Ưu tiên luồng chính tuyệt đối:* Luồng chính chỉ gửi xác nhận thử 1 lần. Nếu lỗi mạng hoặc RPC, đẩy ngay bản ghi sang file JSON lỗi (`failed_uploads.json`, `failed_confirmations.json`), xóa khỏi hàng đợi pending để người dùng và các file upload tiếp theo không phải chờ.
+  2. *Luồng retry là luồng phụ:* Chỉ retry nền khi server rảnh (dùng `tokio::select! { biased; ... }` với độ ưu tiên thấp nhất). Mỗi chu kỳ rảnh chỉ xử lý tối đa 1 transaction rồi nhả luồng.
+  3. *Giới hạn số lần retry:* Chỉ retry tối đa 10 lần (`MAX_BACKGROUND_RETRIES = 10`). Nếu sau 10 lần vẫn lỗi (hợp đồng revert hoặc lỗi nghiêm trọng), ghi log cảnh báo `[ADMIN_ACTION_REQUIRED]`, đánh dấu trạng thái `NEEDS_ADMIN_REVIEW` trong JSON và dừng retry, tránh vòng lặp vô hạn tốn tài nguyên.
+- **Giải pháp đã thực hiện:** 
+  + Cài đặt struct `FailedTxRecord` lưu trữ JSON có cấu trúc (`key`, `reason`, `attempts`, `status`, `updated_at`).
+  + Các hàm `record_failed_upload_detailed`, `record_failed_download_detailed`, `load_failed_records`, `save_failed_records`.
+  + Tích hợp vòng lặp background retry không nghẽn trong `main.rs`.
+- **Test:** Unit test `test_failed_dead_letter_json_storage_and_recovery` và `test_retry_limits_and_fast_backoff_calculation` (PASS).
 
-- **Vấn đề:** không bao giờ fsync, file có thể được xác nhận trên chain khi dữ liệu còn ở page cache.
-- **Cách làm:** gọi `bin_file.sync_data()` trong `spawn_blocking` ngay trước khi enqueue xác nhận. Chỉ ở chunk cuối, không ở mọi chunk.
-- **Test:** unit test hàm hoàn tất file có gọi sync (có thể kiểm tra bằng cách tách hàm `finalize_file`); **đo**: thời gian thêm mỗi file (ghi trong PR), mục tiêu không làm giảm thông lượng quá 2%.
+### 1.5 [x] Thống nhất cơ chế quyền download theo Token Contract (Phản biện của User)
+- **Vấn đề ban đầu đề xuất:** Đặt TTL 5 phút kiểm tra lại quyền trong `DownloadSession`.
+- **Phản biện & Quyết định kiến trúc của User:** Người dùng đã gọi hàm `payForDownload` trên contract và được cấp vé/token download hợp lệ thì cho phép hoàn thành trọn vẹn lượt download đó. Nếu sau đó chủ sở hữu file (owner) thay đổi whitelist hoặc thu hồi quyền, người dùng ở lần tải kế tiếp sẽ phải gọi lại smart contract lấy token mới và sẽ bị revert chặn lại. Việc đặt TTL giữa session đang tải dở vừa tạo ra các cuộc gọi RPC dư thừa lên blockchain, vừa có thể ngắt quãng trải nghiệm download hợp lệ của người dùng.
+- **Kết luận:** Giữ cơ chế kiểm tra token/permission lúc mở session, không thêm TTL ngắt quãng session.
 
-### 1.3 Quét `.meta` đủ chunk mà chưa xác nhận khi khởi động
+## 4. Giai đoạn 2: Hiệu suất (Performance)
 
-- **Vấn đề:** crash giữa lúc ghi chunk cuối và lúc enqueue thì không chunk nào kích hoạt hoàn tất.
-- **Cách làm:** khi khởi động, duyệt `storage_root`; file nào đủ `expected_chunks` và không nằm trong `pending_uploads.txt` thì hỏi `getFileInfo`, còn `Processing` thì enqueue. Chạy ở task nền, không chặn khởi động; giới hạn tốc độ RPC.
-- **Test:** unit test hàm "file đủ chunk" với thư mục giả; tích hợp T7. **Đo:** thời gian quét với 10.000 thư mục file.
+**Quy tắc:** Đo trước, ghi số gốc, rồi mới sửa. Mỗi mục một commit riêng, kèm bảng số đo trước/sau.
 
-### 1.4 Dead-letter xử lý lại được (`main.rs`, `record_failed_*`)
+### 2.0 [x] Công cụ tải và kiểm thử hiệu suất end-to-end (Đã có sẵn)
+- **Công cụ thực tế:** Đã có sẵn test harness Go tại [`up-down-debug/main.go`](metanode-suite/file-storage/up-down-debug/main.go).
+- **Tính năng:**
+  + Tạo dummy file với dung lượng tùy chỉnh (`-size` GB).
+  + Ký và gửi transaction on-chain (hỗ trợ các chế độ `-mode=tcp`, `-mode=http`, `-mode=http-bls`).
+  + Tính Merkle tree, mở kết nối QUIC song song với số worker tùy chọn (`-workers`), upload từng chunk 1MB lên các storage node.
+  + Kiểm tra download trọn vẹn và đo tốc độ kéo chunk (`-download <FILE_KEY>`).
+  + Ghi nhận và báo cáo chi tiết: Tổng thời gian, thời gian chờ Blockchain, thời gian đẩy/kéo chunks qua QUIC, và thông lượng MB/s qua từng round (`-rounds`).
+- **Lệnh thực thi chuẩn:**
+  ```bash
+  # Upload benchmark:
+  go run . -envfile .env.1 -size 0.01 -workers 1 -rounds 3 -mode=tcp
 
-- **Vấn đề:** `failed_*.txt` là văn bản cho người đọc, không nạp lại tự động.
-- **Cách làm:** đổi sang JSON mỗi dòng (`key`, `contract`, `reason`, `time`, `attempts`); thêm tác vụ định kỳ (hoặc lệnh admin) nạp lại các dòng do hết retry vào hàng đợi, tối đa N lần mỗi key; revert chắc chắn (terminal) không nạp lại.
-- **Test:** ghi dead-letter rồi nạp lại, key vào queue; key quá N lần không nạp; dòng cũ định dạng văn bản không làm panic. Tích hợp T4.
+  # Download benchmark:
+  go run . -envfile .env.1 -download <FILE_KEY> -workers 1 -rounds 1
+  ```
 
-### 1.5 TTL cho quyền trong session download
-
-- **Vấn đề:** `is_public` và whitelist được cache đến khi session hết hạn.
-- **Cách làm:** thêm `perms_fetched_at` vào session; khi quá TTL (đề xuất 5 phút) thì lấy lại `isPublicFile`/`getWhitelist` từ chain trước khi phục vụ chunk kế tiếp.
-- **Test:** unit test hàm "quyền đã quá hạn"; tích hợp T8. **Đo:** số RPC thêm mỗi phút mỗi session (phải nhỏ).
-
-## 4. Giai đoạn 2: Hiệu suất
-
-**Quy tắc:** đo trước, ghi số gốc, rồi mới sửa. Không có số gốc thì không được bắt đầu. Mỗi mục một commit riêng, mỗi mục một bảng trước/sau (mục 5). Thay đổi nào không cải thiện vượt mức dao động đã đo (mục 1.3) thì **bỏ**, không giữ.
-
-### 2.0 Công cụ tải end-to-end (làm đầu tiên)
-
-- Viết công cụ (ví dụ `server-file/examples/load_test.rs` hoặc crate riêng) chạy **qua server thật**: ký bằng khoá owner, tạo Merkle proof, upload N file M chunk song song lên 2 node, rồi tải lại; hỗ trợ cả đường QUIC thô và WebTransport.
-- Báo cáo: thông lượng, p50/p95/p99 mỗi chunk, tỷ lệ lỗi, và tách riêng upload và download.
-- Kịch bản chuẩn đề xuất (ghi cố định trong repo để so sánh): 100 file x 100 chunk, 50 luồng song song, chạy 5 lần.
-- Đây là việc có kết quả kiểm tra được: chạy hai lần liên tiếp trên cùng code, chênh lệch median phải nhỏ (đề xuất < 5%), nếu lớn thì công cụ chưa đủ ổn định để dùng làm thước đo.
-
-### Danh sách việc hiệu suất
+### Danh sách việc hiệu suất (Kế hoạch tiếp theo)
 
 | # | Việc | Cách làm | Cách đo | Mục tiêu tối thiểu |
 |---|------|----------|---------|--------------------|

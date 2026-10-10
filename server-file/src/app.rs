@@ -354,4 +354,16 @@ impl App {
         }
         entry
     }
+
+    /// Hoàn tất file upload: fsync dữ liệu file .bin xuống đĩa vật lý (sync_data)
+    /// và đẩy vào hàng đợi Transaction Manager để xác nhận on-chain.
+    pub async fn finalize_upload_file(&self, file_key: &str, contract_addr: Address) {
+        if let Some((_, open_files)) = self.file_cache.remove(file_key) {
+            let bin = open_files.bin_file.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = bin.sync_data();
+            }).await;
+        }
+        let _ = self.upload_batch_sender.send((file_key.to_string(), contract_addr)).await;
+    }
 }

@@ -60,9 +60,23 @@ pub struct DownloadSession {
     pub whitelist: HashSet<Address>,
     pub last_access: Arc<std::sync::atomic::AtomicU64>, // Thời điểm client tải chunk gần nhất (unix timestamp secs)
     pub file_handle: Arc<std::fs::File>,
+    pub available_chunks: Arc<HashSet<u64>>, // Tập các chunk thực tế lưu trữ trên node này (từ .meta)
 }
 // DashMap: downloadKey -> DownloadSession
 pub type DownloadSessionCache = Arc<DashMap<String, DownloadSession>>;
+
+/// Bản ghi dead-letter transaction thất bại (JSON) để retry độc lập ở luồng nền
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FailedTxRecord {
+    pub key: String,
+    pub contract_address: String,
+    pub attempts: u32,
+    pub max_attempts: u32,
+    pub reason: String,
+    pub status: String, // "PENDING_BACKGROUND_RETRY" | "NEEDS_ADMIN_REVIEW" | "TERMINAL_ERROR"
+    pub first_failed_at: String,
+    pub last_attempt_at: String,
+}
 
 // Upload verification cache: stores both verified address and merkle root
 #[derive(Debug, Clone)]

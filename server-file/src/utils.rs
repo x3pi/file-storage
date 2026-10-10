@@ -24,6 +24,21 @@ pub fn retry_delay_secs(attempt: u32) -> u64 {
     (15u64 * (1u64 << (attempt - 1).min(3))).min(120)
 }
 
+/// Thời gian chờ nhanh cho luồng chính (giây) để thử lại tối đa 3 lần trước khi nhường queue:
+/// Lần 1: 2s, Lần 2: 4s, Lần 3: 8s
+#[inline]
+pub fn main_retry_delay_secs(attempt: u32) -> u64 {
+    let attempt = attempt.max(1);
+    (2u64 * (1u64 << (attempt - 1).min(2))).min(8)
+}
+
+/// Kiểm tra một chunk index có nằm trong tập hợp các chunk thực tế mà node đang lưu trữ hay không.
+/// Ngăn chặn việc đọc sparse file trả về toàn bộ 1MB byte 0 cho các chunk của node khác.
+#[inline]
+pub fn is_chunk_in_set(available_chunks: &std::collections::HashSet<u64>, chunk_index: u64) -> bool {
+    available_chunks.contains(&chunk_index)
+}
+
 /// Tính độ sâu của Merkle Tree từ tổng số chunk bằng phép toán bitwise chính xác,
 /// không sử dụng số thực (f64) để tránh sai số làm tròn khi chunk lớn.
 #[inline]

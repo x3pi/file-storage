@@ -341,10 +341,9 @@ async fn handle_upload_chunk(
 
                         if is_completed {
                             if let Some((_, _)) = app.chunk_tracker.remove(&payload.file_key) {
-                                app.file_cache.remove(&payload.file_key); // Đóng ngay file descriptor để tránh rò rỉ FD
-                                log::info!("[WT][{}] 🎯 File {} fully received for this node ({} / {} total chunks). Queueing for confirm.", peer_ip, payload.file_key, expected_chunks, total_chunks);
+                                log::info!("[WT][{}] 🎯 File {} fully received for this node ({} / {} total chunks). Syncing data to disk & queueing for confirm.", peer_ip, payload.file_key, expected_chunks, total_chunks);
                                 log::info!("Extracted contract_addr from cache: {}", contract_addr);
-                                let _ = app.upload_batch_sender.send((payload.file_key.clone(), contract_addr)).await;
+                                app.finalize_upload_file(&payload.file_key, contract_addr).await;
                             }
                         }
                     }
