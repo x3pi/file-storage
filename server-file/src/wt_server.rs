@@ -317,8 +317,6 @@ async fn handle_upload_chunk(
 
             match write_result {
                 Ok(_) => {
-                    let _ = send_chunk_frame(&mut send, &req.id, resp_command, payload.chunk_index, &[]).await;
-                    
                     // --- THÊM LOGIC TRACKING CHUNKS GIỐNG NHƯ RAW QUIC ---
                     let (total_chunks, contract_addr) = if let Some(cache_entry) = app.upload_file_cache.get(&payload.file_key) {
                         (cache_entry.total_chunks, cache_entry.contract_address)
@@ -326,12 +324,14 @@ async fn handle_upload_chunk(
                         (0, alloy::primitives::Address::ZERO)
                     };
 
+                    let mut finalize_failed = false;
                     if total_chunks > 0 {
                         // SVR-4: Xử lý Edge Case chẵn/lẻ bằng hàm dùng chung trong utils
                         let expected_chunks = crate::utils::expected_chunks(total_chunks, payload.chunk_index);
 
                         if expected_chunks == 0 {
                             log::warn!("[WT][{}] ⚠️ Unexpected chunk {} for total_chunks {}", peer_ip, payload.chunk_index, total_chunks);
+                            let _ = send_error_frame(&mut send, &req.id, resp_command, "Unexpected chunk index").await;
                             return;
                         }
 
@@ -347,9 +347,15 @@ async fn handle_upload_chunk(
                                 log::info!("Extracted contract_addr from cache: {}", contract_addr);
                                 if let Err(e) = app.finalize_upload_file(&payload.file_key, contract_addr).await {
                                     log::error!("[WT][{}] ❌ finalize_upload_file failed: {}", peer_ip, e);
+                                    finalize_failed = true;
+                                    let _ = send_error_frame(&mut send, &req.id, resp_command, &format!("Finalize upload failed: {}", e)).await;
                                 }
                             }
                         }
+                    }
+
+                    if !finalize_failed {
+                        let _ = send_chunk_frame(&mut send, &req.id, resp_command, payload.chunk_index, &[]).await;
                     }
                     // ----------------------------------------------------
                 }

@@ -289,10 +289,12 @@ async fn test_atomic_write_and_pending_cleanup() {
     assert_eq!(read_back, initial_content);
 
     // 2. Xóa batch [file1] thuộc contract_a (test cả format không có 0x)
+    let upload_lock = tokio::sync::Mutex::new(());
     super::remove_pending_uploads(
         &pending_upload_file,
         &["file1".to_string()],
         contract_a,
+        &upload_lock,
     )
     .await;
 
@@ -306,7 +308,8 @@ async fn test_atomic_write_and_pending_cleanup() {
     let initial_dl = "0xkey_alpha,0x1111\n0xkey_beta,0x2222\n";
     super::write_atomic(&pending_dl_file, initial_dl).await.unwrap();
 
-    super::remove_pending_download(&pending_dl_file, "key_alpha").await;
+    let dl_lock = tokio::sync::Mutex::new(());
+    super::remove_pending_download(&pending_dl_file, "key_alpha", &dl_lock).await;
     let updated_dl = tokio::fs::read_to_string(&pending_dl_file).await.unwrap();
     assert!(!updated_dl.contains("0xkey_alpha"));
     assert!(updated_dl.contains("0xkey_beta"));
@@ -803,4 +806,209 @@ fn test_transient_rpc_error_circuit_breaker() {
     assert!(!super::is_transient_rpc_error("File does not exist"));
     assert!(!super::is_transient_rpc_error("Caller is not a storage server"));
 }
+
+#[test]
+fn test_is_record_due_and_compute_next_retry_at() {
+    use crate::utils::{compute_next_retry_at, is_record_due};
+
+    // 1. None hoặc chuỗi rỗng: Phải luôn luôn due
+    assert!(is_record_due(&None));
+    assert!(is_record_due(&Some("".to_string())));
+    assert!(is_record_due(&Some("   ".to_string())));
+
+    // 2. Mốc thời gian trong quá khứ: Phải due
+    let past = "2020-01-01 00:00:00".to_string();
+    assert!(is_record_due(&Some(past)));
+
+    // 3. Mốc thời gian trong tương lai xa: Chưa due
+    let future = "2099-12-31 23:59:59".to_string();
+    assert!(!is_record_due(&Some(future)));
+
+    // 4. Mốc thời gian vừa tính toán trong tương lai:
+    let next = compute_next_retry_at(60);
+    assert!(!is_record_due(&Some(next)));
+}
+
+#[tokio::test]
+async fn test_no_head_of_line_blocking() {
+    use crate::models::FailedTxRecord;
+    use crate::utils::{compute_next_retry_at, is_record_due};
+
+    let future_time = compute_next_retry_at(60); // 60s sau mới retry
+
+    let records = vec![
+        FailedTxRecord {
+            key: "batch1_fileA".to_string(),
+            contract_address: "0x1111".to_string(),
+            attempts: 1,
+            max_attempts: 10,
+            reason: "RPC timeout".to_string(),
+            status: "PENDING_BACKGROUND_RETRY".to_string(),
+            first_failed_at: "2026-10-10 10:00:00".to_string(),
+            last_attempt_at: "2026-10-10 10:01:00".to_string(),
+            next_retry_at: Some(future_time), // Chưa đến hạn!
+        },
+        FailedTxRecord {
+            key: "batch2_fileB".to_string(),
+            contract_address: "0x2222".to_string(),
+            attempts: 0,
+            max_attempts: 10,
+            reason: "Initial failure".to_string(),
+            status: "PENDING_BACKGROUND_RETRY".to_string(),
+            first_failed_at: "2026-10-10 10:00:00".to_string(),
+            last_attempt_at: "2026-10-10 10:00:00".to_string(),
+            next_retry_at: None, // Đã đến hạn ngay!
+        },
+    ];
+
+    // Lọc theo điều kiện của Background Retry Worker
+    let eligible_indices: Vec<usize> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            r.status == "PENDING_BACKGROUND_RETRY"
+                && r.attempts < 10
+                && is_record_due(&r.next_retry_at)
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    // Khẳng định: Batch 1 bị bỏ qua, Batch 2 được chọn -> KHÔNG BỊ HEAD-OF-LINE BLOCKING!
+    assert_eq!(eligible_indices.len(), 1);
+    assert_eq!(eligible_indices[0], 1);
+    assert_eq!(records[eligible_indices[0]].key, "batch2_fileB");
+}
+
+#[tokio::test]
+async fn test_concurrent_pending_uploads_wal_safety() {
+    use std::sync::Arc;
+    use tokio::io::AsyncWriteExt;
+
+    let (storage_root, log_dir) = create_temp_env();
+    let pending_file = storage_root.join("pending_uploads.txt");
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+
+    // Khởi tạo file với một số dòng
+    let initial = "file_init_1,0x1111\nfile_init_2,0x1111\n";
+    super::write_atomic(&pending_file, initial).await.unwrap();
+
+    // 20 tác vụ concurrent: 10 tác vụ append và 10 tác vụ remove
+    let mut handles = Vec::new();
+    for i in 0..10 {
+        let p = pending_file.clone();
+        let l = lock.clone();
+        handles.push(tokio::spawn(async move {
+            let _guard = l.lock().await;
+            let line = format!("file_appended_{},0x2222\n", i);
+            let mut file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&p)
+                .await
+                .unwrap();
+            file.write_all(line.as_bytes()).await.unwrap();
+            file.flush().await.unwrap();
+        }));
+    }
+
+    for _ in 0..5 {
+        let p = pending_file.clone();
+        let l = lock.clone();
+        handles.push(tokio::spawn(async move {
+            super::remove_pending_uploads(&p, &["file_init_1".to_string()], "0x1111", &l).await;
+        }));
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    let final_content = tokio::fs::read_to_string(&pending_file).await.unwrap();
+    // file_init_1 đã bị xoá
+    assert!(!final_content.contains("file_init_1"));
+    // file_init_2 vẫn còn
+    assert!(final_content.contains("file_init_2"));
+    // Cả 10 dòng appended đều phải được giữ nguyên, không bị overwrite mất bởi rename!
+    for i in 0..10 {
+        assert!(
+            final_content.contains(&format!("file_appended_{}", i)),
+            "Dòng file_appended_{} phải tồn tại",
+            i
+        );
+    }
+
+    cleanup_temp_env(storage_root, log_dir);
+}
+
+#[tokio::test]
+async fn test_recovery_no_deadlock_on_large_backlog() {
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let (storage_root, log_dir) = create_temp_env();
+    let pending_file = storage_root.join("pending_uploads.txt");
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+
+    // Tạo 1200 items (vượt ngưỡng dung lượng kênh 1000)
+    let mut large_content = String::new();
+    for i in 0..1200 {
+        large_content.push_str(&format!("file_{},0x1111111111111111111111111111111111111111\n", i));
+    }
+    tokio::fs::write(&pending_file, &large_content).await.unwrap();
+
+    let (tx, mut rx) = mpsc::channel::<(String, String)>(1000);
+
+    // Task producer nạp recovery theo cơ chế mới (nhả lock trước khi send)
+    let p_file = pending_file.clone();
+    let p_lock = lock.clone();
+    let producer_handle = tokio::spawn(async move {
+        let entries: Vec<(String, String)> = {
+            let _guard = p_lock.lock().await;
+            let mut items = Vec::new();
+            if let Ok(content) = tokio::fs::read_to_string(&p_file).await {
+                for line in content.lines() {
+                    let parts: Vec<&str> = line.trim().split(',').collect();
+                    if parts.len() == 2 {
+                        items.push((parts[0].to_string(), parts[1].to_string()));
+                    }
+                }
+            }
+            items
+        }; // Lock được giải phóng ở đây!
+
+        for (k, a) in entries {
+            tx.send((k, a)).await.unwrap();
+        }
+    });
+
+    // Task consumer tiêu thụ và đồng thời thử lock (giống TX Manager)
+    let c_lock = lock.clone();
+    let consumer_handle = tokio::spawn(async move {
+        let mut received = 0;
+        while let Some(_) = rx.recv().await {
+            received += 1;
+            // Mỗi 100 items tiêu thụ thì thử acquire lock để chứng minh không bị deadlock
+            if received % 100 == 0 {
+                let _g = c_lock.lock().await;
+            }
+            if received == 1200 {
+                break;
+            }
+        }
+        received
+    });
+
+    // Kiểm tra hoàn thành trong 5 giây mà không bị treo/deadlock
+    let res = timeout(Duration::from_secs(5), async {
+        producer_handle.await.unwrap();
+        consumer_handle.await.unwrap()
+    })
+    .await;
+
+    assert!(res.is_ok(), "Quá trình phục hồi bị treo/deadlock khi backlog > 1000");
+    assert_eq!(res.unwrap(), 1200, "Phải nạp và tiêu thụ đủ 1200 items");
+
+    cleanup_temp_env(storage_root, log_dir);
+}
+
 

@@ -53,12 +53,18 @@ pub fn merkle_tree_depth(total_chunks: u64) -> usize {
 /// Ghi file an toàn (Atomic Write) qua file tạm và POSIX rename,
 /// tránh nguy cơ file bị rỗng (0-byte) khi sập nguồn hoặc crash đột ngột.
 pub async fn write_atomic(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let tmp_path = path.with_extension(format!("tmp.{}.{}", std::process::id(), nonce));
-    tokio::fs::write(&tmp_path, content).await?;
+    {
+        let mut file = tokio::fs::File::create(&tmp_path).await?;
+        file.write_all(content.as_bytes()).await?;
+        file.flush().await?;
+        file.sync_data().await?;
+    }
     tokio::fs::rename(&tmp_path, path).await?;
     Ok(())
 }
@@ -79,4 +85,27 @@ pub async fn cleanup_stale_tmp_files(dir: &std::path::Path) -> usize {
         }
     }
     removed
+}
+
+/// Kiểm tra xem một bản ghi lỗi đã đến hạn retry (next_retry_at <= now hoặc None) hay chưa.
+#[inline]
+pub fn is_record_due(next_retry_at: &Option<String>) -> bool {
+    match next_retry_at {
+        None => true,
+        Some(s) if s.trim().is_empty() => true,
+        Some(s) => {
+            if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M:%S") {
+                chrono::Local::now().naive_local() >= parsed
+            } else {
+                true
+            }
+        }
+    }
+}
+
+/// Tính thời điểm tiếp theo retry giao dịch theo định dạng "%Y-%m-%d %H:%M:%S"
+#[inline]
+pub fn compute_next_retry_at(delay_secs: u64) -> String {
+    let next = chrono::Local::now() + chrono::Duration::seconds(delay_secs as i64);
+    next.format("%Y-%m-%d %H:%M:%S").to_string()
 }

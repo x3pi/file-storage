@@ -176,81 +176,99 @@ async fn main() {
         let failed_dl_json = app_clone.storage_root.join("failed_confirmations.json");
 
         // --- 1. STARTUP RECOVERY (Khôi phục các upload/download chưa hoàn thành từ đĩa) ---
-        // Chạy trong task riêng biệt (tokio::spawn) để KHÔNG block task chính, tránh deadlock khi pending > 1000 items!
+        // 1.1 Khôi phục các bản ghi NEEDS_ADMIN_REVIEW thành PENDING_BACKGROUND_RETRY tuần tự trước khi vào loop, tránh race condition
+        let mut boot_upload_records = load_failed_records(&failed_upload_json).await;
+        let mut reset_uploads = 0;
+        for r in &mut boot_upload_records {
+            if r.status == "NEEDS_ADMIN_REVIEW" {
+                r.status = "PENDING_BACKGROUND_RETRY".to_string();
+                r.attempts = 0;
+                r.next_retry_at = None;
+                reset_uploads += 1;
+            }
+        }
+        if reset_uploads > 0 {
+            let _ = save_failed_records(&failed_upload_json, &boot_upload_records).await;
+            log::info!("♻️ [TX Manager Recovery] Khôi phục {} upload records NEEDS_ADMIN_REVIEW sang PENDING_BACKGROUND_RETRY.", reset_uploads);
+        }
+
+        let mut boot_dl_records = load_failed_records(&failed_dl_json).await;
+        let mut reset_dls = 0;
+        for r in &mut boot_dl_records {
+            if r.status == "NEEDS_ADMIN_REVIEW" {
+                r.status = "PENDING_BACKGROUND_RETRY".to_string();
+                r.attempts = 0;
+                r.next_retry_at = None;
+                reset_dls += 1;
+            }
+        }
+        if reset_dls > 0 {
+            let _ = save_failed_records(&failed_dl_json, &boot_dl_records).await;
+            log::info!("♻️ [TX Manager Recovery] Khôi phục {} download records NEEDS_ADMIN_REVIEW sang PENDING_BACKGROUND_RETRY.", reset_dls);
+        }
+
+        // 1.2 Nạp các pending tx từ đĩa vào kênh channel (đọc xong nhả Lock ngay rồi mới send, loại bỏ 100% deadlock khi pending > 1000)
         let app_recovery = app_clone.clone();
         let pending_upload_recovery = pending_upload_path.clone();
         let pending_dl_recovery = pending_dl_path.clone();
-        let failed_upload_json_boot = failed_upload_json.clone();
-        let failed_dl_json_boot = failed_dl_json.clone();
         tokio::spawn(async move {
-            if tokio::fs::try_exists(&pending_upload_recovery).await.unwrap_or(false) {
+            let pending_uploads: Vec<(String, alloy::primitives::Address)> = if tokio::fs::try_exists(&pending_upload_recovery).await.unwrap_or(false) {
+                let _guard = app_recovery.pending_uploads_lock.lock().await;
+                let mut items = Vec::new();
                 if let Ok(content) = tokio::fs::read_to_string(&pending_upload_recovery).await {
-                    let mut count = 0;
                     for line in content.lines() {
                         let parts: Vec<&str> = line.trim().split(',').collect();
                         if parts.len() == 2 {
                             let key = parts[0].trim().to_string();
                             if let Ok(addr) = parts[1].trim().parse::<alloy::primitives::Address>() {
                                 if !key.is_empty() {
-                                    let _ = app_recovery.upload_batch_sender.send((key, addr)).await;
-                                    count += 1;
+                                    items.push((key, addr));
                                 }
                             }
                         }
                     }
-                    if count > 0 {
-                        log::info!("♻️ [TX Manager Recovery] Khôi phục {} uploads chưa confirm từ đĩa vào hàng đợi.", count);
-                    }
                 }
+                items
+            } else {
+                Vec::new()
+            }; // _guard nhả ngay lập tức tại đây, không giữ lock khi send!
+
+            let mut count = 0;
+            for (key, addr) in pending_uploads {
+                let _ = app_recovery.upload_batch_sender.send((key, addr)).await;
+                count += 1;
+            }
+            if count > 0 {
+                log::info!("♻️ [TX Manager Recovery] Khôi phục {} uploads chưa confirm từ đĩa vào hàng đợi.", count);
             }
 
-            if tokio::fs::try_exists(&pending_dl_recovery).await.unwrap_or(false) {
+            let pending_dls: Vec<(String, String)> = if tokio::fs::try_exists(&pending_dl_recovery).await.unwrap_or(false) {
+                let _guard = app_recovery.pending_confirmations_lock.lock().await;
+                let mut items = Vec::new();
                 if let Ok(content) = tokio::fs::read_to_string(&pending_dl_recovery).await {
-                    let mut count = 0;
                     for line in content.lines() {
                         let parts: Vec<&str> = line.trim().split(',').collect();
                         if parts.len() == 2 {
                             let key = parts[0].trim().to_string();
                             let addr = parts[1].trim().to_string();
                             if !key.is_empty() && !addr.is_empty() {
-                                let _ = app_recovery.confirmation_sender.send((key, addr)).await;
-                                count += 1;
+                                items.push((key, addr));
                             }
                         }
                     }
-                    if count > 0 {
-                        log::info!("♻️ [TX Manager Recovery] Khôi phục {} download confirms chưa hoàn thành từ đĩa.", count);
-                    }
                 }
-            }
+                items
+            } else {
+                Vec::new()
+            }; // _guard nhả ngay lập tức tại đây!
 
-            // Khôi phục các bản ghi NEEDS_ADMIN_REVIEW thành PENDING_BACKGROUND_RETRY khi server khởi động lại
-            let mut boot_upload_records = load_failed_records(&failed_upload_json_boot).await;
-            let mut reset_uploads = 0;
-            for r in &mut boot_upload_records {
-                if r.status == "NEEDS_ADMIN_REVIEW" {
-                    r.status = "PENDING_BACKGROUND_RETRY".to_string();
-                    r.attempts = 0;
-                    reset_uploads += 1;
-                }
+            let mut dl_count = 0;
+            for (key, addr) in pending_dls {
+                let _ = app_recovery.confirmation_sender.send((key, addr)).await;
+                dl_count += 1;
             }
-            if reset_uploads > 0 {
-                let _ = save_failed_records(&failed_upload_json_boot, &boot_upload_records).await;
-                log::info!("♻️ [TX Manager Recovery] Khôi phục {} upload records NEEDS_ADMIN_REVIEW sang PENDING_BACKGROUND_RETRY.", reset_uploads);
-            }
-
-            let mut boot_dl_records = load_failed_records(&failed_dl_json_boot).await;
-            let mut reset_dls = 0;
-            for r in &mut boot_dl_records {
-                if r.status == "NEEDS_ADMIN_REVIEW" {
-                    r.status = "PENDING_BACKGROUND_RETRY".to_string();
-                    r.attempts = 0;
-                    reset_dls += 1;
-                }
-            }
-            if reset_dls > 0 {
-                let _ = save_failed_records(&failed_dl_json_boot, &boot_dl_records).await;
-                log::info!("♻️ [TX Manager Recovery] Khôi phục {} download records NEEDS_ADMIN_REVIEW sang PENDING_BACKGROUND_RETRY.", reset_dls);
+            if dl_count > 0 {
+                log::info!("♻️ [TX Manager Recovery] Khôi phục {} download confirms chưa hoàn thành từ đĩa.", dl_count);
             }
         });
 
@@ -259,9 +277,7 @@ async fn main() {
 
         loop {
             tokio::select! {
-                biased;
-
-                // 1. ƯU TIÊN CAO NHẤT: Upload từ user (xử lý ngay lập tức và gom tất cả những file đang chờ)
+                // Tuyệt đối không dùng biased; để Tokio luân phiên công bằng giữa upload và download, chống starvation
                 Some((file_key, contract_addr)) = upload_receiver.recv() => {
                     use std::collections::HashMap;
                     let mut batches: HashMap<alloy::primitives::Address, Vec<String>> = HashMap::new();
@@ -276,47 +292,20 @@ async fn main() {
                         if batch.len() >= 50 { break; } // Giới hạn mảng tối đa 50 mỗi contract
                     }
 
-                    // --- PERSIST TO DISK (SINGLE WRITER) ---
-                    // Chỉ có duy nhất TX Manager ghi vào pending_uploads.txt nên không có race condition
-                    {
-                        use tokio::io::AsyncWriteExt;
-                        let mut existing_keys = std::collections::HashSet::new();
-                        if let Ok(content) = tokio::fs::read_to_string(&pending_upload_path).await {
-                            for line in content.lines() {
-                                let parts: Vec<&str> = line.trim().split(',').collect();
-                                if !parts.is_empty() {
-                                    existing_keys.insert(parts[0].trim().to_string());
-                                }
-                            }
-                        }
-                        let mut to_append = String::new();
-                        for (addr, keys) in &batches {
-                            for key in keys {
-                                if !existing_keys.contains(key) {
-                                    to_append.push_str(&format!("{},{}\n", key, addr));
-                                    existing_keys.insert(key.clone());
-                                }
-                            }
-                        }
-                        if !to_append.is_empty() {
-                            if let Ok(mut file) = tokio::fs::OpenOptions::new().create(true).append(true).open(&pending_upload_path).await {
-                                let _ = file.write_all(to_append.as_bytes()).await;
-                            }
-                        }
-                    }
-                    
+                    // File đã được ghi vào pending_uploads.txt từ finalize_upload_file trước khi vào channel,
+                    // do đó không cần acquire lock đọc lại đĩa ở đây, loại bỏ 100% lock contention trên hot path!
                     for (addr, current_batch) in batches {
                         log::info!("🚀 [TX Manager] Priority Upload Confirm ({} files) for contract {}", current_batch.len(), addr);
                         match crate::ethereum::confirm_upload_batch(app_clone.clone(), addr, current_batch.clone()).await {
                             Ok(()) => {
                                 // CHỈ XOÁ KHỎI ĐĨA KHI TX THÀNH CÔNG TRÊN CHAIN
-                                remove_pending_uploads(&pending_upload_path, &current_batch, &addr.to_string()).await;
+                                remove_pending_uploads(&pending_upload_path, &current_batch, &addr.to_string(), &app_clone.pending_uploads_lock).await;
                             }
                             Err(e) => {
                                 let err_str = e.to_string();
                                 if is_already_confirmed(&err_str) {
                                     log::info!("✅ [TX Manager] Batch {} file(s) đã được confirm on-chain trước đó. Xóa khỏi pending.", current_batch.len());
-                                    remove_pending_uploads(&pending_upload_path, &current_batch, &addr.to_string()).await;
+                                    remove_pending_uploads(&pending_upload_path, &current_batch, &addr.to_string(), &app_clone.pending_uploads_lock).await;
                                 } else if is_terminal_contract_revert(&err_str) {
                                     log::error!("❌ [TX Manager] confirm_upload_batch gặp lỗi contract không thể phục hồi: {}. Ghi vào failed_uploads.json và xóa khỏi pending.", err_str);
                                     record_failed_upload_batch(
@@ -328,7 +317,7 @@ async fn main() {
                                         "TERMINAL_ERROR",
                                     )
                                     .await;
-                                    remove_pending_uploads(&pending_upload_path, &current_batch, &addr.to_string()).await;
+                                    remove_pending_uploads(&pending_upload_path, &current_batch, &addr.to_string(), &app_clone.pending_uploads_lock).await;
                                 } else {
                                     // Mọi lỗi mạng / RPC tạm thời (timeout, connection reset, nonce, gas price,...):
                                     // Gửi 1 lần không được thì ĐẨY NGAY vào failed_uploads.json (attempts = 1) để luồng chính tiếp tục
@@ -347,19 +336,20 @@ async fn main() {
                                         "PENDING_BACKGROUND_RETRY",
                                     )
                                     .await;
-                                    remove_pending_uploads(&pending_upload_path, &current_batch, &addr.to_string()).await;
+                                    remove_pending_uploads(&pending_upload_path, &current_batch, &addr.to_string(), &app_clone.pending_uploads_lock).await;
                                 }
                             }
                         }
                     }
                 }
 
-                // 2. ƯU TIÊN THỨ HAI: Download confirmation từ user
+                // 2. Download confirmation từ user
                 Some((download_key, contract_addr)) = download_receiver.recv() => {
                     log::info!("⏳ [TX Manager] Processing Download Confirm: {}", download_key);
                     
-                    // Ghi nhận vào pending_confirmations.txt trước khi gửi tx nếu chưa có
+                    // Ghi nhận vào pending_confirmations.txt trước khi gửi tx nếu chưa có (có Lock bảo vệ)
                     {
+                        let _guard = app_clone.pending_confirmations_lock.lock().await;
                         use tokio::io::AsyncWriteExt;
                         let clean_dl_key = download_key.trim_start_matches("0x");
                         let mut exists = false;
@@ -373,6 +363,8 @@ async fn main() {
                             if let Ok(mut file) = tokio::fs::OpenOptions::new().create(true).append(true).open(&pending_dl_path).await {
                                 let line = format!("{},{}\n", download_key, contract_addr);
                                 let _ = file.write_all(line.as_bytes()).await;
+                                let _ = file.flush().await;
+                                let _ = file.sync_data().await;
                             }
                         }
                     }
@@ -380,17 +372,17 @@ async fn main() {
                     match crate::ethereum::handle_confirm_download(download_key.clone(), contract_addr.clone(), app_clone.clone()).await {
                         Ok(()) => {
                             // Thành công: Xoá khỏi pending_confirmations.txt
-                            remove_pending_download(&pending_dl_path, &download_key).await;
+                            remove_pending_download(&pending_dl_path, &download_key, &app_clone.pending_confirmations_lock).await;
                         }
                         Err(e) => {
                             let err_str = e.to_string();
                             if is_already_confirmed(&err_str) {
                                 log::info!("✅ [TX Manager] Download key {} đã được confirm on-chain trước đó. Xóa khỏi pending.", download_key);
-                                remove_pending_download(&pending_dl_path, &download_key).await;
+                                remove_pending_download(&pending_dl_path, &download_key, &app_clone.pending_confirmations_lock).await;
                             } else if is_terminal_contract_revert(&err_str) {
                                 log::error!("❌ [TX Manager] Download confirmation gặp lỗi contract không thể phục hồi: {}. Ghi vào failed_confirmations.json và xóa khỏi pending.", err_str);
                                 record_failed_download_detailed(&app_clone.storage_root, &download_key, &contract_addr, &err_str, 0, "TERMINAL_ERROR").await;
-                                remove_pending_download(&pending_dl_path, &download_key).await;
+                                remove_pending_download(&pending_dl_path, &download_key, &app_clone.pending_confirmations_lock).await;
                             } else {
                                 // Lỗi tạm thời: Đẩy ngay sang failed_confirmations.json (attempts = 1)
                                 log::warn!(
@@ -407,7 +399,7 @@ async fn main() {
                                     "PENDING_BACKGROUND_RETRY",
                                 )
                                 .await;
-                                remove_pending_download(&pending_dl_path, &download_key).await;
+                                remove_pending_download(&pending_dl_path, &download_key, &app_clone.pending_confirmations_lock).await;
                             }
                         }
                     }
@@ -415,21 +407,36 @@ async fn main() {
 
                 // 3. KHI SERVER RẢNH VÀ ĐẾN HẸN (Background Retry Worker):
                 _ = background_timer.tick() => {
-                    // Ưu tiên tuyệt đối luồng chính: nếu có request mới đang xếp hàng thì bỏ qua
+                    // Ưu tiên tuyệt đối luồng chính: nếu có request mới đang xếp hàng thì nhường ngay
                     if app_clone.upload_batch_sender.capacity() < 1000 || app_clone.confirmation_sender.capacity() < 1000 {
                         continue;
                     }
 
-                    // 3.1. Thử lại tối đa 1 batch upload từ failed_uploads.json
+                    // 3.1. Thử lại tối đa 3 batch upload từ failed_uploads.json (nếu còn rảnh)
                     let mut upload_records = load_failed_records(&failed_upload_json).await;
-                    let pending_upload_indices: Vec<usize> = upload_records
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, r)| r.status == "PENDING_BACKGROUND_RETRY" && r.attempts < MAX_BACKGROUND_RETRIES)
-                        .map(|(i, _)| i)
-                        .collect();
+                    let mut upload_modified = false;
+                    let mut batches_tried = 0;
 
-                    if !pending_upload_indices.is_empty() {
+                    loop {
+                        if batches_tried >= 3 || app_clone.upload_batch_sender.capacity() < 1000 || app_clone.confirmation_sender.capacity() < 1000 {
+                            break;
+                        }
+
+                        let pending_upload_indices: Vec<usize> = upload_records
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, r)| {
+                                r.status == "PENDING_BACKGROUND_RETRY" 
+                                    && r.attempts < MAX_BACKGROUND_RETRIES
+                                    && crate::utils::is_record_due(&r.next_retry_at)
+                            })
+                            .map(|(i, _)| i)
+                            .collect();
+
+                        if pending_upload_indices.is_empty() {
+                            break;
+                        }
+
                         let first_idx = pending_upload_indices[0];
                         let target_contract = upload_records[first_idx].contract_address.clone();
                         let mut batch_indices = Vec::new();
@@ -454,6 +461,7 @@ async fn main() {
                                 }
                                 Err(e) => {
                                     let err_str = e.to_string();
+                                    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
                                     if is_already_confirmed(&err_str) {
                                         log::info!("✅ [TX Manager Background] Batch {} file(s) đã được confirm trước đó.", batch_keys.len());
                                         for &i in &batch_indices {
@@ -466,19 +474,20 @@ async fn main() {
                                             upload_records[i].reason = err_str.clone();
                                         }
                                     } else if is_transient_rpc_error(&err_str) {
-                                        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                                        let delay = crate::utils::retry_delay_secs(upload_records[batch_indices[0]].attempts.max(1));
+                                        let next_retry = crate::utils::compute_next_retry_at(delay);
                                         log::warn!(
-                                            "⏳ [TX Manager Background] RPC/mạng tạm thời gián đoạn ({}). Tạm hoãn retry batch này, KHÔNG tăng attempts để bảo toàn bản ghi.",
-                                            err_str
+                                            "⏳ [TX Manager Background] RPC/mạng tạm thời gián đoạn ({}). Hoãn batch này {}s (next retry at: {}), KHÔNG tăng attempts để chống Head-of-Line blocking.",
+                                            err_str, delay, next_retry
                                         );
                                         for &i in &batch_indices {
                                             upload_records[i].last_attempt_at = now.clone();
                                             upload_records[i].reason = format!("Transient RPC Error: {}", err_str);
+                                            upload_records[i].next_retry_at = Some(next_retry.clone());
                                         }
-                                        let _ = save_failed_records(&failed_upload_json, &upload_records).await;
-                                        continue;
+                                        upload_modified = true;
+                                        break; // Mạng/RPC đang gián đoạn, tạm dừng thử các batch khác trong tick này
                                     } else {
-                                        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
                                         for &i in &batch_indices {
                                             upload_records[i].attempts += 1;
                                             upload_records[i].last_attempt_at = now.clone();
@@ -490,68 +499,103 @@ async fn main() {
                                                     MAX_BACKGROUND_RETRIES
                                                 );
                                                 upload_records[i].status = "NEEDS_ADMIN_REVIEW".to_string();
+                                                upload_records[i].next_retry_at = None;
+                                            } else {
+                                                let delay = crate::utils::retry_delay_secs(upload_records[i].attempts);
+                                                upload_records[i].next_retry_at = Some(crate::utils::compute_next_retry_at(delay));
                                             }
                                         }
                                     }
                                 }
                             }
-                            upload_records.retain(|r| r.status != "RESOLVED");
-                            let _ = save_failed_records(&failed_upload_json, &upload_records).await;
-                            // Sau 1 batch thì nhả ngay để luồng chính được kiểm tra trước
-                            continue;
+                            upload_modified = true;
+                            batches_tried += 1;
+                        } else {
+                            break;
                         }
                     }
 
-                    // 3.2. Nếu không có upload nào, thử lại đúng 1 download confirmation
-                    let mut dl_records = load_failed_records(&failed_dl_json).await;
-                    let pending_dl_idx = dl_records
-                        .iter()
-                        .position(|r| r.status == "PENDING_BACKGROUND_RETRY" && r.attempts < MAX_BACKGROUND_RETRIES);
+                    if upload_modified {
+                        upload_records.retain(|r| r.status != "RESOLVED");
+                        let _ = save_failed_records(&failed_upload_json, &upload_records).await;
+                    }
 
-                    if let Some(idx) = pending_dl_idx {
-                        let dl_key = dl_records[idx].key.clone();
-                        let contract_str = dl_records[idx].contract_address.clone();
-                        log::info!("🔄 [TX Manager Background] Server rảnh: đang thử lại download key {}...", dl_key);
-                        match crate::ethereum::handle_confirm_download(dl_key.clone(), contract_str.clone(), app_clone.clone()).await {
-                            Ok(()) => {
-                                log::info!("✅ [TX Manager Background] Thử lại thành công download key: {}", dl_key);
-                                dl_records[idx].status = "RESOLVED".to_string();
-                            }
-                            Err(e) => {
-                                let err_str = e.to_string();
-                                if is_already_confirmed(&err_str) {
-                                    log::info!("✅ [TX Manager Background] Download key {} đã được confirm trước đó.", dl_key);
+                    // 3.2. Retry download confirmations (tối đa 5 download items mỗi tick nếu server rảnh, không bị đói tác vụ)
+                    let mut dl_records = load_failed_records(&failed_dl_json).await;
+                    let mut dl_modified = false;
+                    let mut dls_tried = 0;
+
+                    loop {
+                        if dls_tried >= 5 || app_clone.upload_batch_sender.capacity() < 1000 || app_clone.confirmation_sender.capacity() < 1000 {
+                            break;
+                        }
+
+                        let pending_dl_idx = dl_records
+                            .iter()
+                            .position(|r| {
+                                r.status == "PENDING_BACKGROUND_RETRY" 
+                                    && r.attempts < MAX_BACKGROUND_RETRIES
+                                    && crate::utils::is_record_due(&r.next_retry_at)
+                            });
+
+                        if let Some(idx) = pending_dl_idx {
+                            let dl_key = dl_records[idx].key.clone();
+                            let contract_str = dl_records[idx].contract_address.clone();
+                            log::info!("🔄 [TX Manager Background] Server rảnh: đang thử lại download key {}...", dl_key);
+                            match crate::ethereum::handle_confirm_download(dl_key.clone(), contract_str.clone(), app_clone.clone()).await {
+                                Ok(()) => {
+                                    log::info!("✅ [TX Manager Background] Thử lại thành công download key: {}", dl_key);
                                     dl_records[idx].status = "RESOLVED".to_string();
-                                } else if is_terminal_contract_revert(&err_str) {
-                                    log::error!("❌ [TX Manager Background] Download key gặp lỗi contract vĩnh viễn: {}. Dừng retry.", err_str);
-                                    dl_records[idx].status = "TERMINAL_ERROR".to_string();
-                                    dl_records[idx].reason = err_str;
-                                } else if is_transient_rpc_error(&err_str) {
+                                }
+                                Err(e) => {
+                                    let err_str = e.to_string();
                                     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                                    log::warn!(
-                                        "⏳ [TX Manager Background] RPC/mạng tạm thời gián đoạn ({}) khi confirm download {}. KHÔNG tăng attempts.",
-                                        err_str, dl_key
-                                    );
-                                    dl_records[idx].last_attempt_at = now;
-                                    dl_records[idx].reason = format!("Transient RPC Error: {}", err_str);
-                                    let _ = save_failed_records(&failed_dl_json, &dl_records).await;
-                                    continue;
-                                } else {
-                                    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                                    dl_records[idx].attempts += 1;
-                                    dl_records[idx].last_attempt_at = now;
-                                    dl_records[idx].reason = err_str;
-                                    if dl_records[idx].attempts >= MAX_BACKGROUND_RETRIES {
-                                        log::error!(
-                                            "🚨 [TX Manager Background] Download key {} đã thử lại {} lần thất bại. Đánh dấu NEEDS_ADMIN_REVIEW, dừng retry.",
-                                            dl_records[idx].key,
-                                            MAX_BACKGROUND_RETRIES
+                                    if is_already_confirmed(&err_str) {
+                                        log::info!("✅ [TX Manager Background] Download key {} đã được confirm trước đó.", dl_key);
+                                        dl_records[idx].status = "RESOLVED".to_string();
+                                    } else if is_terminal_contract_revert(&err_str) {
+                                        log::error!("❌ [TX Manager Background] Download key gặp lỗi contract vĩnh viễn: {}. Dừng retry.", err_str);
+                                        dl_records[idx].status = "TERMINAL_ERROR".to_string();
+                                        dl_records[idx].reason = err_str;
+                                    } else if is_transient_rpc_error(&err_str) {
+                                        let delay = crate::utils::retry_delay_secs(dl_records[idx].attempts.max(1));
+                                        let next_retry = crate::utils::compute_next_retry_at(delay);
+                                        log::warn!(
+                                            "⏳ [TX Manager Background] RPC/mạng tạm thời gián đoạn ({}) khi confirm download {}. Hoãn {}s (next retry at: {}), KHÔNG tăng attempts.",
+                                            err_str, dl_key, delay, next_retry
                                         );
-                                        dl_records[idx].status = "NEEDS_ADMIN_REVIEW".to_string();
+                                        dl_records[idx].last_attempt_at = now;
+                                        dl_records[idx].reason = format!("Transient RPC Error: {}", err_str);
+                                        dl_records[idx].next_retry_at = Some(next_retry);
+                                        dl_modified = true;
+                                        break; // Mạng/RPC đang gián đoạn, tạm dừng thử các download khác trong tick này
+                                    } else {
+                                        dl_records[idx].attempts += 1;
+                                        dl_records[idx].last_attempt_at = now;
+                                        dl_records[idx].reason = err_str;
+                                        if dl_records[idx].attempts >= MAX_BACKGROUND_RETRIES {
+                                            log::error!(
+                                                "🚨 [TX Manager Background] Download key {} đã thử lại {} lần thất bại. Đánh dấu NEEDS_ADMIN_REVIEW, dừng retry.",
+                                                dl_records[idx].key,
+                                                MAX_BACKGROUND_RETRIES
+                                            );
+                                            dl_records[idx].status = "NEEDS_ADMIN_REVIEW".to_string();
+                                            dl_records[idx].next_retry_at = None;
+                                        } else {
+                                            let delay = crate::utils::retry_delay_secs(dl_records[idx].attempts);
+                                            dl_records[idx].next_retry_at = Some(crate::utils::compute_next_retry_at(delay));
+                                        }
                                     }
                                 }
                             }
+                            dl_modified = true;
+                            dls_tried += 1;
+                        } else {
+                            break;
                         }
+                    }
+
+                    if dl_modified {
                         dl_records.retain(|r| r.status != "RESOLVED");
                         let _ = save_failed_records(&failed_dl_json, &dl_records).await;
                     }
@@ -690,7 +734,13 @@ pub(crate) async fn write_atomic(path: &std::path::Path, content: &str) -> std::
     crate::utils::write_atomic(path, content).await
 }
 
-pub(crate) async fn remove_pending_uploads(path: &std::path::Path, current_batch: &[String], addr_str: &str) {
+pub(crate) async fn remove_pending_uploads(
+    path: &std::path::Path,
+    current_batch: &[String],
+    addr_str: &str,
+    lock: &tokio::sync::Mutex<()>,
+) {
+    let _guard = lock.lock().await;
     if let Ok(content) = tokio::fs::read_to_string(path).await {
         let remaining_lines: Vec<&str> = content
             .lines()
@@ -719,7 +769,12 @@ pub(crate) async fn remove_pending_uploads(path: &std::path::Path, current_batch
     }
 }
 
-pub(crate) async fn remove_pending_download(path: &std::path::Path, download_key: &str) {
+pub(crate) async fn remove_pending_download(
+    path: &std::path::Path,
+    download_key: &str,
+    lock: &tokio::sync::Mutex<()>,
+) {
+    let _guard = lock.lock().await;
     if let Ok(content) = tokio::fs::read_to_string(path).await {
         let clean_dl_key = download_key.trim_start_matches("0x");
         let remaining_lines: Vec<&str> = content

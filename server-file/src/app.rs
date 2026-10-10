@@ -43,6 +43,8 @@ pub struct App {
     pub invalid_download_keys: Arc<DashMap<String, std::time::Instant>>,
     pub http_client: alloy::transports::http::Client,
     pub admin_rate_limiter: Arc<DashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
+    pub pending_uploads_lock: Arc<tokio::sync::Mutex<()>>,
+    pub pending_confirmations_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl App {
@@ -88,6 +90,8 @@ impl App {
             invalid_download_keys: Arc::new(DashMap::new()),
             http_client,
             admin_rate_limiter: Arc::new(DashMap::new()),
+            pending_uploads_lock: Arc::new(tokio::sync::Mutex::new(())),
+            pending_confirmations_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -129,6 +133,8 @@ impl App {
             invalid_download_keys: Arc::new(DashMap::new()),
             http_client,
             admin_rate_limiter: Arc::new(DashMap::new()),
+            pending_uploads_lock: Arc::new(tokio::sync::Mutex::new(())),
+            pending_confirmations_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -360,10 +366,20 @@ impl App {
         if let Some((_, open_files)) = self.file_cache.remove(file_key) {
             let bin = open_files.bin_file.clone();
             let meta = open_files.meta_file.clone();
+            let storage_root = self.storage_root.clone();
+            let file_key_owned = file_key.to_string();
+
             let sync_res = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
                 bin.sync_data()?;
                 if let Ok(meta_guard) = meta.lock() {
                     meta_guard.sync_data()?;
+                }
+                // Fsync directory cha để đảm bảo dentry (tên file) không bị mất sau crash
+                let level1 = &file_key_owned[0..2.min(file_key_owned.len())];
+                let level2 = &file_key_owned[2..4.min(file_key_owned.len())];
+                let parent_dir = storage_root.join(level1).join(level2).join(&file_key_owned);
+                if let Ok(dir) = std::fs::File::open(&parent_dir) {
+                    let _ = dir.sync_all();
                 }
                 Ok(())
             })
@@ -371,7 +387,7 @@ impl App {
 
             match sync_res {
                 Ok(Ok(())) => {
-                    log::debug!("✅ [FSYNC] Đã sync_data thành công cho .bin và .meta của file {}", file_key);
+                    log::debug!("✅ [FSYNC] Đã sync_data thành công cho .bin, .meta và dentry của file {}", file_key);
                 }
                 Ok(Err(e)) => {
                     log::error!(
@@ -388,21 +404,20 @@ impl App {
             }
         }
 
-        // WAL (Write-Ahead Logging): Ghi vào pending_uploads.txt bền vững trước khi enqueue vào RAM channel.
-        // Giúp bảo đảm nếu server crash trước khi TX Manager kịp đọc channel thì sau khi khởi động lại
-        // server vẫn tự động phục hồi và xác nhận on-chain, client không cần phải tải lại.
+        // WAL (Write-Ahead Logging) có Lock Mutex bảo vệ chống race condition với TX Manager:
         let pending_upload_path = self.storage_root.join("pending_uploads.txt");
         let line = format!("{},{}\n", file_key, contract_addr);
         use tokio::io::AsyncWriteExt;
-        if let Ok(mut file) = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&pending_upload_path)
-            .await
         {
-            let _ = file.write_all(line.as_bytes()).await;
-            let _ = file.flush().await;
-            let _ = file.sync_data().await;
+            let _guard = self.pending_uploads_lock.lock().await;
+            let mut file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&pending_upload_path)
+                .await?;
+            file.write_all(line.as_bytes()).await?;
+            file.flush().await?;
+            file.sync_data().await?;
         }
 
         let _ = self.upload_batch_sender.send((file_key.to_string(), contract_addr)).await;
