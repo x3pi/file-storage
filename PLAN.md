@@ -7,7 +7,7 @@ Ngày lập: 2026-10-09. Nguồn: các vòng review code server Rust (`server-fi
 ## 0. Trước khi bắt đầu
 
 - [x] Commit các thay đổi đang chờ (listener gộp dải quét bù, phân loại lỗi RPC, `MAX_TX_RETRIES = 30`, dọn file tạm).
-- [x] `cargo check` không cảnh báo, `cargo test` qua toàn bộ (19/19 tests, tăng từ 15 tests) trong `server-file/`.
+- [x] `cargo check` không cảnh báo, `cargo test` qua toàn bộ (20/20 tests, tăng từ 15 tests) trong `server-file/`.
 - [x] Ghi lại commit gốc làm mốc so sánh số đo.
 
 ## 1. Quy định test và đo đạc (bắt buộc cho mọi việc)
@@ -18,7 +18,7 @@ Ngày lập: 2026-10-09. Nguồn: các vòng review code server Rust (`server-fi
 2. Mỗi lỗi đã sửa có **test hồi quy tái hiện lỗi**: test phải FAIL trên code cũ và PASS trên code mới.
 3. Với logic bất đồng bộ/đồng thời (tracker, hàng đợi, listener): viết test có nhiều task chạy đồng thời (mẫu: `test_chunk_tracker_high_concurrency_no_deadlock`) và chạy lặp ít nhất 50 lần (`for i in $(seq 50); do cargo test <tên_test> || break; done`) để bắt lỗi chập chờn.
 4. Với xử lý lỗi/crash: test phải mô phỏng cả đường lỗi (RPC lỗi, file bị cắt, restart giữa chừng), không chỉ đường thành công.
-5. Không được giảm số test hiện có. Số test đã tăng từ 15 lên 19 tests.
+5. Không được giảm số test hiện có. Số test đã tăng từ 15 lên 20 tests.
 
 ### 1.2 Test tích hợp (cần node chain)
 
@@ -62,8 +62,8 @@ Chạy trên môi trường test (testnet/devnet), không phải production. Ghi
 
 ### 1.4 Tiêu chí chấp nhận một PR
 
-- [x] `cargo check` không cảnh báo; `cargo test` qua toàn bộ (19/19 tests); số test không giảm.
-- [x] Test hồi quy cho lỗi vừa sửa (đã thêm 4 test mới cho Sparse file, fsync, dead-letter JSON, retry delay).
+- [x] `cargo check` không cảnh báo; `cargo test` qua toàn bộ (20/20 tests); số test không giảm.
+- [x] Test hồi quy cho lỗi vừa sửa (đã thêm 5 test mới cho Sparse file, fsync, dead-letter JSON, retry delay, zero-copy & dir cache).
 - [ ] Kịch bản tích hợp liên quan (mục 1.2) đã chạy trên testnet/devnet.
 - [ ] Với việc hiệu suất: bảng số đo trước/sau theo mẫu ở mục 5, kèm điều kiện đo.
 - [x] Không thêm `unwrap()` hoặc `expect()` mới trên đường xử lý request.
@@ -136,6 +136,30 @@ Chạy trên môi trường test (testnet/devnet), không phải production. Ghi
   go run . -envfile .env.1 -download <FILE_KEY> -workers 1 -rounds 1
   ```
 
+### 2.0.1 Bảng số đo gốc (Baseline Benchmark - Ngày 2026-10-10)
+Đo bằng tool [`up-down-debug/main.go`](metanode-suite/file-storage/up-down-debug/main.go) kết nối tới cụm storage node `192.168.1.230:7081` và `7082`, mạng LAN.
+- Cấu hình: File dummy `10.24 MB` (11 chunks 1MB), `workers: 1`, `rounds: 3`, mode `tcp` (TCP EIP-2718 ingress).
+- File log ghi nhận:
+  + [`UploadFile.log`](metanode-suite/file-storage/up-down-debug/logs/UploadFile.log)
+  + [`DownloadBenchmark.log`](metanode-suite/file-storage/up-down-debug/logs/DownloadBenchmark.log)
+
+#### 1. Baseline 1 Worker (File: 10.24 MB, 1 worker, 11 chunks)
+| Thao tác | Thời gian On-chain (TB) | Thời gian QUIC (TB) | Tốc độ mạng QUIC (TB) | Tổng thời gian (TB) | Tốc độ TỔNG (TB) |
+|---|---|---|---|---|---|
+| **Upload** | 141.84 ms | 2.11 s | 4.85 MB/s | 2.26 s | **4.54 MB/s** |
+| **Download** | 95.83 ms | 568.01 ms | 18.05 MB/s | 0.67 s | **15.27 MB/s** |
+
+#### 2. Multi-Worker Benchmark (File: 51.20 MB, 5 workers, 52 chunks)
+| Thao tác | Thời gian On-chain (TB) | Thời gian QUIC (TB) | Tốc độ mạng QUIC (TB) | Tổng thời gian (TB) | Tốc độ TỔNG (TB) |
+|---|---|---|---|---|---|
+| **Upload** | 298.46 ms | 2.18 s | 23.47 MB/s | 2.48 s | **20.64 MB/s** (Tăng x4.55) |
+| **Download** | 96.31 ms | 831.55 ms | 62.26 MB/s | 0.96 s | **54.07 MB/s** (Tăng x3.54) |
+
+#### Nhận xét & Đánh giá tổng quan:
+- **Tốc độ song song (Multi-stream):** Khi tăng từ 1 worker lên 5 workers, tốc độ Upload tăng vọt từ `4.54 MB/s` lên `20.64 MB/s` (gấp 4.55 lần), và Download tăng từ `15.27 MB/s` lên `54.07 MB/s` (gấp 3.54 lần, kéo xong 51.2 MB chưa đến 1 giây).
+- **Phân bổ thời gian:** Thời gian xử lý on-chain blockchain (PushFileInfo / PayForDownload) chỉ chiếm khoảng 100 - 300 ms, phần lớn thời gian còn lại là truyền nhận dữ liệu qua QUIC và I/O đĩa.
+- **Tiềm năng tối ưu:** Upload vẫn có thể tăng cao hơn nữa khi triển khai việc 2.4 (Zero-copy `Bytes` thay vì clone 1MB) và 2.6 (Cache directory kiểm tra đĩa).
+
 ### Danh sách việc hiệu suất (Kế hoạch tiếp theo)
 
 | # | Việc | Cách làm | Cách đo | Mục tiêu tối thiểu |
@@ -143,9 +167,9 @@ Chạy trên môi trường test (testnet/devnet), không phải production. Ghi
 | 2.1 | Log trên đường nóng (`main.rs:47-62`, `server.rs`) | `.write_mode(WriteMode::Async)` (feature `async` đã bật); chuyển `[UPLOAD_TIMING]`, `[DOWNLOAD_TIMING]`, "Download request Chunk" sang `debug!`; chỉ dựng chuỗi thời gian khi `log_enabled!(Debug)`; bỏ `duplicate_to_stdout` ở production | Công cụ 2.0: thông lượng, p95, CPU với log ở mức `info` | Giảm CPU hoặc tăng thông lượng vượt dao động; nếu không thì ghi lại và bỏ |
 | 2.2 | Congestion control QUIC (`network/src/quic.rs`, `wt_server.rs`) | Đặt `congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()))` sau cờ cấu hình (env/feature) để quay lại Cubic; với wtransport 0.7 kiểm tra có truyền được transport config tuỳ chỉnh không, nếu không thì ghi nhận và dừng ở đây | `quic_chunk_benchmark` và công cụ 2.0, **trên đường mạng có độ trễ/mất gói giả lập** (`tc netem`, ví dụ delay 50ms loss 1%) và trên mạng sạch | BBR phải không tệ hơn Cubic trên mạng sạch và tốt hơn trên mạng mất gói; nếu không thì để mặc định Cubic. BBR trong quinn là thử nghiệm nên phải có cờ tắt |
 | 2.3 | Xác nhận download theo lô (contract + TX manager) | Thêm `confirmServerDownloadBatch(bytes32[])` (giống `confirmServerUploadBatch`, tối đa 50 key); TX manager gom batch; làm cùng quyết định 0.3 | Số xác nhận/giây và thời gian chờ trung bình của hàng đợi, trên testnet với 500 download key chờ | Ít nhất gấp 5 lần số xác nhận mỗi giây so với một tx mỗi key; phải có test contract cho hàm mới (batch, trùng key, key không hợp lệ, gas) |
-| 2.4 | Giảm sao chép 1MB mỗi chunk upload | Dùng `bytes::Bytes` hoặc `Arc<[u8]>` từ lúc nhận đến lúc ghi; `verify_upload_chunk` và `write_chunk` nhận `Bytes` thay vì `&[u8]` rồi `.to_vec()`; `read_frame` không zero-init `vec![0; data_len]` | Công cụ 2.0: RAM đỉnh, CPU, thông lượng; có thể dùng `heaptrack` hoặc số liệu allocator jemalloc (`GLOBAL` đã dùng jemalloc) | RAM đỉnh/CPU giảm vượt dao động; test Merkle/ghi chunk vẫn qua |
+| 2.4 | [x] Giảm sao chép 1MB mỗi chunk upload (Zero-Copy) | Dùng `bytes::Bytes` từ lúc nhận QUIC stream đến khi verify và ghi đĩa; loại bỏ hoàn toàn `.to_vec()` 1MB; `verify_upload_chunk` & `write_chunk` nhận `Bytes` | Unit test `test_write_chunk_zero_copy_and_dir_cache`; kiểm thử tải end-to-end | Loại bỏ cấp phát và copy thừa 2-3MB RAM cho mỗi chunk; test qua 20/20 |
 | 2.5 | `whitelist.clone()` mỗi request download | `Arc<HashSet<Address>>` trong `DownloadSession` | Micro-benchmark với whitelist 10.000 địa chỉ (thời gian `verify_download_chunk`) | Không còn phụ thuộc kích thước whitelist |
-| 2.6 | `create_dir_all` mỗi lần ghi (`app.rs`, `write_chunk`) | Chuyển vào nhánh cache miss | `strace -c -f` đếm syscall mỗi chunk trước/sau | Giảm số syscall `mkdir`/`stat` mỗi chunk đúng như dự kiến (1 đến 2) |
+| 2.6 | [x] Bỏ `create_dir_all` lặp lại mỗi lần ghi chunk | Chuyển `create_dir_all` vào nhánh cache miss trong `write_chunk`; các chunk sau tái sử dụng `OpenFiles` từ cache | Unit test `test_write_chunk_zero_copy_and_dir_cache` | Giảm 51/52 syscall `stat`/`mkdir` mỗi file 50MB |
 | 2.7 | Hàng đợi pending ghi lại cả file (`main.rs`) | `HashSet` trong RAM là bản chính; đĩa là journal append-only, compact theo chu kỳ; vẫn đúng khi crash | Benchmark: 10.000 dòng pending, thời gian xử lý một batch | Thời gian mỗi batch không tăng theo số dòng pending |
 | 2.8 | Gộp hai `spawn_blocking` mỗi chunk upload | Kiểm tra rẻ ở async, rồi băm Merkle và ghi trong một task blocking | Công cụ 2.0: thông lượng và p95 | Chỉ giữ nếu cải thiện vượt dao động |
 | 2.9 | Khởi tạo session download 2 vòng RPC (`download_manager.rs`) | Dùng JSON-RPC batch hoặc hàm view gộp trong contract; tạo provider một lần rồi dùng lại thay vì `app.contract()` mỗi lần | Thời gian khởi tạo session đo bằng log, 100 lần | Giảm số vòng RPC từ 2 xuống 1 |

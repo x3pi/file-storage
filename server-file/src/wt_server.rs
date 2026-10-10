@@ -300,7 +300,9 @@ async fn handle_upload_chunk(
         return; // Thoát luôn, tiết kiệm CPU và Ổ cứng!
     }
 
-    match crate::ethereum::verify_upload_chunk(&payload, &chunk_data_in, &app).await {
+    let chunk_data_bytes = bytes::Bytes::from(chunk_data_in);
+
+    match crate::ethereum::verify_upload_chunk(&payload, &chunk_data_bytes, &app).await {
         Ok(_) => {
             let _permit = match app.task_semaphore.acquire().await {
                 Ok(p) => p,
@@ -310,7 +312,7 @@ async fn handle_upload_chunk(
                     return;
                 }
             };
-            let write_result = app.write_chunk(&payload.file_key, payload.chunk_index, &chunk_data_in).await;
+            let write_result = app.write_chunk(&payload.file_key, payload.chunk_index, chunk_data_bytes).await;
             drop(_permit);
 
             match write_result {

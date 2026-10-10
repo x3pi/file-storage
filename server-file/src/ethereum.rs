@@ -3,6 +3,7 @@ use crate::download_manager;
 use crate::models::{CHUNK_SIZE, DownloadChunkPayload, GenericResponse, UploadChunkPayload, UploadFileInfo};
 use alloy::primitives::{keccak256, Address};
 use alloy::signers::Signature;
+use bytes::Bytes;
 use std::net::IpAddr;
 
 use std::sync::Arc;
@@ -56,7 +57,7 @@ fn recover_address_from_signature(
 /// Combines both signature verification and merkle proof verification
 pub async fn verify_upload_chunk(
     payload: &UploadChunkPayload,
-    chunk_data: &[u8],
+    chunk_data: &Bytes,
     app: &Arc<App>,
 ) -> Result<(), String> {
     let c_addr = payload.contract_address.parse::<alloy::primitives::Address>()
@@ -272,7 +273,7 @@ pub async fn verify_upload_chunk(
     }
     
     // 4. Verify Merkle Proof (ALWAYS - even for cached files)
-    let chunk_data_owned = chunk_data.to_vec();
+    let chunk_data_owned = chunk_data.clone();
     let merkle_proof_hashes = payload.merkle_proof_hashes.clone();
     let chunk_index = payload.chunk_index;
     let merkle_root_expected = payload.merkle_root.clone();

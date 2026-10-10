@@ -687,3 +687,45 @@ async fn test_finalize_upload_file_sync_data() {
 
     cleanup_temp_env(storage_root, log_dir);
 }
+
+#[tokio::test]
+async fn test_write_chunk_zero_copy_and_dir_cache() {
+    let (storage_root, log_dir) = create_temp_env();
+    let app = App::new_test(storage_root.clone(), log_dir.clone());
+    let file_key = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+    // 1. Chunk 0 (Cache miss: tạo thư mục và mở file)
+    let chunk0_data = bytes::Bytes::from(vec![42u8; 100]);
+    let res0 = app.write_chunk(file_key, 0, chunk0_data).await;
+    assert!(res0.is_ok(), "Chunk 0 write should succeed");
+
+    // File cache phải chứa file descriptor đã mở
+    assert!(app.file_cache.contains_key(file_key), "File must be cached after first chunk");
+
+    // 2. Chunk 1 (Cache hit: tái sử dụng open_files, không gọi create_dir_all)
+    let chunk1_data = bytes::Bytes::from(vec![99u8; 100]);
+    let res1 = app.write_chunk(file_key, 1, chunk1_data).await;
+    assert!(res1.is_ok(), "Chunk 1 write should succeed with cached handle");
+
+    // 3. Đọc lại dữ liệu để xác nhận offset ghi đúng
+    let level1 = &file_key[0..2];
+    let level2 = &file_key[2..4];
+    let bin_path = storage_root.join(level1).join(level2).join(file_key).join(format!("{}.bin", file_key));
+    let meta_path = storage_root.join(level1).join(level2).join(file_key).join(format!("{}.meta", file_key));
+
+    assert!(bin_path.exists());
+    assert!(meta_path.exists());
+
+    use std::os::unix::fs::FileExt;
+    let file = std::fs::File::open(&bin_path).unwrap();
+    let mut read_buf0 = vec![0u8; 100];
+    file.read_exact_at(&mut read_buf0, 0).unwrap();
+    assert_eq!(read_buf0, vec![42u8; 100]);
+
+    let offset1 = crate::models::CHUNK_SIZE;
+    let mut read_buf1 = vec![0u8; 100];
+    file.read_exact_at(&mut read_buf1, offset1).unwrap();
+    assert_eq!(read_buf1, vec![99u8; 100]);
+
+    cleanup_temp_env(storage_root, log_dir);
+}

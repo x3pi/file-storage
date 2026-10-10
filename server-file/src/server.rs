@@ -227,7 +227,7 @@ pub async fn handle_connection(
                             
                             // ✅ RECEIVE FRAME 2: Binary Chunk Data có timeout 15s (TRƯỚC KHI LẤY PERMIT)
                             let chunk_data = match tokio::time::timeout(tokio::time::Duration::from_secs(15), stream_handler.recv()).await {
-                                Ok(Ok(Some(data))) => data.to_vec(),
+                                Ok(Ok(Some(data))) => data,
                                 Ok(Ok(None)) => {
                                     log::error!(
                                         "[{}] ❌ Stream closed before binary chunk data for chunk {} -k {}",
@@ -343,7 +343,7 @@ pub async fn handle_connection(
                                 }
                             }
                             
-                            let store_result = app_clone.write_chunk(&payload.file_key, payload.chunk_index, &chunk_data).await;
+                            let store_result = app_clone.write_chunk(&payload.file_key, payload.chunk_index, chunk_data.clone()).await;
 
                             // Nhả semaphore permit NGAY SAU KHI ghi disk xong
                             // Tránh việc Client mạng chậm hoặc chết đột ngột làm cạn kiệt Semaphore.

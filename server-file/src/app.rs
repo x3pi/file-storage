@@ -250,9 +250,8 @@ impl App {
         }
     }
 
-    pub async fn write_chunk(&self, file_key: &str, chunk_index: u64, chunk_data: &[u8]) -> Result<(), std::io::Error> {
+    pub async fn write_chunk(&self, file_key: &str, chunk_index: u64, chunk_data: bytes::Bytes) -> Result<(), std::io::Error> {
         let file_key_owned = file_key.to_string();
-        let chunk_data_owned = chunk_data.to_vec();
         let file_cache = self.file_cache.clone();
         let storage_root = self.storage_root.clone();
 
@@ -264,20 +263,12 @@ impl App {
                 ));
             }
             let chunk_size = crate::models::CHUNK_SIZE; // 1MB
-            if chunk_data_owned.is_empty() || chunk_data_owned.len() > chunk_size as usize {
+            if chunk_data.is_empty() || chunk_data.len() > chunk_size as usize {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "Chunk data cannot be empty or exceed 1MB",
                 ));
             }
-
-            let level1 = &file_key_owned[0..2];
-            let level2 = &file_key_owned[2..4];
-            let file_dir: PathBuf = storage_root.join(level1).join(level2).join(&file_key_owned);
-            std::fs::create_dir_all(&file_dir)?;
-
-            let bin_path = file_dir.join(format!("{}.bin", file_key_owned));
-            let meta_path = file_dir.join(format!("{}.meta", file_key_owned));
 
             use std::fs::OpenOptions;
             use std::io::Write;
@@ -286,6 +277,14 @@ impl App {
             let open_files = if let Some(files) = file_cache.get(&file_key_owned) {
                 files.value().clone()
             } else {
+                let level1 = &file_key_owned[0..2];
+                let level2 = &file_key_owned[2..4];
+                let file_dir: PathBuf = storage_root.join(level1).join(level2).join(&file_key_owned);
+                std::fs::create_dir_all(&file_dir)?;
+
+                let bin_path = file_dir.join(format!("{}.bin", file_key_owned));
+                let meta_path = file_dir.join(format!("{}.meta", file_key_owned));
+
                 let bin_file = OpenOptions::new()
                     .write(true)
                     .create(true)
@@ -305,7 +304,7 @@ impl App {
             let offset = chunk_index
                 .checked_mul(chunk_size)
                 .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Offset calculation overflowed"))?;
-            open_files.bin_file.write_all_at(&chunk_data_owned, offset)?;
+            open_files.bin_file.write_all_at(&chunk_data, offset)?;
 
             let mut meta_file_guard = open_files.meta_file.lock()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Mutex poison error: {}", e)))?;
