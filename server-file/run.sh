@@ -11,10 +11,10 @@ if [ $? == 0 ]; then
 fi
 
 # Tạo session mới, pane 1 chạy server 1 với .env.server1
-tmux new-session -d -s $SESSION -n server1 "echo 'Starting server 1 (0.0.0.0:7081) with .env.server1...'; ENV_FILE=.env.server1 cargo run -- 0.0.0.0:7081"
+tmux new-session -d -s $SESSION -n server1 "echo 'Starting server 1 (0.0.0.0:7081) with .env.server1 (RELEASE)...'; ENV_FILE=.env.server1 cargo run --release -- 0.0.0.0:7081"
 
 # Tạo thêm pane bên phải cho server 2 với .env.server2
-tmux split-window -h -t $SESSION "echo 'Starting server 2 (0.0.0.0:7082) with .env.server2...'; ENV_FILE=.env.server2 cargo run -- 0.0.0.0:7082"
+tmux split-window -h -t $SESSION "echo 'Starting server 2 (0.0.0.0:7082) with .env.server2 (RELEASE)...'; ENV_FILE=.env.server2 cargo run --release -- 0.0.0.0:7082"
 
 # Điều chỉnh layout cho dễ nhìn
 tmux select-layout -t $SESSION tiled
