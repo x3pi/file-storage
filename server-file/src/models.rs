@@ -78,6 +78,8 @@ pub struct FailedTxRecord {
     pub last_attempt_at: String,
     #[serde(default)]
     pub next_retry_at: Option<String>,
+    #[serde(default)]
+    pub transient_attempts: u32,
 }
 
 // Upload verification cache: stores both verified address and merkle root

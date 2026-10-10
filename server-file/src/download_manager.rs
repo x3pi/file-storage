@@ -343,10 +343,35 @@ pub async fn descrease_chunk_count(download_key: &str, app: &Arc<App>) -> Result
 
     if should_confirm {
         let contract_addr_str = contract_address.to_string();
-        let sender = app.confirmation_sender.clone();
+        let app_clone = app.clone();
         let key = download_key_clean.clone();
         tokio::spawn(async move {
-            if let Err(e) = sender.send((key, contract_addr_str)).await {
+            // 1. Ghi WAL vào pending_confirmations.txt trước khi gửi vào channel để chống mất khi crash
+            let pending_dl_path = app_clone.storage_root.join("pending_confirmations.txt");
+            let line = format!("{},{}\n", key, contract_addr_str);
+            use tokio::io::AsyncWriteExt;
+            let wal_res = async {
+                let file = {
+                    let _guard = app_clone.pending_confirmations_lock.lock().await;
+                    let mut file = tokio::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&pending_dl_path)
+                        .await?;
+                    file.write_all(line.as_bytes()).await?;
+                    file.flush().await?;
+                    file
+                };
+                file.sync_data().await?;
+                Ok::<(), std::io::Error>(())
+            }.await;
+
+            if let Err(e) = wal_res {
+                log::error!("❌ [Download WAL] Ghi pending_confirmations.txt thất bại: {}", e);
+            }
+
+            // 2. Gửi vào channel cho TX Manager xử lý
+            if let Err(e) = app_clone.confirmation_sender.send((key, contract_addr_str)).await {
                 log::error!("❌ Failed to send to confirmation queue: Channel closed: {}", e);
             }
         });

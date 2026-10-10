@@ -304,6 +304,25 @@ async fn handle_upload_chunk(
 
     match crate::ethereum::verify_upload_chunk(&payload, &chunk_data_bytes, &app).await {
         Ok(_) => {
+            // Lấy thông tin từ cache và kiểm tra chunk hợp lệ TRƯỚC KHI ghi đĩa
+            let (total_chunks, contract_addr) = if let Some(cache_entry) = app.upload_file_cache.get(&payload.file_key) {
+                (cache_entry.total_chunks, cache_entry.contract_address)
+            } else {
+                (0, alloy::primitives::Address::ZERO)
+            };
+
+            let expected_chunks = if total_chunks > 0 {
+                crate::utils::expected_chunks(total_chunks, payload.chunk_index)
+            } else {
+                1
+            };
+
+            if total_chunks > 0 && expected_chunks == 0 {
+                log::warn!("[WT][{}] ⚠️ Unexpected chunk {} for total_chunks {} (node does not store this parity chunk)", peer_ip, payload.chunk_index, total_chunks);
+                let _ = send_error_frame(&mut send, &req.id, resp_command, "Unexpected chunk index for this node").await;
+                return;
+            }
+
             let _permit = match app.task_semaphore.acquire().await {
                 Ok(p) => p,
                 Err(e) => {
@@ -317,24 +336,8 @@ async fn handle_upload_chunk(
 
             match write_result {
                 Ok(_) => {
-                    // --- THÊM LOGIC TRACKING CHUNKS GIỐNG NHƯ RAW QUIC ---
-                    let (total_chunks, contract_addr) = if let Some(cache_entry) = app.upload_file_cache.get(&payload.file_key) {
-                        (cache_entry.total_chunks, cache_entry.contract_address)
-                    } else {
-                        (0, alloy::primitives::Address::ZERO)
-                    };
-
                     let mut finalize_failed = false;
                     if total_chunks > 0 {
-                        // SVR-4: Xử lý Edge Case chẵn/lẻ bằng hàm dùng chung trong utils
-                        let expected_chunks = crate::utils::expected_chunks(total_chunks, payload.chunk_index);
-
-                        if expected_chunks == 0 {
-                            log::warn!("[WT][{}] ⚠️ Unexpected chunk {} for total_chunks {}", peer_ip, payload.chunk_index, total_chunks);
-                            let _ = send_error_frame(&mut send, &req.id, resp_command, "Unexpected chunk index").await;
-                            return;
-                        }
-
                         let is_completed = {
                             let mut set = app.get_or_init_chunk_tracker(&payload.file_key).await;
                             set.insert(payload.chunk_index);

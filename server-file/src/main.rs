@@ -408,7 +408,7 @@ async fn main() {
                 // 3. KHI SERVER RẢNH VÀ ĐẾN HẸN (Background Retry Worker):
                 _ = background_timer.tick() => {
                     // Ưu tiên tuyệt đối luồng chính: nếu có request mới đang xếp hàng thì nhường ngay
-                    if app_clone.upload_batch_sender.capacity() < 1000 || app_clone.confirmation_sender.capacity() < 1000 {
+                    if app_clone.upload_batch_sender.capacity() < crate::app::TX_CHANNEL_CAPACITY || app_clone.confirmation_sender.capacity() < crate::app::TX_CHANNEL_CAPACITY {
                         continue;
                     }
 
@@ -418,7 +418,7 @@ async fn main() {
                     let mut batches_tried = 0;
 
                     loop {
-                        if batches_tried >= 3 || app_clone.upload_batch_sender.capacity() < 1000 || app_clone.confirmation_sender.capacity() < 1000 {
+                        if batches_tried >= 3 || app_clone.upload_batch_sender.capacity() < crate::app::TX_CHANNEL_CAPACITY || app_clone.confirmation_sender.capacity() < crate::app::TX_CHANNEL_CAPACITY {
                             break;
                         }
 
@@ -427,8 +427,8 @@ async fn main() {
                             .enumerate()
                             .filter(|(_, r)| {
                                 r.status == "PENDING_BACKGROUND_RETRY" 
-                                    && r.attempts < MAX_BACKGROUND_RETRIES
-                                    && crate::utils::is_record_due(&r.next_retry_at)
+                                     && r.attempts < MAX_BACKGROUND_RETRIES
+                                     && crate::utils::is_record_due(&r.next_retry_at)
                             })
                             .map(|(i, _)| i)
                             .collect();
@@ -474,13 +474,33 @@ async fn main() {
                                             upload_records[i].reason = err_str.clone();
                                         }
                                     } else if is_transient_rpc_error(&err_str) {
-                                        let delay = crate::utils::retry_delay_secs(upload_records[batch_indices[0]].attempts.max(1));
+                                        let transient_attempts = upload_records[batch_indices[0]].transient_attempts.saturating_add(1);
+                                        let delay = crate::utils::transient_retry_delay_secs(transient_attempts);
                                         let next_retry = crate::utils::compute_next_retry_at(delay);
-                                        log::warn!(
-                                            "⏳ [TX Manager Background] RPC/mạng tạm thời gián đoạn ({}). Hoãn batch này {}s (next retry at: {}), KHÔNG tăng attempts để chống Head-of-Line blocking.",
-                                            err_str, delay, next_retry
-                                        );
+                                        let is_stuck_long = chrono::NaiveDateTime::parse_from_str(
+                                            &upload_records[batch_indices[0]].first_failed_at,
+                                            "%Y-%m-%d %H:%M:%S",
+                                        )
+                                        .map(|dt| (chrono::Local::now().naive_local() - dt).num_seconds() >= 3600)
+                                        .unwrap_or(false);
+
+                                        if is_stuck_long {
+                                            log::error!(
+                                                "🚨 [CRITICAL][TX Manager Background] Upload batch ({} files) kẹt lỗi RPC tạm thời > 1 giờ! first_failed_at: {}, transient_attempts: {}, reason: {}",
+                                                batch_keys.len(),
+                                                upload_records[batch_indices[0]].first_failed_at,
+                                                transient_attempts,
+                                                err_str
+                                            );
+                                        } else {
+                                            log::warn!(
+                                                "⏳ [TX Manager Background] RPC/mạng tạm thời gián đoạn ({}). Hoãn batch này {}s (transient_attempt: {}, next retry at: {}), KHÔNG tăng attempts để chống Head-of-Line blocking.",
+                                                err_str, delay, transient_attempts, next_retry
+                                            );
+                                        }
+
                                         for &i in &batch_indices {
+                                            upload_records[i].transient_attempts = transient_attempts;
                                             upload_records[i].last_attempt_at = now.clone();
                                             upload_records[i].reason = format!("Transient RPC Error: {}", err_str);
                                             upload_records[i].next_retry_at = Some(next_retry.clone());
@@ -489,6 +509,7 @@ async fn main() {
                                         break; // Mạng/RPC đang gián đoạn, tạm dừng thử các batch khác trong tick này
                                     } else {
                                         for &i in &batch_indices {
+                                            upload_records[i].transient_attempts = 0;
                                             upload_records[i].attempts += 1;
                                             upload_records[i].last_attempt_at = now.clone();
                                             upload_records[i].reason = err_str.clone();
@@ -526,7 +547,7 @@ async fn main() {
                     let mut dls_tried = 0;
 
                     loop {
-                        if dls_tried >= 5 || app_clone.upload_batch_sender.capacity() < 1000 || app_clone.confirmation_sender.capacity() < 1000 {
+                        if dls_tried >= 5 || app_clone.upload_batch_sender.capacity() < crate::app::TX_CHANNEL_CAPACITY || app_clone.confirmation_sender.capacity() < crate::app::TX_CHANNEL_CAPACITY {
                             break;
                         }
 
@@ -534,8 +555,8 @@ async fn main() {
                             .iter()
                             .position(|r| {
                                 r.status == "PENDING_BACKGROUND_RETRY" 
-                                    && r.attempts < MAX_BACKGROUND_RETRIES
-                                    && crate::utils::is_record_due(&r.next_retry_at)
+                                     && r.attempts < MAX_BACKGROUND_RETRIES
+                                     && crate::utils::is_record_due(&r.next_retry_at)
                             });
 
                         if let Some(idx) = pending_dl_idx {
@@ -558,18 +579,38 @@ async fn main() {
                                         dl_records[idx].status = "TERMINAL_ERROR".to_string();
                                         dl_records[idx].reason = err_str;
                                     } else if is_transient_rpc_error(&err_str) {
-                                        let delay = crate::utils::retry_delay_secs(dl_records[idx].attempts.max(1));
+                                        dl_records[idx].transient_attempts = dl_records[idx].transient_attempts.saturating_add(1);
+                                        let delay = crate::utils::transient_retry_delay_secs(dl_records[idx].transient_attempts);
                                         let next_retry = crate::utils::compute_next_retry_at(delay);
-                                        log::warn!(
-                                            "⏳ [TX Manager Background] RPC/mạng tạm thời gián đoạn ({}) khi confirm download {}. Hoãn {}s (next retry at: {}), KHÔNG tăng attempts.",
-                                            err_str, dl_key, delay, next_retry
-                                        );
+                                        let is_stuck_long = chrono::NaiveDateTime::parse_from_str(
+                                            &dl_records[idx].first_failed_at,
+                                            "%Y-%m-%d %H:%M:%S",
+                                        )
+                                        .map(|dt| (chrono::Local::now().naive_local() - dt).num_seconds() >= 3600)
+                                        .unwrap_or(false);
+
+                                        if is_stuck_long {
+                                            log::error!(
+                                                "🚨 [CRITICAL][TX Manager Background] Download key {} kẹt lỗi RPC tạm thời > 1 giờ! first_failed_at: {}, transient_attempts: {}, reason: {}",
+                                                dl_key,
+                                                dl_records[idx].first_failed_at,
+                                                dl_records[idx].transient_attempts,
+                                                err_str
+                                            );
+                                        } else {
+                                            log::warn!(
+                                                "⏳ [TX Manager Background] RPC/mạng tạm thời gián đoạn ({}) khi confirm download {}. Hoãn {}s (transient_attempt: {}, next retry at: {}), KHÔNG tăng attempts.",
+                                                err_str, dl_key, delay, dl_records[idx].transient_attempts, next_retry
+                                            );
+                                        }
+
                                         dl_records[idx].last_attempt_at = now;
                                         dl_records[idx].reason = format!("Transient RPC Error: {}", err_str);
                                         dl_records[idx].next_retry_at = Some(next_retry);
                                         dl_modified = true;
                                         break; // Mạng/RPC đang gián đoạn, tạm dừng thử các download khác trong tick này
                                     } else {
+                                        dl_records[idx].transient_attempts = 0;
                                         dl_records[idx].attempts += 1;
                                         dl_records[idx].last_attempt_at = now;
                                         dl_records[idx].reason = err_str;
@@ -904,6 +945,7 @@ pub(crate) async fn record_failed_upload_batch(
             first_failed_at: now.clone(),
             last_attempt_at: now.clone(),
             next_retry_at: None,
+            transient_attempts: 0,
         };
         if let Some(existing) = records.iter_mut().find(|r| r.key.trim_start_matches("0x").eq_ignore_ascii_case(clean_key)) {
             *existing = new_record;
@@ -969,6 +1011,7 @@ pub(crate) async fn record_failed_download_detailed(
         first_failed_at: now.clone(),
         last_attempt_at: now.clone(),
         next_retry_at: None,
+        transient_attempts: 0,
     };
     upsert_failed_record(&json_path, record).await;
 

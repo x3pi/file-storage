@@ -47,6 +47,8 @@ pub struct App {
     pub pending_confirmations_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
+pub const TX_CHANNEL_CAPACITY: usize = 1_000;
+
 impl App {
     pub async fn setup(log_dir: PathBuf) -> Result<Self> {
         let config = AppConfig::from_env()?;
@@ -56,8 +58,8 @@ impl App {
         let upload_file_cache: UploadFileCache = Arc::new(DashMap::new());
         let file_cache: FileCache = Arc::new(DashMap::new());
         let chunk_tracker: ChunkTracker = Arc::new(DashMap::new());
-        let (confirmation_sender, confirmation_receiver) = mpsc::channel(1_000);
-        let (upload_batch_sender, upload_batch_receiver) = mpsc::channel(1_000);
+        let (confirmation_sender, confirmation_receiver) = mpsc::channel(TX_CHANNEL_CAPACITY);
+        let (upload_batch_sender, upload_batch_receiver) = mpsc::channel(TX_CHANNEL_CAPACITY);
         let init_locks = Arc::new(DashMap::new());
         // [LOAD TEST] Bỏ giới hạn luồng để kiểm thử tải tối đa.
         // Dùng Semaphore::MAX_PERMITS để không giới hạn số luồng đồng thời.
@@ -98,8 +100,8 @@ impl App {
     #[cfg(test)]
     pub fn new_test(storage_root: PathBuf, log_dir: PathBuf) -> Arc<Self> {
         use sha2::{Digest, Sha256};
-        let (confirmation_sender, confirmation_receiver) = mpsc::channel(1_000);
-        let (upload_batch_sender, upload_batch_receiver) = mpsc::channel(1_000);
+        let (confirmation_sender, confirmation_receiver) = mpsc::channel(TX_CHANNEL_CAPACITY);
+        let (upload_batch_sender, upload_batch_receiver) = mpsc::channel(TX_CHANNEL_CAPACITY);
         let dummy_key = "0x0000000000000000000000000000000000000000000000000000000000000001";
         let wallet = PrivateKeySigner::from_str(dummy_key).unwrap();
         let http_client = alloy::transports::http::Client::builder().build().unwrap();
@@ -404,11 +406,11 @@ impl App {
             }
         }
 
-        // WAL (Write-Ahead Logging) có Lock Mutex bảo vệ chống race condition với TX Manager:
+        // WAL (Write-Ahead Logging) có Lock Mutex bảo vệ critical section khi append:
         let pending_upload_path = self.storage_root.join("pending_uploads.txt");
         let line = format!("{},{}\n", file_key, contract_addr);
         use tokio::io::AsyncWriteExt;
-        {
+        let file = {
             let _guard = self.pending_uploads_lock.lock().await;
             let mut file = tokio::fs::OpenOptions::new()
                 .create(true)
@@ -417,8 +419,9 @@ impl App {
                 .await?;
             file.write_all(line.as_bytes()).await?;
             file.flush().await?;
-            file.sync_data().await?;
-        }
+            file
+        }; // Nhả _guard ngay sau flush, sync_data thực hiện ngoài lock để không tuần tự hoá fsync giữa các luồng!
+        file.sync_data().await?;
 
         let _ = self.upload_batch_sender.send((file_key.to_string(), contract_addr)).await;
         Ok(())

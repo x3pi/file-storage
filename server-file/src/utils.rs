@@ -24,6 +24,20 @@ pub fn retry_delay_secs(attempt: u32) -> u64 {
     (15u64 * (1u64 << (attempt - 1).min(3))).min(120)
 }
 
+/// Tính thời gian chờ (giây) cho lỗi RPC/mạng tạm thời theo Exponential Backoff leo thang:
+/// Lần 1: 15s, Lần 2: 30s, Lần 3: 60s, Lần 4: 120s, Lần 5+: 300s (5 phút)
+#[inline]
+pub fn transient_retry_delay_secs(transient_attempts: u32) -> u64 {
+    let attempt = transient_attempts.max(1);
+    match attempt {
+        1 => 15,
+        2 => 30,
+        3 => 60,
+        4 => 120,
+        _ => 300,
+    }
+}
+
 /// Thời gian chờ nhanh cho luồng chính (giây) để thử lại tối đa 3 lần trước khi nhường queue:
 /// Lần 1: 2s, Lần 2: 4s, Lần 3: 8s
 #[inline]

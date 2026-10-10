@@ -342,7 +342,42 @@ pub async fn handle_connection(
                                     return; // Thoát task
                                 }
                             }
-                            
+
+                            // Kiểm tra tính hợp lệ của chunk TRƯỚC KHI ghi đĩa:
+                            let (total_chunks, contract_addr) = if let Some(info) = app_clone.upload_file_cache.get(&log_file_key) {
+                                (info.total_chunks, info.contract_address)
+                            } else {
+                                (0, alloy::primitives::Address::ZERO)
+                            };
+
+                            if total_chunks == 0 {
+                                drop(_permit);
+                                let response = GenericResponse {
+                                    status: "ERROR".to_string(),
+                                    message: "File not found in cache or total_chunks is 0".to_string(),
+                                };
+                                let mut response_json: Vec<u8> = serde_json::to_vec(&response).unwrap_or_default();
+                                response_json.push(b'\n');
+                                let _ = stream_handler.send(Bytes::from(response_json)).await;
+                                log::error!("[{}] ❌ Error: Missing total_chunks for file {}", peer_clone, log_file_key);
+                                return;
+                            }
+
+                            // SVR-4: Xử lý Edge Case chẵn/lẻ bằng hàm dùng chung trong utils
+                            let expected_chunks = crate::utils::expected_chunks(total_chunks, log_chunk_index);
+                            if expected_chunks == 0 {
+                                drop(_permit);
+                                let response = GenericResponse {
+                                    status: "ERROR".to_string(),
+                                    message: format!("Unexpected chunk {} for this node", log_chunk_index),
+                                };
+                                let mut response_json: Vec<u8> = serde_json::to_vec(&response).unwrap_or_default();
+                                response_json.push(b'\n');
+                                let _ = stream_handler.send(Bytes::from(response_json)).await;
+                                log::warn!("[{}] ⚠️ Unexpected chunk {} for total_chunks {} (expected 0 chunks for this parity)", peer_clone, log_chunk_index, total_chunks);
+                                return;
+                            }
+
                             let store_result = app_clone.write_chunk(&payload.file_key, payload.chunk_index, chunk_data.clone()).await;
 
                             // Nhả semaphore permit NGAY SAU KHI ghi disk xong
@@ -353,33 +388,6 @@ pub async fn handle_connection(
                             let processing_done_wall_clock = Local::now();
                             match store_result {
                                 Ok(()) => {
-                                    // TRACK CHUNK: Ghi nhận ngay khi lưu ổ cứng thành công
-                                    let (total_chunks, contract_addr) = if let Some(info) = app_clone.upload_file_cache.get(&log_file_key) {
-                                        (info.total_chunks, info.contract_address)
-                                    } else {
-                                        (0, alloy::primitives::Address::ZERO)
-                                    };
-                                    
-                                    if total_chunks == 0 {
-                                        let response = GenericResponse {
-                                            status: "ERROR".to_string(),
-                                            message: "File not found in cache or total_chunks is 0".to_string(),
-                                        };
-                                        let mut response_json: Vec<u8> = serde_json::to_vec(&response).unwrap_or_default();
-                                        response_json.push(b'\n');
-                                        let _ = stream_handler.send(Bytes::from(response_json)).await;
-                                        log::error!("[{}] ❌ Error: Missing total_chunks for file {}", peer_clone, log_file_key);
-                                        continue;
-                                    }
-
-                                    // SVR-4: Xử lý Edge Case chẵn/lẻ bằng hàm dùng chung trong utils
-                                    let expected_chunks = crate::utils::expected_chunks(total_chunks, log_chunk_index);
-
-                                    if expected_chunks == 0 {
-                                        log::warn!("[{}] ⚠️ Unexpected chunk {} for total_chunks {} (expected 0 chunks for this parity)", peer_clone, log_chunk_index, total_chunks);
-                                        continue;
-                                    }
-
                                     let is_completed = {
                                         let mut set = app_clone.get_or_init_chunk_tracker(&log_file_key).await;
                                         set.insert(log_chunk_index);

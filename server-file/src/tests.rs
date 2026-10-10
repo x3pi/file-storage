@@ -847,6 +847,7 @@ async fn test_no_head_of_line_blocking() {
             first_failed_at: "2026-10-10 10:00:00".to_string(),
             last_attempt_at: "2026-10-10 10:01:00".to_string(),
             next_retry_at: Some(future_time), // Chưa đến hạn!
+            transient_attempts: 0,
         },
         FailedTxRecord {
             key: "batch2_fileB".to_string(),
@@ -858,6 +859,7 @@ async fn test_no_head_of_line_blocking() {
             first_failed_at: "2026-10-10 10:00:00".to_string(),
             last_attempt_at: "2026-10-10 10:00:00".to_string(),
             next_retry_at: None, // Đã đến hạn ngay!
+            transient_attempts: 0,
         },
     ];
 
@@ -1007,6 +1009,65 @@ async fn test_recovery_no_deadlock_on_large_backlog() {
 
     assert!(res.is_ok(), "Quá trình phục hồi bị treo/deadlock khi backlog > 1000");
     assert_eq!(res.unwrap(), 1200, "Phải nạp và tiêu thụ đủ 1200 items");
+
+    cleanup_temp_env(storage_root, log_dir);
+}
+
+#[tokio::test]
+async fn test_transient_retry_delay_escalation() {
+    use crate::utils::transient_retry_delay_secs;
+
+    assert_eq!(transient_retry_delay_secs(0), 15);
+    assert_eq!(transient_retry_delay_secs(1), 15);
+    assert_eq!(transient_retry_delay_secs(2), 30);
+    assert_eq!(transient_retry_delay_secs(3), 60);
+    assert_eq!(transient_retry_delay_secs(4), 120);
+    assert_eq!(transient_retry_delay_secs(5), 300);
+    assert_eq!(transient_retry_delay_secs(10), 300);
+    assert_eq!(transient_retry_delay_secs(100), 300);
+}
+
+#[tokio::test]
+async fn test_download_wal_written_on_completion() {
+    let (storage_root, log_dir) = create_temp_env();
+    let app = App::new_test(storage_root.clone(), log_dir.clone());
+    let dl_key = "test_dl_wal_key";
+    let contract_addr = alloy::primitives::Address::repeat_byte(0x22);
+
+    // Tạo dummy session với remaining_chunks = 1
+    let temp_file = storage_root.join("dummy_bin.bin");
+    let file_std = std::fs::File::create(&temp_file).unwrap();
+    let session = crate::models::DownloadSession {
+        file_key: "test_file_key".to_string(),
+        contract_address: contract_addr,
+        file_owner: alloy::primitives::Address::ZERO,
+        session_user: alloy::primitives::Address::ZERO,
+        remaining_chunks: 1,
+        total_chunks: 1,
+        first_ip: Arc::new(std::sync::OnceLock::new()),
+        retry_remaining: 3,
+        confirmed_at: None,
+        verified_signature: Arc::new(tokio::sync::Mutex::new(None)),
+        is_public: false,
+        whitelist: std::collections::HashSet::new(),
+        last_access: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        file_handle: Arc::new(file_std),
+        available_chunks: Arc::new(std::collections::HashSet::new()),
+    };
+    app.download_cache.insert(dl_key.to_string(), session);
+
+    // Gọi descrease_chunk_count -> remaining_chunks giảm xuống 0, kích hoạt WAL ghi pending_confirmations.txt
+    let res = crate::download_manager::descrease_chunk_count(dl_key, &app).await;
+    assert_eq!(res, Ok(0));
+
+    // Đợi một khoảng ngắn cho background task spawn ghi WAL
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let pending_file = storage_root.join("pending_confirmations.txt");
+    assert!(pending_file.exists(), "pending_confirmations.txt phải được tạo để lưu WAL");
+    let content = tokio::fs::read_to_string(&pending_file).await.unwrap();
+    assert!(content.contains(dl_key), "WAL phải chứa download key");
+    assert!(content.contains(&contract_addr.to_string()), "WAL phải chứa contract address");
 
     cleanup_temp_env(storage_root, log_dir);
 }
