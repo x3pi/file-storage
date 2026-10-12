@@ -226,6 +226,7 @@ pub async fn handle_connection(
                             let log_chunk_index = payload.chunk_index;
                             
                             // ✅ RECEIVE FRAME 2: Binary Chunk Data có timeout 15s (TRƯỚC KHI LẤY PERMIT)
+                            let recv_data_start = Instant::now();
                             let chunk_data = match tokio::time::timeout(tokio::time::Duration::from_secs(15), stream_handler.recv()).await {
                                 Ok(Ok(Some(data))) => data,
                                 Ok(Ok(None)) => {
@@ -270,6 +271,7 @@ pub async fn handle_connection(
                                     return;
                                 }
                             };
+                            let recv_data_duration = recv_data_start.elapsed();
                             
                             // ✅ DUPLICATE CHUNK EARLY CHECK (chỉ đọc cache nếu đã có, không tạo entry trước khi verify)
                             let is_duplicate = {
@@ -292,6 +294,7 @@ pub async fn handle_connection(
                             }
 
                             // ✅ CHỈ LẤY SEMAPHORE PERMIT KHI ĐÃ CÓ ĐẦY ĐỦ DATA TRONG TAY
+                            let sem_start = Instant::now();
                             let _permit = match semaphore.acquire().await {
                                 Ok(permit) => permit,
                                 Err(e) => {
@@ -309,7 +312,10 @@ pub async fn handle_connection(
                                     return; // Thoát task này
                                 }
                             };
+                            let sem_duration = sem_start.elapsed();
+
                             // ✅ UNIFIED VERIFICATION: Signature + Merkle Proof in one call
+                            let verify_start = Instant::now();
                             match verify_upload_chunk(&payload, &chunk_data, &app_clone).await {
                                 Ok(()) => {
                                     log::debug!(
@@ -342,6 +348,7 @@ pub async fn handle_connection(
                                     return; // Thoát task
                                 }
                             }
+                            let verify_duration = verify_start.elapsed();
 
                             // Kiểm tra tính hợp lệ của chunk TRƯỚC KHI ghi đĩa:
                             let (total_chunks, contract_addr) = if let Some(info) = app_clone.upload_file_cache.get(&log_file_key) {
@@ -378,16 +385,18 @@ pub async fn handle_connection(
                                 return;
                             }
 
+                            let write_start = Instant::now();
                             let store_result = app_clone.write_chunk(&payload.file_key, payload.chunk_index, chunk_data.clone()).await;
+                            let write_duration = write_start.elapsed();
 
                             // Nhả semaphore permit NGAY SAU KHI ghi disk xong
                             // Tránh việc Client mạng chậm hoặc chết đột ngột làm cạn kiệt Semaphore.
                             drop(_permit);
 
-                            let processing_done_time = Instant::now();
                             let processing_done_wall_clock = Local::now();
                             match store_result {
                                 Ok(()) => {
+                                    let track_start = Instant::now();
                                     let is_completed = {
                                         let mut set = app_clone.get_or_init_chunk_tracker(&log_file_key).await;
                                         set.insert(log_chunk_index);
@@ -407,6 +416,7 @@ pub async fn handle_connection(
                                             }
                                         }
                                     }
+                                    let track_duration = track_start.elapsed();
 
                                     let response = GenericResponse {
                                         status: status_str.to_string(),
@@ -436,30 +446,28 @@ pub async fn handle_connection(
                                         );
                                     }
 
-                                    let send_done_time = Instant::now();
-
-                                    // THÊM: Tính toán và log thời gian
-                                    let processing_duration =
-                                        processing_done_time.duration_since(start_time);
-                                    let send_duration =
-                                        send_done_time.duration_since(send_start_time);
-                                    let total_duration = send_done_time.duration_since(start_time);
+                                    let send_duration = send_start_time.elapsed();
+                                    let total_duration = start_time.elapsed();
                                     let processing_time_formatted = processing_done_wall_clock
                                         .format("%H:%M:%S.%3f")
                                         .to_string();
                                     let start_time_formatted =
                                         start_time_wall_clock.format("%H:%M:%S.%3f").to_string();
                                     log::info!(
-                                "[{}] 📈 [UPLOAD_TIMING] Chunk {} -k {}, .Time: Receive:{:?}, Process: {:?} | Duration: Processing: {:?}, Send: {:?}, Total: {:?}",
-                                peer_clone,
-                                log_chunk_index,
-                                log_file_key,
-                                start_time_formatted,
-                                processing_time_formatted,
-                                processing_duration,
-                                send_duration,
-                                total_duration
-                            );
+                                        "[{}] 📈 [UPLOAD_TIMING] Chunk {} -k {}, Time: [Recv:{}, Done:{}] | Total: {:?} | Breakdown: [RecvData: {:?}, WaitSem: {:?}, Verify: {:?}, WriteDisk: {:?}, Track: {:?}, SendResp: {:?}]",
+                                        peer_clone,
+                                        log_chunk_index,
+                                        log_file_key,
+                                        start_time_formatted,
+                                        processing_time_formatted,
+                                        total_duration,
+                                        recv_data_duration,
+                                        sem_duration,
+                                        verify_duration,
+                                        write_duration,
+                                        track_duration,
+                                        send_duration
+                                    );
                                 }
                                 Err(e) => {
                                     log::error!("[{}] ❌ Failed to store chunk: {}", peer_clone, e);
